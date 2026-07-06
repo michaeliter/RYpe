@@ -262,6 +262,29 @@ fn extract_bucket_minimizers(
     salt: u64,
     orient_sequences: bool,
 ) -> Result<(Vec<u64>, Vec<String>, Vec<u64>)> {
+    if orient_sequences {
+        extract_bucket_minimizers_oriented(files, config_dir, k, w, salt)
+    } else {
+        extract_bucket_minimizers_parallel(files, config_dir, k, w, salt)
+    }
+}
+
+/// Sequential, order-dependent extraction used when `--orient` is enabled.
+///
+/// Each sequence after the first is oriented (forward vs. reverse-complement)
+/// by comparing against the cumulative minimizer set built so far, so
+/// sequences must be processed in order. Kept sequential and unchanged from
+/// the original implementation: switching to a fixed-baseline comparison
+/// (as the single-bucket oriented path does) would enable parallelism but
+/// would also change which orientation gets picked for later sequences,
+/// which is an accuracy tradeoff, not just a speed one.
+fn extract_bucket_minimizers_oriented(
+    files: &[PathBuf],
+    config_dir: &Path,
+    k: usize,
+    w: usize,
+    salt: u64,
+) -> Result<(Vec<u64>, Vec<String>, Vec<u64>)> {
     use rype::config::resolve_path;
 
     let mut ws = MinimizerWorkspace::new();
@@ -292,7 +315,7 @@ fn extract_bucket_minimizers(
             let seq = rec.seq();
             file_total_bases += seq.len() as u64;
 
-            if is_first_sequence || !orient_sequences {
+            if is_first_sequence {
                 // Forward-only: extract, sort, merge in-place
                 extract_into(&seq, k, w, salt, &mut ws);
                 let mut new_mins = std::mem::take(&mut ws.buffer);
@@ -321,6 +344,98 @@ fn extract_bucket_minimizers(
 
     // bucket_mins is already sorted and deduped from merge_sorted_into
     Ok((bucket_mins, sources, file_lengths))
+}
+
+/// Parallel, order-independent extraction used when orientation is disabled.
+///
+/// The previous implementation extracted and merged one sequence at a time via
+/// `merge_sorted_into`, which costs O(bucket_size) per sequence — effectively
+/// quadratic in the number of sequences per bucket. Since orientation doesn't
+/// apply here, sequence order doesn't affect the result: minimizers can be
+/// extracted in parallel (mirroring `build_single_bucket_streaming`'s chunked
+/// approach) and combined with a single O(n log k) `kway_merge_dedup` per
+/// chunk, then merged across chunks.
+///
+/// Bucket-level processing is itself parallelized by the caller (rayon over
+/// buckets), so this divides its memory budget by the thread count to avoid
+/// many concurrently-running buckets each assuming they own the whole
+/// machine's memory.
+fn extract_bucket_minimizers_parallel(
+    files: &[PathBuf],
+    config_dir: &Path,
+    k: usize,
+    w: usize,
+    salt: u64,
+) -> Result<(Vec<u64>, Vec<String>, Vec<u64>)> {
+    use rype::config::resolve_path;
+    use rype::memory::detect_available_memory;
+
+    let available = detect_available_memory().bytes / rayon::current_num_threads().max(1);
+    let chunk_config = calculate_chunk_config(available);
+
+    let mut merged: Vec<u64> = Vec::new();
+    let mut sources: Vec<String> = Vec::new();
+    let mut file_length_map: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+
+    // Strict: an unreadable/empty file should fail the build loudly, matching
+    // the previous sequential implementation's behavior, rather than silently
+    // skipping it as SequenceChunkIterator does by default elsewhere.
+    let mut chunk_iter =
+        SequenceChunkIterator::new(files, config_dir, chunk_config.target_chunk_bytes).strict(true);
+
+    while let Some(chunk) = chunk_iter.next_chunk()? {
+        if chunk.is_empty() {
+            continue;
+        }
+
+        for (seq, src) in &chunk {
+            sources.push(src.clone());
+            if let Some(delim_pos) = src.find(BUCKET_SOURCE_DELIM) {
+                let filename = &src[..delim_pos];
+                *file_length_map.entry(filename.to_string()).or_insert(0) += seq.len() as u64;
+            }
+        }
+
+        let avg_len = chunk.iter().map(|(seq, _)| seq.len()).sum::<usize>() / chunk.len().max(1);
+        let estimated_mins = MinimizerWorkspace::estimate_for_length(avg_len, k, w);
+
+        let chunk_mins: Vec<Vec<u64>> = chunk
+            .par_iter()
+            .map_init(
+                move || MinimizerWorkspace::with_estimate(estimated_mins),
+                |ws, (seq, _source)| {
+                    extract_into(seq, k, w, salt, ws);
+                    let mut mins = std::mem::take(&mut ws.buffer);
+                    mins.sort_unstable();
+                    mins
+                },
+            )
+            .collect();
+
+        let chunk_merged = kway_merge_dedup(chunk_mins);
+        merge_sorted_into(&mut merged, &chunk_merged);
+    }
+
+    // One entry per file that produced sequences, in the order files were
+    // read (matches `build_single_bucket_streaming`'s file-length accounting).
+    let mut file_lengths: Vec<u64> = Vec::with_capacity(files.len());
+    let mut seen_filenames: HashSet<String> = HashSet::new();
+    for file_path in files {
+        let abs_path = resolve_path(config_dir, file_path);
+        let filename = abs_path
+            .canonicalize()
+            .unwrap_or(abs_path)
+            .to_string_lossy()
+            .to_string();
+        if seen_filenames.insert(filename.clone()) {
+            if let Some(&len) = file_length_map.get(&filename) {
+                file_lengths.push(len);
+            }
+        }
+    }
+
+    Ok((merged, sources, file_lengths))
 }
 
 // ============================================================================
@@ -629,10 +744,13 @@ struct SequenceChunkIterator {
     current_filename: String,
     /// Pending sequence that didn't fit in the previous chunk
     pending_sequence: Option<(Vec<u8>, String)>,
+    /// If true, fail on an unreadable/empty file instead of skipping it.
+    strict: bool,
 }
 
 impl SequenceChunkIterator {
-    /// Create a new chunk iterator.
+    /// Create a new chunk iterator. Unreadable/empty files are skipped with
+    /// a warning by default; use `.strict(true)` to fail instead.
     fn new(files: &[PathBuf], config_dir: &Path, target_chunk_bytes: usize) -> Self {
         Self {
             files: files.to_vec(),
@@ -642,7 +760,15 @@ impl SequenceChunkIterator {
             current_reader: None,
             current_filename: String::new(),
             pending_sequence: None,
+            strict: false,
         }
+    }
+
+    /// If `strict` is true, an unreadable/empty file causes an error instead
+    /// of being silently skipped.
+    fn strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
     }
 
     /// Open the next file, returning true if successful.
@@ -659,13 +785,17 @@ impl SequenceChunkIterator {
                 .to_string_lossy()
                 .to_string();
 
-            // Try to open the file, skip if empty or invalid
+            // Try to open the file, skip if empty or invalid (unless strict)
             match parse_fastx_file(&abs_path) {
                 Ok(reader) => {
                     self.current_reader = Some(reader);
                     return Ok(true);
                 }
                 Err(e) => {
+                    if self.strict {
+                        return Err(e)
+                            .context(format!("Failed to open file {}", abs_path.display()));
+                    }
                     // Log warning and skip to next file
                     log::warn!(
                         "Skipping file {} (possibly empty or invalid): {}",
