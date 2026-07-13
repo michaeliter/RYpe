@@ -36,6 +36,8 @@ fn main() -> Result<()> {
                 window,
                 salt,
                 separate_buckets,
+                dedup_cross_bucket,
+                dedup_cross_bucket_min,
                 max_shard_size,
                 row_group_size,
                 zstd,
@@ -74,6 +76,8 @@ fn main() -> Result<()> {
                     separate_buckets,
                     max_shard_size,
                     Some(&parquet_options),
+                    dedup_cross_bucket,
+                    dedup_cross_bucket_min,
                 )?;
             }
 
@@ -206,6 +210,8 @@ fn main() -> Result<()> {
                 orient,
                 timing,
                 subtract_from,
+                dedup_cross_bucket,
+                dedup_cross_bucket_min,
             } => {
                 // Enable timing diagnostics if requested
                 if timing {
@@ -233,6 +239,8 @@ fn main() -> Result<()> {
                     Some(&options),
                     orient,
                     subtract_from.as_deref(),
+                    dedup_cross_bucket,
+                    dedup_cross_bucket_min,
                 )?;
             }
 

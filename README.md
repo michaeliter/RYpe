@@ -44,6 +44,11 @@ rype index create -o index.ryxdi -r ref1.fasta -r ref2.fasta -k 64 -w 50
 # Create index with one bucket per sequence
 rype index create -o genes.ryxdi -r genes.fasta --separate-buckets
 
+# Remove minimizers shared across too many buckets, keeping each bucket's
+# minimizers more discriminative (opt-in; default threshold removes anything
+# shared by 2+ buckets)
+rype index create -o index.ryxdi -r ref1.fasta -r ref2.fasta -k 64 -w 50 --dedup-cross-bucket
+
 # Build from a TOML configuration file
 rype index from-config -c config.toml
 

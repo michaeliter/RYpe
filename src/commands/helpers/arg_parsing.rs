@@ -64,6 +64,25 @@ pub fn validate_minimum_length(s: &str) -> Result<usize, String> {
     validate_positive_length(s, "minimum-length")
 }
 
+/// Validate the --dedup-cross-bucket-min argument.
+///
+/// Must be >= 2: a minimizer is dropped if it appears in at least this many
+/// distinct buckets. N=1 would drop every minimizer present anywhere (nonsensical),
+/// and N=0 is meaningless.
+pub fn validate_dedup_cross_bucket_min(s: &str) -> Result<usize, String> {
+    let val: usize = s
+        .parse()
+        .map_err(|_| format!("'{}' is not a valid positive integer", s))?;
+    if val < 2 {
+        return Err(format!(
+            "dedup-cross-bucket-min must be >= 2 (got {}); a minimizer must be shared \
+             by at least 2 buckets to be considered non-discriminative",
+            val
+        ));
+    }
+    Ok(val)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

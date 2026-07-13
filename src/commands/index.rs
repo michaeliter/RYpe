@@ -78,6 +78,40 @@ fn validate_subtraction_compatibility(
 }
 
 // ============================================================================
+// Cross-bucket minimizer dedup
+// ============================================================================
+
+/// Count how many distinct buckets each minimizer appears in.
+///
+/// `bucket_minimizer_sets` must yield each bucket's sorted, deduplicated
+/// minimizer slice exactly once.
+fn count_bucket_membership<'a>(
+    bucket_minimizer_sets: impl Iterator<Item = &'a [u64]>,
+) -> std::collections::HashMap<u64, u32> {
+    let mut counts: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+    for mins in bucket_minimizer_sets {
+        for &m in mins {
+            *counts.entry(m).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// Remove minimizers present in >= `min_bucket_count` distinct buckets.
+///
+/// Preserves sorted order (`Vec::retain` doesn't reorder), satisfying
+/// `BucketData`'s sorted invariant. Returns the number of minimizers removed.
+fn filter_cross_bucket_minimizers(
+    minimizers: &mut Vec<u64>,
+    counts: &std::collections::HashMap<u64, u32>,
+    min_bucket_count: u32,
+) -> usize {
+    let before = minimizers.len();
+    minimizers.retain(|m| counts.get(m).copied().unwrap_or(0) < min_bucket_count);
+    before - minimizers.len()
+}
+
+// ============================================================================
 // Parquet Index Creation
 // ============================================================================
 
@@ -92,6 +126,8 @@ pub fn create_parquet_index_from_refs(
     separate_buckets: bool,
     max_shard_bytes: Option<usize>,
     options: Option<&parquet_index::ParquetWriteOptions>,
+    dedup_cross_bucket: bool,
+    dedup_cross_bucket_min: usize,
 ) -> Result<()> {
     use rype::{create_parquet_inverted_index, BucketData, BucketFileStats};
     use std::collections::HashMap;
@@ -191,6 +227,38 @@ pub fn create_parquet_index_from_refs(
         buckets.len(),
         total_minimizers
     );
+
+    if dedup_cross_bucket {
+        if buckets.len() < 2 {
+            return Err(anyhow!(
+                "--dedup-cross-bucket requires at least 2 buckets (got {})",
+                buckets.len()
+            ));
+        }
+        let counts = count_bucket_membership(buckets.iter().map(|b| b.minimizers.as_slice()));
+        let mut total_removed = 0usize;
+        for bucket in &mut buckets {
+            let removed = filter_cross_bucket_minimizers(
+                &mut bucket.minimizers,
+                &counts,
+                dedup_cross_bucket_min as u32,
+            );
+            if removed > 0 {
+                total_removed += removed;
+                log::info!(
+                    "Bucket '{}': removed {} cross-bucket minimizers ({} remaining)",
+                    bucket.bucket_name,
+                    removed,
+                    bucket.minimizers.len()
+                );
+            }
+        }
+        log::info!(
+            "Cross-bucket dedup: removed {} minimizer instances total (threshold >= {} buckets)",
+            total_removed,
+            dedup_cross_bucket_min
+        );
+    }
 
     // Compute per-bucket file stats
     let bucket_stats: HashMap<u32, BucketFileStats> = bucket_file_lengths
@@ -1742,12 +1810,15 @@ fn build_single_bucket(
 /// * `cli_max_memory` - CLI override for max memory (None = auto-detect)
 /// * `options` - Parquet write options
 /// * `cli_orient` - CLI override for orient sequences flag (takes precedence over config)
+#[allow(clippy::too_many_arguments)]
 pub fn build_parquet_index_from_config(
     config_path: &Path,
     cli_max_memory: Option<usize>,
     options: Option<&parquet_index::ParquetWriteOptions>,
     cli_orient: bool,
     subtract_from: Option<&Path>,
+    dedup_cross_bucket: bool,
+    dedup_cross_bucket_min: usize,
 ) -> Result<()> {
     let t_total = Instant::now();
 
@@ -1847,6 +1918,12 @@ pub fn build_parquet_index_from_config(
     // Build buckets - strategy depends on bucket count
     let is_single_bucket = bucket_names.len() == 1;
 
+    if dedup_cross_bucket && is_single_bucket {
+        return Err(anyhow!(
+            "--dedup-cross-bucket requires at least 2 buckets (config has 1)"
+        ));
+    }
+
     if !is_single_bucket {
         // Multiple buckets: use streaming mode with channel-based parallelism
         use rype::memory::detect_available_memory;
@@ -1869,6 +1946,8 @@ pub fn build_parquet_index_from_config(
             options,
             cli_orient,
             exclusion_set.as_ref(),
+            dedup_cross_bucket,
+            dedup_cross_bucket_min,
         );
     }
 
@@ -1985,6 +2064,115 @@ pub fn build_parquet_index_from_config(
     Ok(())
 }
 
+/// Count how many distinct buckets each minimizer appears in, by extracting every
+/// bucket's minimizers once (same extraction call as the main streaming pass) and
+/// folding into a global count map.
+///
+/// Each bucket's minimizers are discarded after counting — this pass never holds
+/// more than one bucket's minimizers at a time beyond the channel's backpressure
+/// buffer, preserving the streaming path's memory-bounded design.
+///
+/// Applies subtraction filtering first (if any) so subtracted minimizers don't
+/// inflate bucket-membership counts, matching what the write pass will actually see.
+///
+/// This is pass 1 of the two-pass `--dedup-cross-bucket` build for `from-config`;
+/// pass 2 (in `build_parquet_index_from_config_streaming`) re-extracts each bucket
+/// and filters using the counts computed here.
+#[allow(clippy::too_many_arguments)]
+fn count_bucket_membership_streaming(
+    cfg: &rype::config::ConfigFile,
+    config_dir: &Path,
+    orient_sequences: bool,
+    work_items: &[(u32, &str, &[PathBuf])],
+    exclusion_set: Option<&HashSet<u64>>,
+) -> Result<std::collections::HashMap<u64, u32>> {
+    let num_buckets = work_items.len();
+
+    // (bucket_id, bucket_name, minimizers) — sources/file_lengths aren't needed for counting
+    type CountBucketResult = Result<(u32, String, Vec<u64>)>;
+
+    let processed_count = std::sync::atomic::AtomicUsize::new(0);
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let mut counts: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+
+    let process_result: Result<()> = std::thread::scope(|s| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CountBucketResult>(4);
+
+        let cancelled_ref = &cancelled;
+        let processed_ref = &processed_count;
+        s.spawn(move || {
+            work_items
+                .par_iter()
+                .panic_fuse()
+                .for_each_with(tx, |tx, (bucket_id, bucket_name, files)| {
+                    if cancelled_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+
+                    log::info!(
+                        "Counting bucket '{}' ({}/{}) for cross-bucket dedup...",
+                        bucket_name,
+                        bucket_id,
+                        num_buckets
+                    );
+
+                    let result = extract_bucket_minimizers(
+                        files,
+                        config_dir,
+                        cfg.index.k,
+                        cfg.index.window,
+                        cfg.index.salt,
+                        orient_sequences,
+                    );
+
+                    let bucket_result: CountBucketResult = match result {
+                        Ok((minimizers, _sources, _file_lengths)) => {
+                            Ok((*bucket_id, bucket_name.to_string(), minimizers))
+                        }
+                        Err(e) => Err(e.context(format!(
+                            "Failed processing bucket '{}' (ID {}) during cross-bucket dedup counting pass",
+                            bucket_name, bucket_id
+                        ))),
+                    };
+
+                    if tx.send(bucket_result).is_ok() {
+                        processed_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                });
+        });
+
+        for result in rx {
+            let (_bucket_id, _bucket_name, minimizers) = match result {
+                Ok(data) => data,
+                Err(e) => {
+                    cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Err(e);
+                }
+            };
+            for m in minimizers {
+                if exclusion_set.is_some_and(|excl| excl.contains(&m)) {
+                    continue;
+                }
+                *counts.entry(m).or_insert(0) += 1;
+            }
+        }
+
+        Ok(())
+    });
+
+    let actual_processed = processed_count.load(std::sync::atomic::Ordering::Relaxed);
+    if actual_processed != num_buckets && process_result.is_ok() {
+        return Err(anyhow!(
+            "Cross-bucket dedup counting pass incomplete: processed {}/{} buckets (possible panic in worker thread)",
+            actual_processed,
+            num_buckets
+        ));
+    }
+    process_result?;
+
+    Ok(counts)
+}
+
 /// Create Parquet inverted index from config using streaming shard creation.
 ///
 /// This function processes buckets one at a time, using a `ShardAccumulator` to
@@ -2006,12 +2194,18 @@ pub fn build_parquet_index_from_config(
 /// * `cli_max_shard_size` - CLI override for max shard size (takes precedence over config)
 /// * `options` - Parquet write options
 /// * `cli_orient` - CLI override for orient sequences flag
+/// * `exclusion_set` - Optional set of minimizers to exclude (for subtraction)
+/// * `dedup_cross_bucket` - Enable opt-in cross-bucket minimizer dedup (two-pass)
+/// * `dedup_cross_bucket_min` - Minimum bucket-membership count to trigger removal
+#[allow(clippy::too_many_arguments)]
 pub fn build_parquet_index_from_config_streaming(
     config_path: &Path,
     cli_max_shard_size: Option<usize>,
     options: Option<&parquet_index::ParquetWriteOptions>,
     cli_orient: bool,
     exclusion_set: Option<&HashSet<u64>>,
+    dedup_cross_bucket: bool,
+    dedup_cross_bucket_min: usize,
 ) -> Result<()> {
     use rype::parquet_index::{
         compute_source_hash, create_index_directory, write_buckets_parquet, InvertedManifest,
@@ -2136,6 +2330,34 @@ pub fn build_parquet_index_from_config_streaming(
         return Err(anyhow!("No buckets defined in configuration"));
     }
 
+    if dedup_cross_bucket && num_buckets < 2 {
+        return Err(anyhow!(
+            "--dedup-cross-bucket requires at least 2 buckets (got {})",
+            num_buckets
+        ));
+    }
+
+    // Pass 1 of two-pass --dedup-cross-bucket: extract every bucket's minimizers
+    // once just to count cross-bucket membership, discarding each bucket's
+    // minimizers immediately after counting. Pass 2 (below) re-extracts and
+    // filters using these counts. See count_bucket_membership_streaming's doc
+    // comment for why this preserves the streaming path's memory bound.
+    let cross_bucket_counts = if dedup_cross_bucket {
+        log::info!(
+            "Cross-bucket dedup: counting minimizer membership across {} buckets (pass 1/2)...",
+            num_buckets
+        );
+        Some(count_bucket_membership_streaming(
+            &cfg,
+            config_dir,
+            orient_sequences,
+            &work_items,
+            exclusion_set,
+        )?)
+    } else {
+        None
+    };
+
     // Type alias for channel message clarity
     // (bucket_id, bucket_name, minimizers, sources, file_lengths)
     type BucketResult = Result<(u32, String, Vec<u64>, Vec<String>, Vec<u64>)>;
@@ -2210,6 +2432,7 @@ pub fn build_parquet_index_from_config_streaming(
 
         // Consumer: receive results as buckets complete and accumulate
         let mut total_excluded: u64 = 0;
+        let mut total_cross_bucket_removed: u64 = 0;
         for result in rx {
             let (bucket_id, bucket_name, minimizers, sources, file_lengths) = match result {
                 Ok(data) => data,
@@ -2233,6 +2456,27 @@ pub fn build_parquet_index_from_config_streaming(
                         bucket_name,
                         excluded,
                         original_len
+                    );
+                }
+            }
+
+            // Pass 2 of two-pass --dedup-cross-bucket: filter using the counts
+            // computed in pass 1 (count_bucket_membership_streaming), applied
+            // after subtraction so the counts and the final write agree.
+            if let Some(ref counts) = cross_bucket_counts {
+                let before = minimizers.len();
+                let removed = filter_cross_bucket_minimizers(
+                    &mut minimizers,
+                    counts,
+                    dedup_cross_bucket_min as u32,
+                );
+                total_cross_bucket_removed += removed as u64;
+                if removed > 0 {
+                    log::info!(
+                        "Bucket '{}': removed {} of {} minimizers via cross-bucket dedup",
+                        bucket_name,
+                        removed,
+                        before
                     );
                 }
             }
@@ -2268,6 +2512,14 @@ pub fn build_parquet_index_from_config_streaming(
             log::info!(
                 "Subtraction complete: excluded {} minimizer entries total",
                 total_excluded
+            );
+        }
+
+        if total_cross_bucket_removed > 0 {
+            log::info!(
+                "Cross-bucket dedup complete: removed {} minimizer instances total (threshold >= {} buckets)",
+                total_cross_bucket_removed,
+                dedup_cross_bucket_min
             );
         }
 
@@ -2492,7 +2744,8 @@ output = "{}"
         );
 
         // Build parquet index
-        let result = build_parquet_index_from_config(&config_path, None, None, false, None);
+        let result =
+            build_parquet_index_from_config(&config_path, None, None, false, None, false, 2);
         assert!(result.is_ok(), "Should succeed: {:?}", result);
 
         // Verify the parquet index was created
@@ -2526,8 +2779,15 @@ output = "{}"
             ..Default::default()
         };
 
-        let result =
-            build_parquet_index_from_config(&config_path, None, Some(&options), false, None);
+        let result = build_parquet_index_from_config(
+            &config_path,
+            None,
+            Some(&options),
+            false,
+            None,
+            false,
+            2,
+        );
         assert!(
             result.is_ok(),
             "Should succeed with bloom filter: {:?}",
@@ -2552,7 +2812,8 @@ output = "{}"
             10,
         );
 
-        let result = build_parquet_index_from_config(&config_path, None, None, false, None);
+        let result =
+            build_parquet_index_from_config(&config_path, None, None, false, None, false, 2);
         assert!(result.is_err(), "Should fail with missing file");
     }
 
@@ -2943,8 +3204,15 @@ files = ["ref2.fa"]
         std::fs::write(&config_path, config_content).unwrap();
 
         // Build streaming index
-        let result =
-            build_parquet_index_from_config_streaming(&config_path, None, None, false, None);
+        let result = build_parquet_index_from_config_streaming(
+            &config_path,
+            None,
+            None,
+            false,
+            None,
+            false,
+            2,
+        );
         assert!(
             result.is_ok(),
             "Streaming index creation should succeed: {:?}",
@@ -3038,6 +3306,8 @@ max_shard_size = 1048576
             None,
             false,
             None,
+            false,
+            2,
         );
         assert!(result.is_ok(), "Should succeed: {:?}", result);
 
@@ -3090,8 +3360,15 @@ files = ["ref2.fa"]
         let config_path = dir.join("config.toml");
         std::fs::write(&config_path, config_content).unwrap();
 
-        let result =
-            build_parquet_index_from_config_streaming(&config_path, None, None, false, None);
+        let result = build_parquet_index_from_config_streaming(
+            &config_path,
+            None,
+            None,
+            false,
+            None,
+            false,
+            2,
+        );
         assert!(result.is_ok(), "Should succeed: {:?}", result);
 
         // Load and verify manifest
@@ -3216,8 +3493,15 @@ files = ["small5.fa"]
 
         // Time the streaming build
         let start = Instant::now();
-        let result =
-            build_parquet_index_from_config_streaming(&config_path, None, None, false, None);
+        let result = build_parquet_index_from_config_streaming(
+            &config_path,
+            None,
+            None,
+            false,
+            None,
+            false,
+            2,
+        );
         let elapsed = start.elapsed();
 
         assert!(result.is_ok(), "Should succeed: {:?}", result);
@@ -3304,6 +3588,8 @@ max_shard_size = 1048576
             None,
             false,
             None,
+            false,
+            2,
         );
         assert!(result.is_ok(), "Should succeed: {:?}", result);
 
@@ -3370,8 +3656,15 @@ files = ["valid2.fa"]
         std::fs::write(&config_path, config_content).unwrap();
 
         // Should fail during validation (before processing starts)
-        let result =
-            build_parquet_index_from_config_streaming(&config_path, None, None, false, None);
+        let result = build_parquet_index_from_config_streaming(
+            &config_path,
+            None,
+            None,
+            false,
+            None,
+            false,
+            2,
+        );
         assert!(result.is_err(), "Should fail with missing file");
 
         let err_msg = result.unwrap_err().to_string();
@@ -3429,8 +3722,15 @@ files = ["valid2.fa"]
         let config_path = dir.join("config.toml");
         std::fs::write(&config_path, config_content).unwrap();
 
-        let result =
-            build_parquet_index_from_config_streaming(&config_path, None, None, false, None);
+        let result = build_parquet_index_from_config_streaming(
+            &config_path,
+            None,
+            None,
+            false,
+            None,
+            false,
+            2,
+        );
 
         // The corrupt file might either fail (if FASTA parser rejects it) or
         // produce empty output (if parser is lenient). Either is acceptable.
@@ -3486,7 +3786,8 @@ files = ["ref3.fa"]
         let config_path_ns = dir.join("config_nonstream.toml");
         std::fs::write(&config_path_ns, config_nonstream).unwrap();
 
-        let result_ns = build_parquet_index_from_config(&config_path_ns, None, None, false, None);
+        let result_ns =
+            build_parquet_index_from_config(&config_path_ns, None, None, false, None, false, 2);
         assert!(
             result_ns.is_ok(),
             "Non-streaming should succeed: {:?}",
@@ -3513,8 +3814,15 @@ files = ["ref3.fa"]
         let config_path_s = dir.join("config_stream.toml");
         std::fs::write(&config_path_s, config_stream).unwrap();
 
-        let result_s =
-            build_parquet_index_from_config_streaming(&config_path_s, None, None, false, None);
+        let result_s = build_parquet_index_from_config_streaming(
+            &config_path_s,
+            None,
+            None,
+            false,
+            None,
+            false,
+            2,
+        );
         assert!(result_s.is_ok(), "Streaming should succeed: {:?}", result_s);
 
         // Compare the two indices
@@ -3615,7 +3923,8 @@ files = ["ref0.fa", "ref1.fa", "ref2.fa", "ref3.fa", "ref4.fa"]
         std::fs::write(&config_path, config_content).unwrap();
 
         // Build index using non-streaming path (which will eventually use parallel)
-        let result = build_parquet_index_from_config(&config_path, None, None, false, None);
+        let result =
+            build_parquet_index_from_config(&config_path, None, None, false, None, false, 2);
         assert!(
             result.is_ok(),
             "Index creation should succeed: {:?}",
@@ -3706,7 +4015,8 @@ files = ["ref_g.fa"]
         std::fs::write(&config_path, config_content).unwrap();
 
         // Build index
-        let result = build_parquet_index_from_config(&config_path, None, None, false, None);
+        let result =
+            build_parquet_index_from_config(&config_path, None, None, false, None, false, 2);
         assert!(
             result.is_ok(),
             "Index creation should succeed: {:?}",
@@ -3797,7 +4107,8 @@ files = ["ref0.fa", "ref1.fa", "ref2.fa", "ref3.fa"]
         std::fs::write(&config_path, config_content).unwrap();
 
         // Build index with orientation
-        let result = build_parquet_index_from_config(&config_path, None, None, false, None);
+        let result =
+            build_parquet_index_from_config(&config_path, None, None, false, None, false, 2);
         assert!(
             result.is_ok(),
             "Oriented index creation should succeed: {:?}",
@@ -3859,7 +4170,8 @@ files = ["single.fa"]
         std::fs::write(&config_path, config_content).unwrap();
 
         // Build index
-        let result = build_parquet_index_from_config(&config_path, None, None, false, None);
+        let result =
+            build_parquet_index_from_config(&config_path, None, None, false, None, false, 2);
         assert!(
             result.is_ok(),
             "Single sequence index should succeed: {:?}",
@@ -3932,7 +4244,8 @@ files = ["short.fa", "long.fa"]
         std::fs::write(&config_path, config_content).unwrap();
 
         // Build index - should not crash
-        let result = build_parquet_index_from_config(&config_path, None, None, false, None);
+        let result =
+            build_parquet_index_from_config(&config_path, None, None, false, None, false, 2);
         assert!(
             result.is_ok(),
             "Index with short sequences should succeed: {:?}",
@@ -5315,5 +5628,336 @@ files = ["short.fa", "long.fa"]
         .unwrap();
 
         assert!(result.total_minimizers > 0);
+    }
+
+    // =========================================================================
+    // Cross-bucket minimizer dedup tests
+    // =========================================================================
+
+    #[test]
+    fn test_count_bucket_membership_basic() {
+        let bucket_a: Vec<u64> = vec![1, 2, 3];
+        let bucket_b: Vec<u64> = vec![2, 3, 4];
+        let bucket_c: Vec<u64> = vec![3, 5];
+        let sets = [
+            bucket_a.as_slice(),
+            bucket_b.as_slice(),
+            bucket_c.as_slice(),
+        ];
+        let counts = count_bucket_membership(sets.into_iter());
+
+        assert_eq!(counts.get(&1), Some(&1), "1 is only in bucket_a");
+        assert_eq!(counts.get(&2), Some(&2), "2 is in bucket_a and bucket_b");
+        assert_eq!(counts.get(&3), Some(&3), "3 is in all three buckets");
+        assert_eq!(counts.get(&4), Some(&1), "4 is only in bucket_b");
+        assert_eq!(counts.get(&5), Some(&1), "5 is only in bucket_c");
+    }
+
+    #[test]
+    fn test_filter_cross_bucket_minimizers_threshold() {
+        // Threshold semantics: a minimizer is removed if its bucket-membership
+        // count is >= min_bucket_count. This test encodes the boundary: exactly
+        // at threshold is removed, one below survives.
+        let mut counts = std::collections::HashMap::new();
+        counts.insert(1u64, 1u32); // below threshold: survives
+        counts.insert(2u64, 2u32); // exactly at threshold: removed
+        counts.insert(3u64, 3u32); // above threshold: removed
+
+        let mut minimizers = vec![1, 2, 3];
+        let removed = filter_cross_bucket_minimizers(&mut minimizers, &counts, 2);
+
+        assert_eq!(removed, 2, "minimizers with count >= 2 should be removed");
+        assert_eq!(
+            minimizers,
+            vec![1],
+            "only the below-threshold minimizer should survive"
+        );
+    }
+
+    #[test]
+    fn test_filter_cross_bucket_minimizers_preserves_sorted_order() {
+        // BucketData requires sorted minimizers; retain() must not reorder.
+        let mut counts = std::collections::HashMap::new();
+        counts.insert(10u64, 5u32);
+
+        let mut minimizers = vec![5, 10, 15, 20];
+        filter_cross_bucket_minimizers(&mut minimizers, &counts, 2);
+
+        assert_eq!(
+            minimizers,
+            vec![5, 15, 20],
+            "remaining minimizers stay sorted"
+        );
+    }
+
+    #[test]
+    fn test_filter_cross_bucket_minimizers_none_removed_when_unique() {
+        let mut counts = std::collections::HashMap::new();
+        counts.insert(1u64, 1u32);
+        counts.insert(2u64, 1u32);
+
+        let mut minimizers = vec![1, 2];
+        let removed = filter_cross_bucket_minimizers(&mut minimizers, &counts, 2);
+
+        assert_eq!(removed, 0, "bucket-unique minimizers must never be removed");
+        assert_eq!(minimizers, vec![1, 2]);
+    }
+
+    /// Write a two-record FASTA file (used to build a bucket containing both a
+    /// "shared" sequence, common to multiple buckets, and a bucket-unique sequence).
+    fn create_two_record_fasta(dir: &Path, name: &str, rec1: &[u8], rec2: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        let mut file = File::create(&path).unwrap();
+        writeln!(file, ">rec1").unwrap();
+        file.write_all(rec1).unwrap();
+        writeln!(file).unwrap();
+        writeln!(file, ">rec2").unwrap();
+        file.write_all(rec2).unwrap();
+        writeln!(file).unwrap();
+        path
+    }
+
+    /// Fixture: 3 files, each containing an identical "shared" sequence plus a
+    /// bucket-unique sequence. With --dedup-cross-bucket (default threshold 2),
+    /// the shared sequence's minimizers should be removed from every bucket
+    /// (present in all 3, so count=3 >= 2), while each bucket's unique minimizers
+    /// survive (present in only 1 bucket, count=1 < 2).
+    fn create_shared_and_unique_bucket_files(dir: &Path) -> Vec<PathBuf> {
+        let shared: &[u8] = b"AAAAACCCCCGGGGGTTTTTAAAAACCCCCGGGGGTTTTTAAAAACCCCCGGGGGTTTTT";
+        let unique_a: &[u8] = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let unique_b: &[u8] = b"TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA";
+        let unique_c: &[u8] = b"ATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG";
+
+        vec![
+            create_two_record_fasta(dir, "bucket_a.fa", shared, unique_a),
+            create_two_record_fasta(dir, "bucket_b.fa", shared, unique_b),
+            create_two_record_fasta(dir, "bucket_c.fa", shared, unique_c),
+        ]
+    }
+
+    #[test]
+    fn test_create_dedup_cross_bucket_removes_shared_minimizers() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let files = create_shared_and_unique_bucket_files(dir);
+
+        let baseline_path = dir.join("baseline.ryxdi");
+        create_parquet_index_from_refs(
+            &baseline_path,
+            &files,
+            32,
+            10,
+            0x5555555555555555,
+            false,
+            None,
+            None,
+            false, // dedup_cross_bucket off
+            2,
+        )
+        .unwrap();
+
+        let dedup_path = dir.join("dedup.ryxdi");
+        create_parquet_index_from_refs(
+            &dedup_path,
+            &files,
+            32,
+            10,
+            0x5555555555555555,
+            false,
+            None,
+            None,
+            true, // dedup_cross_bucket on
+            2,
+        )
+        .unwrap();
+
+        use rype::ShardedInvertedIndex;
+        let baseline_index = ShardedInvertedIndex::open(&baseline_path).unwrap();
+        let dedup_index = ShardedInvertedIndex::open(&dedup_path).unwrap();
+
+        assert_eq!(baseline_index.manifest().bucket_names.len(), 3);
+        assert_eq!(dedup_index.manifest().bucket_names.len(), 3);
+
+        let baseline_total = baseline_index.manifest().total_bucket_ids;
+        let dedup_total = dedup_index.manifest().total_bucket_ids;
+
+        assert!(
+            dedup_total < baseline_total,
+            "dedup should remove shared minimizers: baseline={}, dedup={}",
+            baseline_total,
+            dedup_total
+        );
+        assert!(
+            dedup_total > 0,
+            "bucket-unique minimizers should still survive after dedup"
+        );
+    }
+
+    #[test]
+    fn test_create_dedup_cross_bucket_requires_multiple_buckets() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let file = create_fasta_file(dir, "single.fa", seq);
+
+        let output = dir.join("single_bucket.ryxdi");
+        let result = create_parquet_index_from_refs(
+            &output,
+            &[file],
+            32,
+            10,
+            0x5555555555555555,
+            false,
+            None,
+            None,
+            true, // dedup_cross_bucket on, but only 1 bucket
+            2,
+        );
+
+        assert!(
+            result.is_err(),
+            "should reject dedup with fewer than 2 buckets"
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("at least 2 buckets"));
+    }
+
+    #[test]
+    fn test_streaming_dedup_cross_bucket_matches_single_pass_reduction() {
+        // Verify the two-pass streaming implementation removes the same shared
+        // minimizers as the single-pass index-create implementation, for an
+        // equivalent bucket definition.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let files = create_shared_and_unique_bucket_files(dir);
+
+        // Single-pass (index create) reference reduction
+        let single_pass_baseline = dir.join("sp_baseline.ryxdi");
+        create_parquet_index_from_refs(
+            &single_pass_baseline,
+            &files,
+            32,
+            10,
+            0x5555555555555555,
+            false,
+            None,
+            None,
+            false,
+            2,
+        )
+        .unwrap();
+        let single_pass_dedup = dir.join("sp_dedup.ryxdi");
+        create_parquet_index_from_refs(
+            &single_pass_dedup,
+            &files,
+            32,
+            10,
+            0x5555555555555555,
+            false,
+            None,
+            None,
+            true,
+            2,
+        )
+        .unwrap();
+
+        // Two-pass streaming (from-config) reduction, same file set as 3 buckets
+        let config_path = create_test_config(
+            dir,
+            "streaming_dedup.ryxdi",
+            &[
+                ("BucketA", &["bucket_a.fa"]),
+                ("BucketB", &["bucket_b.fa"]),
+                ("BucketC", &["bucket_c.fa"]),
+            ],
+            32,
+            10,
+        );
+
+        let baseline_result = build_parquet_index_from_config_streaming(
+            &config_path,
+            None,
+            None,
+            false,
+            None,
+            false,
+            2,
+        );
+        assert!(baseline_result.is_ok(), "{:?}", baseline_result);
+        let streaming_baseline_path = dir.join("streaming_dedup.ryxdi");
+        use rype::ShardedInvertedIndex;
+        let streaming_baseline = ShardedInvertedIndex::open(&streaming_baseline_path).unwrap();
+        let streaming_baseline_total = streaming_baseline.manifest().total_bucket_ids;
+
+        // Rebuild with dedup enabled at a fresh output path (config output is fixed,
+        // so remove and rebuild in place)
+        std::fs::remove_dir_all(&streaming_baseline_path).unwrap();
+        let dedup_result = build_parquet_index_from_config_streaming(
+            &config_path,
+            None,
+            None,
+            false,
+            None,
+            true,
+            2,
+        );
+        assert!(dedup_result.is_ok(), "{:?}", dedup_result);
+        let streaming_dedup = ShardedInvertedIndex::open(&streaming_baseline_path).unwrap();
+        let streaming_dedup_total = streaming_dedup.manifest().total_bucket_ids;
+
+        let single_pass_baseline_index = ShardedInvertedIndex::open(&single_pass_baseline).unwrap();
+        let single_pass_dedup_index = ShardedInvertedIndex::open(&single_pass_dedup).unwrap();
+        let single_pass_baseline_total = single_pass_baseline_index.manifest().total_bucket_ids;
+        let single_pass_dedup_total = single_pass_dedup_index.manifest().total_bucket_ids;
+
+        assert!(
+            streaming_dedup_total < streaming_baseline_total,
+            "streaming dedup should reduce total entries"
+        );
+        assert_eq!(
+            single_pass_baseline_total, streaming_baseline_total,
+            "single-pass and streaming baselines (no dedup) should match exactly"
+        );
+        assert_eq!(
+            single_pass_dedup_total, streaming_dedup_total,
+            "single-pass and two-pass streaming dedup should remove the same minimizers"
+        );
+    }
+
+    #[test]
+    fn test_streaming_dedup_cross_bucket_requires_multiple_buckets() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        create_fasta_file(dir, "single.fa", seq);
+
+        let config_path = create_test_config(
+            dir,
+            "single_streaming.ryxdi",
+            &[("OnlyBucket", &["single.fa"])],
+            32,
+            10,
+        );
+
+        let result = build_parquet_index_from_config_streaming(
+            &config_path,
+            None,
+            None,
+            false,
+            None,
+            true, // dedup_cross_bucket on, but only 1 bucket
+            2,
+        );
+
+        assert!(
+            result.is_err(),
+            "should reject dedup with fewer than 2 buckets"
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("at least 2 buckets"));
     }
 }
