@@ -2735,12 +2735,22 @@ pub fn build_parquet_index_from_config_streaming(
         // alone exceeded a 400GB budget under the old whole-bucket-in-memory
         // approach, regardless of concurrency).
         //
-        // Per-bucket memory budgets are divided by thread count, mirroring
-        // extract_bucket_minimizers_parallel's existing approach, since up to
+        // Per-bucket memory budgets are divided by thread count, since up to
         // that many buckets may have their own accumulator active at once.
+        //
+        // Chunk sizing is derived from `max_shard_size` (not a fresh
+        // `detect_available_memory()` call) so that an explicit `--max-memory`
+        // override actually bounds extraction, not just the shard flush
+        // threshold: the caller sizes `max_shard_size` as roughly half of
+        // whatever memory budget it resolved (CLI override, config value, or
+        // 80% of detected system memory), so doubling it back recovers that
+        // budget instead of silently re-detecting real system memory and
+        // ignoring the override.
         let concurrency = rayon::current_num_threads().max(1);
-        let per_bucket_available =
-            (rype::memory::detect_available_memory().bytes / concurrency).max(1);
+        let overall_available_estimate = max_shard_size
+            .saturating_mul(2)
+            .max(rype::parquet_index::MIN_SHARD_BYTES);
+        let per_bucket_available = (overall_available_estimate / concurrency).max(1);
         let per_bucket_chunk_bytes =
             calculate_chunk_config(per_bucket_available).target_chunk_bytes;
         let per_bucket_shard_size =
