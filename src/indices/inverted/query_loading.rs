@@ -4,7 +4,7 @@ use crate::error::{Result, RypeError};
 use std::path::Path;
 
 use super::InvertedIndex;
-use crate::constants::{DEFAULT_ROW_GROUP_SIZE, QUERY_HASHSET_THRESHOLD};
+use crate::constants::DEFAULT_ROW_GROUP_SIZE;
 
 impl InvertedIndex {
     /// Check if ANY query minimizer might be in this row group's bloom filter.
@@ -204,7 +204,7 @@ fn load_filtered_coo_pairs(
     options: Option<&super::super::parquet::ParquetReadOptions>,
 ) -> Result<Vec<(u64, u32)>> {
     use arrow::array::{Array, UInt32Array, UInt64Array};
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
     use parquet::file::properties::ReaderProperties;
     use parquet::file::reader::FileReader;
     use parquet::file::serialized_reader::{ReadOptionsBuilder, SerializedFileReader};
@@ -240,7 +240,7 @@ fn load_filtered_coo_pairs(
     //
     // When bloom filter is enabled, we keep the reader alive longer to access bloom
     // filters for each row group after statistics filtering.
-    let matching_row_groups: Vec<usize> = {
+    let matching_row_groups: Vec<(usize, u64, u64)> = {
         let file = File::open(path).map_err(|e| RypeError::io(path, "open Parquet shard", e))?;
 
         // Use new_with_options when bloom filter reading is requested
@@ -381,8 +381,20 @@ fn load_filtered_coo_pairs(
             }
 
             bloom_filtered
+                .into_iter()
+                .map(|rg_idx| {
+                    let (rg_min, rg_max) = rg_stats[rg_idx];
+                    (rg_idx, rg_min, rg_max)
+                })
+                .collect::<Vec<(usize, u64, u64)>>()
         } else {
             stats_filtered
+                .into_iter()
+                .map(|rg_idx| {
+                    let (rg_min, rg_max) = rg_stats[rg_idx];
+                    (rg_idx, rg_min, rg_max)
+                })
+                .collect::<Vec<(usize, u64, u64)>>()
         }
     }; // parquet_reader and file handle dropped here
 
@@ -390,19 +402,23 @@ fn load_filtered_coo_pairs(
         return Ok(Vec::new());
     }
 
-    // Filtered loading is always beneficial - even loading 90% of row groups
-    // still filters individual rows within those groups, reducing memory usage.
-    let use_hashset = query_minimizers.len() > QUERY_HASHSET_THRESHOLD;
-    let query_set: Option<std::collections::HashSet<u64>> = if use_hashset {
-        Some(query_minimizers.iter().copied().collect())
-    } else {
-        None
+    // Parse the footer once and reuse it in every per-row-group reader below via
+    // `new_with_metadata`. Without this, each of the (potentially thousands of)
+    // parallel per-row-group tasks below would re-open the file AND re-parse and
+    // re-deserialize the full footer (which itself lists every row group's
+    // statistics) just to build a reader for a single row group.
+    let arrow_metadata = {
+        let file = File::open(path).map_err(|e| RypeError::io(path, "open Parquet shard", e))?;
+        ArrowReaderMetadata::load(&file, Default::default())?
     };
 
     // Parallel read of matching row groups only.
-    // Each row group is internally sorted by minimizer (enforced at write time).
-    // Results from different row groups may overlap, so we sort after concatenation.
-    // Each thread opens its own file handle; OS page cache handles deduplication.
+    // Each row group is internally sorted by minimizer (enforced at write time),
+    // and row groups within a single shard file are non-overlapping contiguous
+    // slices of one globally sorted stream (see comment on the final debug_assert
+    // below). Each thread opens its own file handle for the actual data read (I/O
+    // must be per-thread), but reuses the shared pre-parsed footer metadata; OS
+    // page cache handles data deduplication across threads.
     let path = path.to_path_buf(); // Clone path for parallel closure
 
     // Estimate pairs per row group for pre-allocation.
@@ -411,14 +427,37 @@ fn load_filtered_coo_pairs(
 
     let row_group_results: Vec<Result<Vec<(u64, u32)>>> = matching_row_groups
         .par_iter()
-        .map(|&rg_idx| {
+        .map(|&(rg_idx, rg_min, rg_max)| {
+            // Narrow to the sub-slice of query minimizers that can possibly appear
+            // in this row group's [rg_min, rg_max] range (both sides sorted).
+            let q_start = query_minimizers.partition_point(|&m| m < rg_min);
+            let q_end = query_minimizers.partition_point(|&m| m <= rg_max);
+            let bounded = &query_minimizers[q_start..q_end];
+
+            if bounded.is_empty() {
+                return Ok(Vec::new());
+            }
+
             let file = File::open(&path)?;
-            let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+            let builder =
+                ParquetRecordBatchReaderBuilder::new_with_metadata(file, arrow_metadata.clone());
             let reader = builder.with_row_groups(vec![rg_idx]).build()?;
 
             let mut pairs = Vec::with_capacity(estimated_pairs_per_rg);
 
+            // Two-pointer sorted intersection: `bounded` (query minimizers, unique,
+            // ascending) against the row group's minimizer column (ascending, may
+            // contain runs of duplicate minimizers with different bucket_ids). This
+            // replaces a per-row HashSet/binary_search probe with a linear merge —
+            // both sides are already sorted, so no hashing or per-row search is
+            // needed. `qi` is carried across Arrow batches within this row group
+            // since the column is sorted continuously across batch boundaries.
+            let mut qi = 0usize;
+
             for batch in reader {
+                if qi >= bounded.len() {
+                    break;
+                }
                 let batch = batch?;
 
                 let min_col = batch
@@ -437,17 +476,20 @@ fn load_filtered_coo_pairs(
                         RypeError::format(&path, "Expected UInt32Array for bucket_id column")
                     })?;
 
-                for i in 0..batch.num_rows() {
-                    let m = min_col.value(i);
-                    // Filter: only include pairs where minimizer is in query set
-                    let matches = if let Some(ref hs) = query_set {
-                        hs.contains(&m)
+                let mins: &[u64] = min_col.values();
+                let bids: &[u32] = bid_col.values();
+
+                let mut ri = 0usize;
+                while qi < bounded.len() && ri < mins.len() {
+                    let qv = bounded[qi];
+                    let rv = mins[ri];
+                    if qv < rv {
+                        qi += 1;
+                    } else if qv > rv {
+                        ri += 1;
                     } else {
-                        // Binary search for small query sets
-                        query_minimizers.binary_search(&m).is_ok()
-                    };
-                    if matches {
-                        pairs.push((m, bid_col.value(i)));
+                        pairs.push((rv, bids[ri]));
+                        ri += 1;
                     }
                 }
             }
@@ -459,7 +501,7 @@ fn load_filtered_coo_pairs(
     // Concatenate results from all row groups, adding context for failures
     let mut all_pairs: Vec<(u64, u32)> = Vec::new();
 
-    for (idx, result) in matching_row_groups.iter().zip(row_group_results) {
+    for (&(idx, _, _), result) in matching_row_groups.iter().zip(row_group_results) {
         let pairs = result.map_err(|e| {
             RypeError::io(
                 path.clone(),
@@ -473,10 +515,18 @@ fn load_filtered_coo_pairs(
         all_pairs.extend(pairs);
     }
 
-    // Sort concatenated results to handle overlapping row groups.
-    // Multiple row groups may contain the same minimizer if a bucket list spans
-    // the row group size boundary during write.
-    all_pairs.sort_unstable_by_key(|&(m, _)| m);
+    // Row groups are visited in ascending rg_idx order (matching_row_groups is
+    // built by iterating 0..num_row_groups in order and rayon's par_iter().collect()
+    // preserves input order), and within a single shard file, row groups are
+    // non-overlapping contiguous slices of one globally sorted stream (the writer
+    // emits one continuous sorted (minimizer, bucket_id) stream chunked into row
+    // groups — has_overlapping_shards refers to overlap ACROSS shard files, not
+    // within one). So the concatenation above is already fully sorted; no re-sort
+    // needed.
+    debug_assert!(
+        all_pairs.windows(2).all(|w| w[0].0 <= w[1].0),
+        "load_filtered_coo_pairs: concatenated pairs should already be sorted by minimizer"
+    );
 
     Ok(all_pairs)
 }
@@ -514,11 +564,8 @@ pub fn load_row_group_pairs(
     rg_idx: usize,
     query_minimizers: &[u64],
 ) -> Result<Vec<(u64, u32)>> {
-    use crate::constants::BOUNDED_QUERY_HASHSET_THRESHOLD;
     use arrow::array::{Array, UInt32Array, UInt64Array};
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use parquet::file::reader::FileReader;
-    use parquet::file::serialized_reader::SerializedFileReader;
+    use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
     use parquet::file::statistics::Statistics;
     use std::fs::File;
 
@@ -526,10 +573,14 @@ pub fn load_row_group_pairs(
         return Ok(Vec::new());
     }
 
-    // Open file and get row group metadata
+    // Open the file once and parse the footer once, reusing the same
+    // ArrowReaderMetadata both for statistics (below) and for building the
+    // Arrow reader (further down). Previously this opened the file and parsed
+    // the footer twice per call, which is expensive when a shard has many row
+    // groups (the footer lists every row group's statistics).
     let file = File::open(path).map_err(|e| RypeError::io(path, "open Parquet file", e))?;
-    let parquet_reader = SerializedFileReader::new(file)?;
-    let metadata = parquet_reader.metadata();
+    let arrow_metadata = ArrowReaderMetadata::load(&file, Default::default())?;
+    let metadata = arrow_metadata.metadata();
 
     if rg_idx >= metadata.num_row_groups() {
         return Err(RypeError::validation(format!(
@@ -577,9 +628,6 @@ pub fn load_row_group_pairs(
         }
     };
 
-    // Drop the parquet_reader before doing more work
-    drop(parquet_reader);
-
     // Binary search to find bounded query minimizers
     let q_start = query_minimizers.partition_point(|&m| m < rg_min);
     let q_end = query_minimizers.partition_point(|&m| m <= rg_max);
@@ -591,25 +639,24 @@ pub fn load_row_group_pairs(
 
     let bounded_queries = &query_minimizers[q_start..q_end];
 
-    // Build HashSet from bounded queries for O(1) filtering when set is large enough.
-    // Always build from bounded_queries (not the full query set) for efficiency.
-    let local_set: Option<std::collections::HashSet<u64>> =
-        if bounded_queries.len() > BOUNDED_QUERY_HASHSET_THRESHOLD {
-            Some(bounded_queries.iter().copied().collect())
-        } else {
-            None
-        };
-
-    // Load the row group using Arrow reader
-    let file = File::open(path).map_err(|e| RypeError::io(path, "open Parquet file", e))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    // Build the Arrow reader from the already-parsed metadata (no second footer parse).
+    let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, arrow_metadata);
     let reader = builder.with_row_groups(vec![rg_idx]).build()?;
 
     // Estimate capacity based on row group size
     let estimated_pairs = rg_num_rows / 10; // Assume ~10% match rate
     let mut pairs = Vec::with_capacity(estimated_pairs);
 
+    // Two-pointer sorted intersection against `bounded_queries` (sorted, unique).
+    // The row group's minimizer column is sorted ascending (may contain runs of
+    // duplicate minimizers with different bucket_ids), and `qi` is carried across
+    // Arrow batches since the column is sorted continuously within the row group.
+    let mut qi = 0usize;
+
     for batch in reader {
+        if qi >= bounded_queries.len() {
+            break;
+        }
         let batch = batch?;
 
         let min_col = batch
@@ -624,19 +671,20 @@ pub fn load_row_group_pairs(
             .downcast_ref::<UInt32Array>()
             .ok_or_else(|| RypeError::format(path, "Expected UInt32Array for bucket_id column"))?;
 
-        for i in 0..batch.num_rows() {
-            let m = min_col.value(i);
+        let mins: &[u64] = min_col.values();
+        let bids: &[u32] = bid_col.values();
 
-            // Filter: only include pairs where minimizer is in bounded query set
-            let matches = if let Some(ref hs) = local_set {
-                hs.contains(&m)
+        let mut ri = 0usize;
+        while qi < bounded_queries.len() && ri < mins.len() {
+            let qv = bounded_queries[qi];
+            let rv = mins[ri];
+            if qv < rv {
+                qi += 1;
+            } else if qv > rv {
+                ri += 1;
             } else {
-                // Binary search for small query sets
-                bounded_queries.binary_search(&m).is_ok()
-            };
-
-            if matches {
-                pairs.push((m, bid_col.value(i)));
+                pairs.push((rv, bids[ri]));
+                ri += 1;
             }
         }
     }

@@ -48,15 +48,6 @@ pub(crate) const ESTIMATED_MINIMIZERS_PER_SEQUENCE: usize = 32;
 // Classification Tuning
 // ============================================================================
 
-/// Threshold for switching to HashSet-based lookup in filtered loading.
-/// Above this many query minimizers, use HashSet instead of binary search.
-pub(crate) const QUERY_HASHSET_THRESHOLD: usize = 1000;
-
-/// Threshold for using HashSet vs binary search for bounded query filtering
-/// during row group loading. When the bounded query slice exceeds this size,
-/// build a local HashSet for O(1) lookups instead of O(log n) binary search.
-pub(crate) const BOUNDED_QUERY_HASHSET_THRESHOLD: usize = 100;
-
 /// Estimated buckets per read for HashMap pre-allocation.
 pub(crate) const ESTIMATED_BUCKETS_PER_READ: usize = 4;
 
