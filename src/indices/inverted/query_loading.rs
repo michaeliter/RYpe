@@ -2,9 +2,12 @@
 
 use crate::error::{Result, RypeError};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use super::InvertedIndex;
 use crate::constants::DEFAULT_ROW_GROUP_SIZE;
+use crate::log_timing;
 
 impl InvertedIndex {
     /// Check if ANY query minimizer might be in this row group's bloom filter.
@@ -412,52 +415,112 @@ fn load_filtered_coo_pairs(
         ArrowReaderMetadata::load(&file, Default::default())?
     };
 
-    // Parallel read of matching row groups only.
-    // Each row group is internally sorted by minimizer (enforced at write time),
-    // and row groups within a single shard file are non-overlapping contiguous
-    // slices of one globally sorted stream (see comment on the final debug_assert
-    // below). Each thread opens its own file handle for the actual data read (I/O
-    // must be per-thread), but reuses the shared pre-parsed footer metadata; OS
-    // page cache handles data deduplication across threads.
+    // Parallel read of matching row groups, batched into `num_threads` large
+    // chunks rather than one rayon task per row group.
+    //
+    // A large shard can have on the order of 10,000 matching row groups, and
+    // one-task-per-row-group was measured (via --timing on the real 22GB
+    // perf index) to leave most of the theoretical 12x parallel speedup on
+    // the table — decode+filter work summed to ~90s across tasks but the
+    // parallel map's wall time was ~65s (~1.4x effective speedup, not 12x)
+    // — the tasks are too small and too numerous for rayon to schedule
+    // efficiently, and per-task allocation/file-open overhead dominates.
+    // The single-threaded concatenation afterward cost another ~39s across
+    // ~9,852 small `extend()` calls even after pre-sizing the destination.
+    //
+    // Batching into ~num_threads chunks fixes both: each task now opens one
+    // file and reads many row groups through one `ParquetRecordBatchReader`
+    // (`with_row_groups` accepts multiple indices and streams their batches
+    // in order), and the final concatenation is ~num_threads `extend()`
+    // calls instead of thousands.
+    //
+    // Correctness: row groups within one chunk are contiguous, non-overlapping,
+    // ascending-sorted ranges of one globally sorted stream (established at
+    // write time), so the two-pointer merge can run continuously across an
+    // entire chunk's batch stream using one combined [chunk_min, chunk_max]
+    // bound — no per-row-group bounding is needed within a chunk.
     let path = path.to_path_buf(); // Clone path for parallel closure
 
-    // Estimate pairs per row group for pre-allocation.
-    // We expect query selectivity to filter most rows. Conservative estimate: 10%.
+    // Oversubscribe chunks relative to thread count. Exactly num_threads
+    // chunks (tried first) removed rayon's ability to load-balance: with one
+    // chunk per thread and no spare work, an unevenly-sized chunk (row
+    // groups don't all match the same number of query minimizers) leaves
+    // other threads idle while the straggler finishes alone — measured on
+    // the real 22GB index, shard_load_total got *worse* (146.6s -> 173.5s)
+    // with exactly num_threads chunks despite far fewer file opens.
+    // Oversubscribing gives the work-stealing scheduler enough granularity
+    // to rebalance stragglers, while still cutting file-open/concat count
+    // by roughly this factor vs one task per row group (was ~9,852/shard).
+    const CHUNK_OVERSUBSCRIPTION_FACTOR: usize = 8;
+    let num_threads = rayon::current_num_threads();
+    let num_chunks = (num_threads * CHUNK_OVERSUBSCRIPTION_FACTOR)
+        .min(matching_row_groups.len())
+        .max(1);
+    let chunk_size = matching_row_groups.len().div_ceil(num_chunks);
+    let chunks: Vec<&[(usize, u64, u64)]> = matching_row_groups.chunks(chunk_size).collect();
+
+    // Estimate pairs per row group for pre-allocation, scaled per chunk by
+    // how many row groups it covers. Conservative estimate: 10% selectivity.
+    // (This mirrors the existing shard_reservation memory budget in
+    // memory.rs, which uses the same 10% figure — see SHARD_SELECTIVITY_ESTIMATE.)
     let estimated_pairs_per_rg = DEFAULT_ROW_GROUP_SIZE / 10;
 
-    let row_group_results: Vec<Result<Vec<(u64, u32)>>> = matching_row_groups
+    // Instrumentation: split shard_load_total into "decode" (opening the file,
+    // Snappy/DELTA_BINARY_PACKED decompression, Arrow batch materialization —
+    // all inside the `parquet`/`arrow` crates, not our code) vs "filter" (our
+    // two-pointer sorted-intersection loop below). Only meaningful under
+    // --timing; the atomics are Relaxed fetch_adds, cheap enough to leave on
+    // the hot path unconditionally rather than branch on ENABLE_TIMING per chunk.
+    let decode_ns = AtomicU64::new(0);
+    let filter_ns = AtomicU64::new(0);
+
+    let t_parallel_phase = Instant::now();
+    let chunk_results: Vec<Result<Vec<(u64, u32)>>> = chunks
         .par_iter()
-        .map(|&(rg_idx, rg_min, rg_max)| {
-            // Narrow to the sub-slice of query minimizers that can possibly appear
-            // in this row group's [rg_min, rg_max] range (both sides sorted).
-            let q_start = query_minimizers.partition_point(|&m| m < rg_min);
-            let q_end = query_minimizers.partition_point(|&m| m <= rg_max);
+        .map(|chunk| {
+            // Combined bound spanning the whole chunk — row groups within a
+            // chunk are contiguous and sorted, so one [min, max] pair covers
+            // the entire chunk's minimizer range.
+            let chunk_min = chunk.iter().map(|&(_, min, _)| min).min().unwrap();
+            let chunk_max = chunk.iter().map(|&(_, _, max)| max).max().unwrap();
+            let q_start = query_minimizers.partition_point(|&m| m < chunk_min);
+            let q_end = query_minimizers.partition_point(|&m| m <= chunk_max);
             let bounded = &query_minimizers[q_start..q_end];
 
             if bounded.is_empty() {
                 return Ok(Vec::new());
             }
 
+            let rg_indices: Vec<usize> = chunk.iter().map(|&(rg_idx, _, _)| rg_idx).collect();
+
             let file = File::open(&path)?;
             let builder =
                 ParquetRecordBatchReaderBuilder::new_with_metadata(file, arrow_metadata.clone());
-            let reader = builder.with_row_groups(vec![rg_idx]).build()?;
+            let mut reader = builder.with_row_groups(rg_indices).build()?;
 
-            let mut pairs = Vec::with_capacity(estimated_pairs_per_rg);
+            let mut pairs = Vec::with_capacity(estimated_pairs_per_rg * chunk.len());
 
             // Two-pointer sorted intersection: `bounded` (query minimizers, unique,
-            // ascending) against the row group's minimizer column (ascending, may
-            // contain runs of duplicate minimizers with different bucket_ids). This
-            // replaces a per-row HashSet/binary_search probe with a linear merge —
-            // both sides are already sorted, so no hashing or per-row search is
-            // needed. `qi` is carried across Arrow batches within this row group
-            // since the column is sorted continuously across batch boundaries.
+            // ascending) against this chunk's minimizer column, streamed across
+            // every row group in the chunk (ascending; may contain runs of
+            // duplicate minimizers with different bucket_ids). `qi` is carried
+            // across every batch in the chunk, spanning row-group boundaries,
+            // since the whole chunk is one continuous sorted range.
             let mut qi = 0usize;
 
-            for batch in reader {
+            loop {
                 if qi >= bounded.len() {
                     break;
                 }
+                // Timed around `reader.next()` itself (not `for batch in reader`,
+                // whose desugared `.next()` call runs *before* the loop body —
+                // timing inside the body there measures almost nothing, since the
+                // real decompression work already happened by the time the body
+                // starts). This is the only place actual decode work occurs.
+                let t_decode = Instant::now();
+                let next = reader.next();
+                decode_ns.fetch_add(t_decode.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                let Some(batch) = next else { break };
                 let batch = batch?;
 
                 let min_col = batch
@@ -479,6 +542,7 @@ fn load_filtered_coo_pairs(
                 let mins: &[u64] = min_col.values();
                 let bids: &[u32] = bid_col.values();
 
+                let t_filter = Instant::now();
                 let mut ri = 0usize;
                 while qi < bounded.len() && ri < mins.len() {
                     let qv = bounded[qi];
@@ -492,28 +556,58 @@ fn load_filtered_coo_pairs(
                         ri += 1;
                     }
                 }
+                filter_ns.fetch_add(t_filter.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
 
             Ok(pairs)
         })
         .collect();
 
-    // Concatenate results from all row groups, adding context for failures
-    let mut all_pairs: Vec<(u64, u32)> = Vec::new();
+    log_timing(
+        "load_filtered_coo_pairs: parallel_phase_wall (map+collect, wall time)",
+        t_parallel_phase.elapsed().as_millis(),
+    );
+    log_timing(
+        "load_filtered_coo_pairs: decode (open+decompress+decode, sum across chunk tasks)",
+        (decode_ns.load(Ordering::Relaxed) / 1_000_000) as u128,
+    );
+    log_timing(
+        "load_filtered_coo_pairs: filter (two-pointer intersection, sum across chunk tasks)",
+        (filter_ns.load(Ordering::Relaxed) / 1_000_000) as u128,
+    );
 
-    for (&(idx, _, _), result) in matching_row_groups.iter().zip(row_group_results) {
+    // Concatenate results from all chunks (now ~num_threads of them, not
+    // thousands), adding context for failures. Pre-size from the
+    // already-known per-task lengths to avoid repeated reallocate-and-copy.
+    let t_concat = Instant::now();
+    let total_len: usize = chunk_results
+        .iter()
+        .map(|r| r.as_ref().map(|v| v.len()).unwrap_or(0))
+        .sum();
+    let mut all_pairs: Vec<(u64, u32)> = Vec::with_capacity(total_len);
+
+    for (chunk_idx, result) in chunk_results.into_iter().enumerate() {
         let pairs = result.map_err(|e| {
+            let first_rg = chunks[chunk_idx].first().map(|&(idx, _, _)| idx);
+            let last_rg = chunks[chunk_idx].last().map(|&(idx, _, _)| idx);
             RypeError::io(
                 path.clone(),
-                "read row group",
+                "read row group chunk",
                 std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    format!("row group {}: {}", idx, e),
+                    format!(
+                        "row groups {:?}..={:?}: {}",
+                        first_rg, last_rg, e
+                    ),
                 ),
             )
         })?;
         all_pairs.extend(pairs);
     }
+    log_timing(
+        "load_filtered_coo_pairs: concat (single-threaded extend into all_pairs)",
+        t_concat.elapsed().as_millis(),
+    );
 
     // Row groups are visited in ascending rg_idx order (matching_row_groups is
     // built by iterating 0..num_row_groups in order and rayon's par_iter().collect()
