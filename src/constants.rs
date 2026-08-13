@@ -80,6 +80,20 @@ pub(crate) const COO_MERGE_JOIN_MAX_BUCKETS: usize = 10;
 /// amortize rayon overhead (~10μs per task) against merge-join cost (~1μs per pair).
 pub(crate) const MIN_PARALLEL_SHARD_SIZE: usize = 10_000;
 
+/// Maximum `num_reads` for using per-thread dense-accumulator fold/reduce in a
+/// parallel merge-join. Above this, per-chunk accumulators are sized
+/// `num_reads × stride × 8 bytes` each — with millions of reads, N threads'
+/// worth of full-size accumulators can reach tens of GB. Above the threshold,
+/// use sparse-hit collection (bounded by actual match count, not read count)
+/// plus a single-threaded merge instead.
+///
+/// At DENSE_ACCUMULATOR_MAX_BUCKETS=256 and 8 bytes per bucket:
+/// 256 × 8 × num_reads bytes per accumulator × num_threads.
+/// At 8 threads and 640K reads: 256 × 8 × 640K × 8 ≈ 10 GB — too much.
+/// 500K is a conservative threshold (~80% of theoretical 640K) to stay
+/// well within memory bounds across varying thread counts.
+pub(crate) const FOLD_REDUCE_MAX_READS: usize = 500_000;
+
 // ============================================================================
 // Delimiters
 // ============================================================================

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::constants::{
     COO_MERGE_JOIN_MAX_BUCKETS, DENSE_ACCUMULATOR_MAX_BUCKETS, ESTIMATED_MINIMIZERS_PER_SEQUENCE,
+    FOLD_REDUCE_MAX_READS,
 };
 use crate::core::extraction::get_paired_minimizers_into;
 use crate::core::workspace::MinimizerWorkspace;
@@ -511,14 +512,8 @@ where
 
     // Strategy selection: fold/reduce creates per-thread accumulators.
     // For large batches (millions of short reads), this may exceed available
-    // memory with dense accumulators. Use collect+merge instead.
-    //
-    // At DENSE_ACCUMULATOR_MAX_BUCKETS=256 and 8 bytes per bucket:
-    // 256 × 8 × num_reads bytes per accumulator × num_threads.
-    // At 8 threads and 640K reads: 256 × 8 × 640K × 8 ≈ 10 GB — too much.
-    // 500K is a conservative threshold (~80% of theoretical 640K) to stay
-    // well within memory bounds across varying thread counts.
-    const FOLD_REDUCE_MAX_READS: usize = 500_000;
+    // memory with dense accumulators. Use collect+merge instead. See
+    // FOLD_REDUCE_MAX_READS doc comment (constants.rs) for the memory math.
 
     let t_parallel = Instant::now();
     let total_rgs = filtered_rg_count;
