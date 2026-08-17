@@ -231,25 +231,68 @@ pub fn classify_log_ratio_batch(
     records: &[QueryRecord],
     skip_threshold: Option<f64>,
 ) -> Result<Vec<LogRatioResult>> {
-    let num_queries = records.len();
-    if num_queries == 0 {
+    if records.is_empty() {
         return Ok(Vec::new());
     }
 
     let (k, w, salt) = validate_log_ratio_indices(numerator, denominator)?;
 
-    // Save original query IDs, use sequential 0..N internally.
-    // partition_by_numerator_score uses dense arrays indexed by query_id,
-    // so query IDs must be sequential 0..N.
     let original_ids: Vec<i64> = records.iter().map(|r| r.0).collect();
-    let sequential_ids: Vec<i64> = (0..num_queries as i64).collect();
-
     let extracted = crate::extract_batch_minimizers(k, w, salt, None, records);
+
+    classify_log_ratio_from_extracted(
+        numerator,
+        denominator,
+        &extracted,
+        &original_ids,
+        skip_threshold,
+    )
+}
+
+/// Log-ratio classification from pre-extracted minimizers.
+///
+/// Steps 3-6 of [`classify_log_ratio_batch`], split out so a caller that has
+/// already extracted minimizers does not have to keep the sequence bytes alive.
+/// The Arrow streaming path uses this to drop each input RecordBatch as soon as
+/// its minimizers are extracted, while still classifying many batches' worth of
+/// reads in a single pass over the indices.
+///
+/// `original_ids` supplies one caller-facing query id per entry in `extracted`,
+/// in the same order; the returned results carry those ids.
+pub fn classify_log_ratio_from_extracted(
+    numerator: &ShardedInvertedIndex,
+    denominator: &ShardedInvertedIndex,
+    extracted: &[(Vec<u64>, Vec<u64>)],
+    original_ids: &[i64],
+    skip_threshold: Option<f64>,
+) -> Result<Vec<LogRatioResult>> {
+    let num_queries = extracted.len();
+    if num_queries == 0 {
+        return Ok(Vec::new());
+    }
+    if original_ids.len() != num_queries {
+        return Err(anyhow!(
+            "original_ids length ({}) does not match extracted length ({})",
+            original_ids.len(),
+            num_queries
+        ));
+    }
+
+    // Deliberately re-checked here even when the caller already validated: this
+    // is a public entry point that would otherwise classify against mismatched
+    // or multi-bucket indices and return meaningless ratios. The check reads two
+    // manifests, which is nothing beside the two shard passes below.
+    validate_log_ratio_indices(numerator, denominator)?;
+
+    // Use sequential 0..N internally: partition_by_numerator_score uses dense
+    // arrays indexed by query_id, so query IDs must be sequential 0..N. The
+    // caller's ids are mapped back in at the end.
+    let sequential_ids: Vec<i64> = (0..num_queries as i64).collect();
 
     // Classify against numerator (threshold=0.0 to get all scores)
     let num_results = crate::classify_from_extracted_minimizers(
         numerator,
-        &extracted,
+        extracted,
         &sequential_ids,
         0.0,
         None,
@@ -261,12 +304,16 @@ pub fn classify_log_ratio_batch(
     // Build needs-denom subset
     let needs_denom_set: HashSet<i64> = partition.needs_denom_query_ids.iter().copied().collect();
 
-    let mut denom_extracted = Vec::new();
+    // Borrow the selected reads rather than cloning their minimizers. With the
+    // default skip threshold (disabled) every read needs the denominator, so a
+    // clone here would be a second full copy of the batch's minimizers — at
+    // Arrow group scale that is the largest allocation in the pass.
+    let mut denom_extracted: Vec<&(Vec<u64>, Vec<u64>)> = Vec::new();
     let mut denom_ids = Vec::new();
     for (i, ext) in extracted.iter().enumerate() {
         let seq_id = i as i64;
         if needs_denom_set.contains(&seq_id) {
-            denom_extracted.push(ext.clone());
+            denom_extracted.push(ext);
             denom_ids.push(seq_id);
         }
     }

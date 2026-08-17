@@ -5,6 +5,7 @@
 //! - Platform-specific memory detection
 //! - Batch size calculation based on memory constraints
 
+use crate::constants::DENSE_ACCUMULATOR_MAX_BUCKETS;
 use crate::error::{Result, RypeError};
 
 /// Parse a byte size string with optional suffix.
@@ -921,7 +922,9 @@ const ARROW_BUILDER_OVERHEAD: f64 = 1.5;
 /// - Input records: batch_size * (72 + avg_query_length) for OwnedFastxRecord
 /// - Minimizers: batch_size * minimizers_per_query * 16 bytes (`Vec<u64>` for fwd + rc)
 /// - QueryInvertedIndex CSR: batch_size * minimizers_per_query * 12 bytes
-/// - Accumulators: batch_size * estimated_buckets_per_read * 24 bytes (HashMap overhead)
+/// - Accumulators: dense `batch_size * (num_buckets + 1) * 8` when the index is
+///   small enough for the dense accumulator, otherwise sparse
+///   `batch_size * estimated_buckets_per_read * 24`
 ///
 /// Returns None if arithmetic overflow occurs.
 pub fn estimate_batch_memory(
@@ -946,12 +949,31 @@ pub fn estimate_batch_memory(
         .checked_mul(profile.minimizers_per_query)?
         .checked_mul(12)?;
 
-    // Per-read accumulators: HashMap<u32, (u32, u32)>
-    // Estimate ~4 buckets per read on average
-    let estimated_buckets_per_read = 4.min(num_buckets);
-    let accumulators = batch_size
-        .checked_mul(estimated_buckets_per_read)?
-        .checked_mul(24)?; // HashMap entry overhead
+    // Per-read accumulators. Two implementations exist and the choice is made
+    // per index by classify::sharded::use_dense_accumulator:
+    //
+    // - Dense (max bucket id <= DENSE_ACCUMULATOR_MAX_BUCKETS): a flat
+    //   Vec<(u32, u32)> of batch_size * (max_bucket_id + 1) — 8 bytes per read
+    //   per bucket slot, allocated whether or not the bucket is ever hit. For a
+    //   160-bucket index that is ~1.3 KB per read, which dominates every other
+    //   term here. Modelling this as "~4 buckets per read" under-estimated it by
+    //   more than 10x and produced batch sizes that could not fit the budget.
+    // - Sparse (more buckets than that): per-read HashMap<u32, (u32, u32)>,
+    //   holding only buckets actually hit, ~4 per read on average.
+    //
+    // `num_buckets` is a count while the dense stride is max_bucket_id + 1.
+    // These agree for contiguously numbered buckets, which is what the index
+    // builders produce; an index with sparse bucket ids uses more than this.
+    let accumulators = if num_buckets > 0 && num_buckets <= DENSE_ACCUMULATOR_MAX_BUCKETS {
+        batch_size
+            .checked_mul(num_buckets.checked_add(1)?)?
+            .checked_mul(8)?
+    } else {
+        let estimated_buckets_per_read = 4.min(num_buckets);
+        batch_size
+            .checked_mul(estimated_buckets_per_read)?
+            .checked_mul(24)? // HashMap entry overhead
+    };
 
     // Sum components with overflow checking
     let mut base_estimate = input_records
@@ -1381,6 +1403,53 @@ mod tests {
     }
 
     // === Batch memory estimation tests ===
+
+    /// The dense accumulator allocates a `(u32, u32)` slot per read per bucket
+    /// whether or not the bucket is hit, so its cost scales with the bucket
+    /// count. Modelling it as a sparse "~4 buckets per read" HashMap made the
+    /// estimate independent of bucket count above 4 and understated a 160-bucket
+    /// index by more than 10x — which is how a caller sizing a batch against a
+    /// memory budget ends up OOMing.
+    #[test]
+    fn test_estimate_batch_memory_accounts_for_dense_accumulator() {
+        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+        let batch = 100_000;
+
+        let few = estimate_batch_memory(batch, &profile, 4, false).unwrap();
+        let many = estimate_batch_memory(batch, &profile, 160, false).unwrap();
+
+        // Under the old sparse-only model both used min(4, n) * 24 bytes/read,
+        // making these equal.
+        assert!(
+            many > few,
+            "a 160-bucket index must cost more per batch than a 4-bucket one \
+             (got {} vs {})",
+            many,
+            few
+        );
+
+        // The dense term alone is (num_buckets + 1) * 8 bytes per read.
+        let dense_term = batch * (160 + 1) * 8;
+        assert!(
+            many - few > dense_term / 2,
+            "the difference ({}) should be dominated by the dense accumulator \
+             term ({})",
+            many - few,
+            dense_term
+        );
+
+        // Above the dense threshold the sparse model applies and the per-read
+        // cost stops growing with bucket count.
+        let sparse_a =
+            estimate_batch_memory(batch, &profile, DENSE_ACCUMULATOR_MAX_BUCKETS + 1, false)
+                .unwrap();
+        let sparse_b = estimate_batch_memory(batch, &profile, 100_000, false).unwrap();
+        assert_eq!(
+            sparse_a, sparse_b,
+            "beyond the dense threshold the accumulator estimate is per-hit, \
+             not per-bucket"
+        );
+    }
 
     #[test]
     fn test_estimate_batch_memory_scales_linearly() {

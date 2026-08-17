@@ -79,9 +79,9 @@ pub use classify::{
 
 // Log-ratio types and functions
 pub use classify::log_ratio::{
-    classify_log_ratio_batch, compute_log_ratio, partition_by_numerator_score,
-    validate_compatible_indices, validate_log_ratio_indices, validate_single_bucket_index,
-    FastPath, LogRatioResult, PartitionResult,
+    classify_log_ratio_batch, classify_log_ratio_from_extracted, compute_log_ratio,
+    partition_by_numerator_score, validate_compatible_indices, validate_log_ratio_indices,
+    validate_single_bucket_index, FastPath, LogRatioResult, PartitionResult,
 };
 
 // ============================================================================
