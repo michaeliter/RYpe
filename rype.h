@@ -443,6 +443,10 @@ size_t rype_parse_byte_suffix(const char* str);
  * the CLI would use, given the index characteristics, read profile, and available
  * memory.
  *
+ * With rype_classify_arrow_ex() the returned value is what to pass as
+ * classify_batch_rows; input RecordBatches may then be sized however the caller
+ * likes, since they no longer determine how often the shard loop runs.
+ *
  * @param index            Non-NULL RypeIndex pointer from rype_index_load()
  * @param avg_read_length  Average nucleotide length of individual reads (must be > 0)
  * @param is_paired        Non-zero for paired-end, 0 for single-end
@@ -1330,6 +1334,56 @@ int rype_classify_arrow_best_hit(
 );
 
 /**
+ * Classify from Arrow stream with the input batch size decoupled from the
+ * classification batch size
+ *
+ * rype_classify_arrow() runs one classification pass — one full pass over the
+ * index's Parquet shards — per input RecordBatch, so a caller that wants to
+ * bound the memory held by any single input batch pays for the extra index
+ * passes. This entry point accumulates input batches until
+ * classify_batch_rows reads are pending, extracting each batch's minimizers
+ * and releasing its sequence bytes as it goes, then classifies the group in
+ * one pass.
+ *
+ * Peak sequence residency becomes one input batch rather than one
+ * classification group, and the number of index passes is unchanged. Results
+ * are identical to rype_classify_arrow() for the same input; only the grouping
+ * of output batches differs.
+ *
+ * @param classify_batch_rows  Reads to accumulate per classification pass. 0
+ *                             reproduces rype_classify_arrow() exactly (one
+ *                             pass per input batch). See
+ *                             rype_recommend_batch_size().
+ *
+ * All other parameters, ownership rules, and schemas match
+ * rype_classify_arrow().
+ */
+int rype_classify_arrow_ex(
+    const RypeIndex* index,
+    const RypeNegativeSet* negative_set,
+    struct ArrowArrayStream* input_stream,
+    double threshold,
+    size_t classify_batch_rows,
+    struct ArrowArrayStream* out_stream
+);
+
+/**
+ * Best-hit counterpart to rype_classify_arrow_ex()
+ *
+ * Best-hit filtering applies per classification group. A read is never split
+ * across groups, and one read is one query, so grouping does not change which
+ * hit wins.
+ */
+int rype_classify_arrow_best_hit_ex(
+    const RypeIndex* index,
+    const RypeNegativeSet* negative_set,
+    struct ArrowArrayStream* input_stream,
+    double threshold,
+    size_t classify_batch_rows,
+    struct ArrowArrayStream* out_stream
+);
+
+/**
  * Get the output schema for Arrow classification results
  *
  * @param out_schema  Pointer to caller-allocated ArrowSchema to initialize
@@ -1390,6 +1444,28 @@ int rype_classify_arrow_log_ratio(
     const RypeIndex* denominator,
     struct ArrowArrayStream* input_stream,
     double numerator_skip_threshold,
+    struct ArrowArrayStream* out_stream
+);
+
+/**
+ * Log-ratio classification with the input batch size decoupled from the
+ * classification batch size
+ *
+ * See rype_classify_arrow_ex() for the rationale. classify_batch_rows reads
+ * are accumulated — as minimizers, with each input batch's sequence bytes
+ * released once extracted — before a classification pass runs. 0 reproduces
+ * rype_classify_arrow_log_ratio() exactly.
+ *
+ * The numerator fast-path partition is computed per classification group,
+ * exactly as it is per input batch today; grouping affects neither which reads
+ * take the fast path nor the reported ratios.
+ */
+int rype_classify_arrow_log_ratio_ex(
+    const RypeIndex* numerator,
+    const RypeIndex* denominator,
+    struct ArrowArrayStream* input_stream,
+    double numerator_skip_threshold,
+    size_t classify_batch_rows,
     struct ArrowArrayStream* out_stream
 );
 
