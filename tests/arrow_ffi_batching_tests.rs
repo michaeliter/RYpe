@@ -31,9 +31,10 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 use rype::c_api::{
-    rype_classify_arrow, rype_classify_arrow_ex, rype_classify_arrow_log_ratio,
-    rype_classify_arrow_log_ratio_ex, rype_get_last_error, rype_index_free, rype_index_load,
-    rype_negative_set_create, rype_negative_set_free, RypeIndex, RypeNegativeSet,
+    rype_classify_arrow, rype_classify_arrow_best_hit, rype_classify_arrow_best_hit_ex,
+    rype_classify_arrow_ex, rype_classify_arrow_log_ratio, rype_classify_arrow_log_ratio_ex,
+    rype_get_last_error, rype_index_free, rype_index_load, rype_negative_set_create,
+    rype_negative_set_free, RypeIndex, RypeNegativeSet,
 };
 use rype::{
     create_parquet_inverted_index, extract_into, BucketData, MinimizerWorkspace,
@@ -93,6 +94,34 @@ fn make_input_batches(count: usize, per_batch: usize) -> Vec<RecordBatch> {
     batches
 }
 
+/// Batches whose reads alternate between slices of the bucket-`seed` reference
+/// (every minimizer present, so numerator score 1.0) and novel sequences (score
+/// ~0). A skip threshold between the two therefore splits the batch, which is
+/// what makes the log-ratio fast path observable — the shared
+/// `make_input_batches` fixture scores all-or-nothing and cannot produce a mix.
+fn make_mixed_input_batches(count: usize, per_batch: usize, seed: u64) -> Vec<RecordBatch> {
+    let reference = generate_sequence(4000, seed);
+    let mut batches = Vec::new();
+    let mut next = 0usize;
+    while next < count {
+        let end = (next + per_batch).min(count);
+        let ids: Vec<i64> = (next..end).map(|i| i as i64).collect();
+        let seqs: Vec<Vec<u8>> = (next..end)
+            .map(|i| {
+                if i % 2 == 0 {
+                    let off = (i * 97) % (reference.len() - 150);
+                    reference[off..off + 150].to_vec()
+                } else {
+                    generate_sequence(150, 900_000 + i as u64)
+                }
+            })
+            .collect();
+        batches.push(make_batch(&ids, &seqs));
+        next = end;
+    }
+    batches
+}
+
 fn ffi_input_stream(batches: Vec<RecordBatch>) -> FFI_ArrowArrayStream {
     let schema = input_schema();
     let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
@@ -109,8 +138,13 @@ fn last_error() -> String {
         .into_owned()
 }
 
+/// One classification result row: (query_id, bucket_id, score).
+type HitRow = (i64, u32, f64);
+/// One log-ratio result row: (query_id, log_ratio, fast_path).
+type LogRatioRow = (i64, f64, i32);
+
 /// Drain an output stream into (batch count, rows sorted for comparison).
-fn drain_hits(out: FFI_ArrowArrayStream) -> Result<(usize, Vec<(i64, u32, f64)>)> {
+fn drain_hits(out: FFI_ArrowArrayStream) -> Result<(usize, Vec<HitRow>)> {
     let mut out = out;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut out) }?;
     let mut batch_count = 0usize;
@@ -142,7 +176,7 @@ fn drain_hits(out: FFI_ArrowArrayStream) -> Result<(usize, Vec<(i64, u32, f64)>)
 }
 
 /// Drain a log-ratio output stream into (batch count, rows sorted by query id).
-fn drain_log_ratios(out: FFI_ArrowArrayStream) -> Result<(usize, Vec<(i64, f64, i32)>)> {
+fn drain_log_ratios(out: FFI_ArrowArrayStream) -> Result<(usize, Vec<LogRatioRow>)> {
     let mut out = out;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut out) }?;
     let mut batch_count = 0usize;
@@ -307,6 +341,26 @@ fn classify_arrow_ex_negative_filtering_is_independent_of_input_batching() -> Re
         "negative filtering must not depend on input batching"
     );
     assert_eq!(accumulated_batches, 1);
+
+    // Both runs above pass a negative set, so if filtering silently became a
+    // no-op — an empty hitting set, or the retain loop in classify_arrow_internal
+    // deleted — they would shift together and still compare equal. Pin that the
+    // negative set actually changes the outcome.
+    let mut input = ffi_input_stream(make_input_batches(48, 6));
+    let mut out = FFI_ArrowArrayStream::empty();
+    let rc =
+        unsafe { rype_classify_arrow_ex(index, std::ptr::null(), &mut input, 0.0, 48, &mut out) };
+    assert_eq!(rc, 0, "unfiltered run failed: {}", last_error());
+    let (_, unfiltered) = drain_hits(out)?;
+    assert!(
+        !unfiltered.is_empty(),
+        "fixture produced no hits — nothing to filter"
+    );
+    assert_ne!(
+        accumulated, unfiltered,
+        "the negative index shares seed 7 with the positive one, so filtering \
+         must change the results; identical output means it did nothing"
+    );
 
     rype_negative_set_free(neg_set);
     rype_index_free(neg_index);
@@ -528,5 +582,180 @@ fn classify_arrow_ex_rejects_null_index() -> Result<()> {
         "error should name the index pointer, got: {}",
         last_error()
     );
+    Ok(())
+}
+
+/// `rype_classify_arrow_best_hit_ex` is the one `_ex` variant whose reduction is
+/// applied per classification group rather than per input batch, so widening the
+/// group widens what `filter_best_hits` sees. Query ids are unique per read here,
+/// as the header requires, and under that precondition grouping must not change
+/// which hit wins.
+#[test]
+fn classify_arrow_best_hit_ex_results_are_independent_of_input_batching() -> Result<()> {
+    let dir = tempdir()?;
+    let index_path = build_index(dir.path(), "pos.ryxdi", &[7, 11])?;
+    let index = load(&index_path);
+
+    // Baseline: the pre-existing best-hit entry point, one input batch.
+    let mut input = ffi_input_stream(make_input_batches(64, 64));
+    let mut out = FFI_ArrowArrayStream::empty();
+    let rc =
+        unsafe { rype_classify_arrow_best_hit(index, std::ptr::null(), &mut input, 0.0, &mut out) };
+    assert_eq!(rc, 0, "best_hit failed: {}", last_error());
+    let (baseline_batches, baseline) = drain_hits(out)?;
+    assert_eq!(baseline_batches, 1);
+    assert!(!baseline.is_empty(), "fixture produced no hits");
+
+    // Best-hit must actually reduce: without this the test would pass even if
+    // filter_best_hits were dropped from the pipeline entirely.
+    let mut input = ffi_input_stream(make_input_batches(64, 64));
+    let mut out = FFI_ArrowArrayStream::empty();
+    let rc = unsafe { rype_classify_arrow(index, std::ptr::null(), &mut input, 0.0, &mut out) };
+    assert_eq!(rc, 0);
+    let (_, all_hits) = drain_hits(out)?;
+    assert!(
+        baseline.len() < all_hits.len(),
+        "best-hit kept {} of {} rows — it is not filtering",
+        baseline.len(),
+        all_hits.len()
+    );
+    // One row per query at most is the defining property.
+    let mut ids: Vec<i64> = baseline.iter().map(|r| r.0).collect();
+    let total = ids.len();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), total, "best-hit emitted a query id twice");
+
+    // 16 input batches, one classification group: one pass, same winners.
+    let mut input = ffi_input_stream(make_input_batches(64, 4));
+    let mut out = FFI_ArrowArrayStream::empty();
+    let rc = unsafe {
+        rype_classify_arrow_best_hit_ex(index, std::ptr::null(), &mut input, 0.0, 64, &mut out)
+    };
+    assert_eq!(rc, 0, "best_hit_ex failed: {}", last_error());
+    let (accumulated_batches, accumulated) = drain_hits(out)?;
+    assert_eq!(
+        accumulated, baseline,
+        "grouping changed which hit won per query"
+    );
+    assert_eq!(
+        accumulated_batches, 1,
+        "expected a single classification pass"
+    );
+
+    // Four groups of 16: still one winner per query, unchanged.
+    let mut input = ffi_input_stream(make_input_batches(64, 4));
+    let mut out = FFI_ArrowArrayStream::empty();
+    let rc = unsafe {
+        rype_classify_arrow_best_hit_ex(index, std::ptr::null(), &mut input, 0.0, 16, &mut out)
+    };
+    assert_eq!(rc, 0, "best_hit_ex failed: {}", last_error());
+    let (grouped_batches, grouped) = drain_hits(out)?;
+    assert_eq!(grouped, baseline, "regrouping changed the best hits");
+    assert_eq!(
+        grouped_batches, 4,
+        "expected 64/16 = 4 classification passes"
+    );
+
+    // classify_batch_rows=0 reproduces one pass per input batch.
+    let mut input = ffi_input_stream(make_input_batches(64, 4));
+    let mut out = FFI_ArrowArrayStream::empty();
+    let rc = unsafe {
+        rype_classify_arrow_best_hit_ex(index, std::ptr::null(), &mut input, 0.0, 0, &mut out)
+    };
+    assert_eq!(rc, 0, "best_hit_ex failed: {}", last_error());
+    let (per_batch_batches, _) = drain_hits(out)?;
+    assert_eq!(per_batch_batches, 16);
+
+    rype_index_free(index);
+    Ok(())
+}
+
+/// The log-ratio fast path partitions each group into "numerator score is high
+/// enough to skip the denominator" and "needs the denominator". That partition is
+/// computed per group, so it is the part most exposed to a change in group size —
+/// and with `numerator_skip_threshold = 0.0` (as the other log-ratio test uses)
+/// it never runs at all, because the threshold is then disabled.
+#[test]
+fn classify_arrow_log_ratio_ex_fast_path_split_is_independent_of_input_batching() -> Result<()> {
+    const FAST_NONE: i32 = 0;
+    const FAST_NUM_HIGH: i32 = 1;
+
+    let dir = tempdir()?;
+    let num_path = build_index(dir.path(), "num.ryxdi", &[7])?;
+    let denom_path = build_index(dir.path(), "denom.ryxdi", &[11])?;
+    let num = load(&num_path);
+    let denom = load(&denom_path);
+
+    // Half the reads are slices of the numerator reference (score 1.0), half are
+    // novel (score ~0); 0.5 splits them.
+    let threshold = 0.5;
+
+    let mut input = ffi_input_stream(make_mixed_input_batches(32, 32, 7));
+    let mut out = FFI_ArrowArrayStream::empty();
+    let rc = unsafe { rype_classify_arrow_log_ratio(num, denom, &mut input, threshold, &mut out) };
+    assert_eq!(rc, 0, "log_ratio failed: {}", last_error());
+    let (_, baseline) = drain_log_ratios(out)?;
+    assert_eq!(baseline.len(), 32, "one result per read");
+
+    // Pin the premise: both branches must be represented, or the assertions
+    // below would hold for a classifier that never took the fast path.
+    let fast = baseline.iter().filter(|r| r.2 == FAST_NUM_HIGH).count();
+    let exact = baseline.iter().filter(|r| r.2 == FAST_NONE).count();
+    assert!(
+        fast > 0 && exact > 0,
+        "fixture must produce both fast-path and exact reads, got fast={} exact={}",
+        fast,
+        exact
+    );
+    // Fast-path reads are assigned +inf without a denominator pass.
+    for row in baseline.iter().filter(|r| r.2 == FAST_NUM_HIGH) {
+        assert!(
+            row.1.is_infinite() && row.1 > 0.0,
+            "fast-path read {} should be +inf, got {}",
+            row.0,
+            row.1
+        );
+    }
+
+    // Same reads over 8 input batches, one group: identical ratios and identical
+    // per-read fast-path flags.
+    let mut input = ffi_input_stream(make_mixed_input_batches(32, 4, 7));
+    let mut out = FFI_ArrowArrayStream::empty();
+    let rc = unsafe {
+        rype_classify_arrow_log_ratio_ex(num, denom, &mut input, threshold, 32, &mut out)
+    };
+    assert_eq!(rc, 0, "log_ratio_ex failed: {}", last_error());
+    let (one_group_batches, one_group) = drain_log_ratios(out)?;
+    assert_eq!(one_group, baseline, "batching changed the fast-path split");
+    assert_eq!(one_group_batches, 1);
+
+    // Four groups of 8: the partition is per group, so this is the case where a
+    // group-size dependency would surface.
+    let mut input = ffi_input_stream(make_mixed_input_batches(32, 4, 7));
+    let mut out = FFI_ArrowArrayStream::empty();
+    let rc =
+        unsafe { rype_classify_arrow_log_ratio_ex(num, denom, &mut input, threshold, 8, &mut out) };
+    assert_eq!(rc, 0, "log_ratio_ex failed: {}", last_error());
+    let (multi_batches, multi) = drain_log_ratios(out)?;
+    assert_eq!(multi, baseline, "regrouping changed the fast-path split");
+    assert_eq!(multi_batches, 4, "expected 32/8 = 4 classification passes");
+
+    // classify_batch_rows=0 must reproduce one pass per input batch, which no
+    // log-ratio test covered before.
+    let mut input = ffi_input_stream(make_mixed_input_batches(32, 4, 7));
+    let mut out = FFI_ArrowArrayStream::empty();
+    let rc =
+        unsafe { rype_classify_arrow_log_ratio_ex(num, denom, &mut input, threshold, 0, &mut out) };
+    assert_eq!(rc, 0, "log_ratio_ex failed: {}", last_error());
+    let (per_batch_batches, per_batch) = drain_log_ratios(out)?;
+    assert_eq!(per_batch, baseline);
+    assert_eq!(
+        per_batch_batches, 8,
+        "classify_batch_rows=0 must classify each input batch on its own"
+    );
+
+    rype_index_free(denom);
+    rype_index_free(num);
     Ok(())
 }
