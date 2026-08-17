@@ -190,7 +190,8 @@ pub fn classify_arrow_batch_sharded_best_hit(
 ///
 /// # Errors
 ///
-/// Returns an error if classification fails or the results cannot be encoded.
+/// Returns an error if `query_ids` and `extracted` differ in length, if
+/// classification fails, or if the results cannot be encoded.
 pub fn classify_arrow_from_extracted(
     sharded: &ShardedInvertedIndex,
     extracted: Vec<(Vec<u64>, Vec<u64>)>,
@@ -198,6 +199,18 @@ pub fn classify_arrow_from_extracted(
     threshold: f64,
     best_hit_only: bool,
 ) -> Result<RecordBatch, ArrowClassifyError> {
+    // Checked rather than documented: the scoring loop pairs reads with ids by
+    // position and stops at the shorter of the two, so a mismatch silently drops
+    // the tail instead of failing. classify_log_ratio_from_extracted rejects the
+    // same mismatch; this is the plain path's equivalent.
+    if query_ids.len() != extracted.len() {
+        return Err(ArrowClassifyError::Classification(format!(
+            "query_ids length ({}) does not match extracted length ({})",
+            query_ids.len(),
+            extracted.len()
+        )));
+    }
+
     let hits =
         crate::classify_from_extracted_minimizers(sharded, &extracted, query_ids, threshold, None)
             .map_err(|e| ArrowClassifyError::Classification(e.to_string()))?;
@@ -222,6 +235,13 @@ fn classify_arrow_batch_sharded_internal(
 ) -> Result<RecordBatch, ArrowClassifyError> {
     let records = batch_to_records(batch)?;
     let manifest = sharded.manifest();
+
+    // Timed to match classify_batch_sharded_merge_join, whose extraction step
+    // this replaces: --timing must still report an extraction phase for the
+    // Arrow path. `records` borrows `batch`, so there is nothing to release
+    // early here — batch_to_records is zero-copy and the sequence bytes belong
+    // to the caller's RecordBatch either way.
+    let t_extract = std::time::Instant::now();
     let extracted = crate::extract_batch_minimizers(
         manifest.k,
         manifest.w,
@@ -229,8 +249,9 @@ fn classify_arrow_batch_sharded_internal(
         negative_mins,
         &records,
     );
+    crate::log_timing("merge_join: extraction", t_extract.elapsed().as_millis());
+
     let query_ids: Vec<i64> = records.iter().map(|(id, _, _)| *id).collect();
-    drop(records);
 
     classify_arrow_from_extracted(sharded, extracted, &query_ids, threshold, best_hit_only)
 }
@@ -328,6 +349,39 @@ mod tests {
         assert_eq!(result.schema().field(0).name(), COL_QUERY_ID);
         assert_eq!(result.schema().field(1).name(), COL_BUCKET_ID);
         assert_eq!(result.schema().field(2).name(), COL_SCORE);
+    }
+
+    /// A length mismatch must be rejected, not absorbed. The scoring loop pairs
+    /// reads with ids positionally and stops at the shorter of the two, so
+    /// without this guard the extra reads are classified and then silently
+    /// dropped — a short result batch and no error. The log-ratio sibling,
+    /// classify_log_ratio_from_extracted, rejects the same mismatch.
+    #[test]
+    fn test_classify_arrow_from_extracted_rejects_length_mismatch() {
+        let (_dir, index) = create_test_parquet_index();
+        let query_seq = generate_sequence(100, 0);
+        let records: Vec<crate::QueryRecord> = vec![
+            (1, query_seq.as_slice(), None),
+            (2, query_seq.as_slice(), None),
+            (3, query_seq.as_slice(), None),
+        ];
+        let manifest = index.manifest();
+        let extracted =
+            crate::extract_batch_minimizers(manifest.k, manifest.w, manifest.salt, None, &records);
+
+        // Three reads, two ids.
+        let err = classify_arrow_from_extracted(&index, extracted.clone(), &[1, 2], 0.0, false)
+            .expect_err("length mismatch must be an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("2") && msg.contains("3"),
+            "error should report both lengths, got: {}",
+            msg
+        );
+
+        // Matching lengths still work.
+        classify_arrow_from_extracted(&index, extracted, &[1, 2, 3], 0.0, false)
+            .expect("matching lengths should classify");
     }
 
     #[test]
