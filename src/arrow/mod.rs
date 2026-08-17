@@ -247,10 +247,19 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
 
-    /// Helper to generate a DNA sequence.
-    fn generate_sequence(len: usize, seed: u8) -> Vec<u8> {
+    /// Deterministic pseudo-DNA. Distinct `seed`s give distinct minimizer sets;
+    /// a period-4 pattern would make every seed a rotation of the same sequence.
+    fn generate_sequence(len: usize, seed: u64) -> Vec<u8> {
         let bases = [b'A', b'C', b'G', b'T'];
-        (0..len).map(|i| bases[(i + seed as usize) % 4]).collect()
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                bases[((state >> 33) % 4) as usize]
+            })
+            .collect()
     }
 
     /// Helper to create a test batch.

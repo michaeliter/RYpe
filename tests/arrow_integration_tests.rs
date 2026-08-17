@@ -21,10 +21,24 @@ use rype::{
     MinimizerWorkspace, ParquetWriteOptions, ShardedInvertedIndex,
 };
 
-/// Generate a DNA sequence of given length with a deterministic pattern.
-fn generate_sequence(len: usize, seed: u8) -> Vec<u8> {
+/// Deterministic pseudo-DNA. Distinct `seed`s give distinct minimizer sets.
+///
+/// A period-4 pattern (`bases[(i + seed) % 4]`) will not do here: every seed is
+/// then a rotation of `ACGT...`, so all references and queries share one
+/// minimizer set and every hit scores 1.0. Under such a fixture the threshold is
+/// dead weight — a classifier that ignored it entirely would pass every test in
+/// this file.
+fn generate_sequence(len: usize, seed: u64) -> Vec<u8> {
     let bases = [b'A', b'C', b'G', b'T'];
-    (0..len).map(|i| bases[(i + seed as usize) % 4]).collect()
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+    (0..len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            bases[((state >> 33) % 4) as usize]
+        })
+        .collect()
 }
 
 /// Create a test batch with the expected schema.
@@ -230,7 +244,7 @@ fn test_arrow_large_batch() -> Result<()> {
     let num_queries = 1000;
     let ids: Vec<i64> = (0..num_queries).collect();
     let sequences: Vec<Vec<u8>> = (0..num_queries)
-        .map(|i| generate_sequence(100, (i % 4) as u8))
+        .map(|i| generate_sequence(100, (i % 4) as u64))
         .collect();
     let seq_refs: Vec<&[u8]> = sequences.iter().map(|s| s.as_slice()).collect();
 
@@ -279,19 +293,43 @@ fn test_arrow_streaming_multiple_batches() -> Result<()> {
 fn test_arrow_threshold_filtering() -> Result<()> {
     let (_dir, index) = create_test_parquet_index();
 
-    let query_seq = generate_sequence(100, 0);
-    let batch = make_test_batch(&[1], &[&query_seq]);
+    // A query that fully matches bucket 1 scores 1.0 and a query that matches
+    // nothing is never reported, so neither can distinguish one threshold from
+    // another. Use a chimera — half of bucket 1's reference, half novel — which
+    // lands strictly between 0 and 1 and so is reported at a low threshold and
+    // filtered at a high one.
+    let ref_seq = generate_sequence(100, 0);
+    let novel = generate_sequence(100, 9_001);
+    let mut chimera = ref_seq[..50].to_vec();
+    chimera.extend_from_slice(&novel[..50]);
+    let batch = make_test_batch(&[1], &[&chimera]);
 
-    // With very high threshold
-    let high_result = classify_arrow_batch_sharded(&index, None, &batch, 1.0)?;
-
-    // With zero threshold
     let low_result = classify_arrow_batch_sharded(&index, None, &batch, 0.0)?;
+    let high_result = classify_arrow_batch_sharded(&index, None, &batch, 0.99)?;
 
-    // High threshold should filter more results
+    // Pin the premise: the chimera must actually score in between, otherwise the
+    // comparison below would hold for uninteresting reasons.
+    let scores = low_result
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert!(low_result.num_rows() > 0, "chimera should hit bucket 1");
+    let score = scores.value(0);
     assert!(
-        low_result.num_rows() >= high_result.num_rows(),
-        "Lower threshold should have more or equal results"
+        score > 0.0 && score < 0.99,
+        "chimera score {} must be strictly between the two thresholds for this \
+         test to discriminate",
+        score
+    );
+
+    // Strictly fewer, not merely "no more": a classifier that ignored the
+    // threshold would satisfy >= but not >.
+    assert!(
+        low_result.num_rows() > high_result.num_rows(),
+        "raising the threshold above the score must drop the hit (low={}, high={})",
+        low_result.num_rows(),
+        high_result.num_rows()
     );
 
     Ok(())
