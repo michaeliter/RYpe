@@ -98,7 +98,7 @@ use std::collections::HashSet;
 
 use arrow::record_batch::RecordBatch;
 
-use crate::{classify_batch_sharded_merge_join, ShardedInvertedIndex};
+use crate::ShardedInvertedIndex;
 
 /// Classify sequences from an Arrow RecordBatch using a ShardedInvertedIndex.
 ///
@@ -166,6 +166,65 @@ pub fn classify_arrow_batch_sharded_best_hit(
     classify_arrow_batch_sharded_internal(sharded, negative_mins, batch, threshold, true)
 }
 
+/// Classify from pre-extracted minimizers and build the result RecordBatch.
+///
+/// The tail of [`classify_arrow_batch_sharded`] — classify, optionally reduce to
+/// the best hit per query, encode — split out so a caller that has already
+/// extracted minimizers does not have to keep the sequence bytes alive. The
+/// Arrow FFI streaming path uses this to drop each input RecordBatch as soon as
+/// its minimizers are extracted, while still classifying many batches' worth of
+/// reads in a single pass over the shards. Mirrors
+/// [`crate::classify_log_ratio_from_extracted`] on the log-ratio path.
+///
+/// Negative filtering is the caller's responsibility here: `extracted` must
+/// already have had any negative-set minimizers removed.
+///
+/// `query_ids` supplies one caller-facing query id per entry in `extracted`, in
+/// the same order.
+///
+/// Takes `extracted` by value and releases it as soon as classification is done,
+/// before the result columns are built. That ordering is the reason this is a
+/// shared function rather than a snippet each caller repeats: with a large
+/// accumulated group the minimizers and the output columns are both substantial,
+/// and holding them at the same time is what the streaming path exists to avoid.
+///
+/// # Errors
+///
+/// Returns an error if `query_ids` and `extracted` differ in length, if
+/// classification fails, or if the results cannot be encoded.
+pub fn classify_arrow_from_extracted(
+    sharded: &ShardedInvertedIndex,
+    extracted: Vec<(Vec<u64>, Vec<u64>)>,
+    query_ids: &[i64],
+    threshold: f64,
+    best_hit_only: bool,
+) -> Result<RecordBatch, ArrowClassifyError> {
+    // Checked rather than documented: the scoring loop pairs reads with ids by
+    // position and stops at the shorter of the two, so a mismatch silently drops
+    // the tail instead of failing. classify_log_ratio_from_extracted rejects the
+    // same mismatch; this is the plain path's equivalent.
+    if query_ids.len() != extracted.len() {
+        return Err(ArrowClassifyError::Classification(format!(
+            "query_ids length ({}) does not match extracted length ({})",
+            query_ids.len(),
+            extracted.len()
+        )));
+    }
+
+    let hits =
+        crate::classify_from_extracted_minimizers(sharded, &extracted, query_ids, threshold, None)
+            .map_err(|e| ArrowClassifyError::Classification(e.to_string()))?;
+    drop(extracted);
+
+    let hits = if best_hit_only {
+        crate::classify::filter_best_hits(hits)
+    } else {
+        hits
+    };
+
+    hits_to_record_batch(hits)
+}
+
 /// Internal implementation that supports both regular and best-hit modes.
 fn classify_arrow_batch_sharded_internal(
     sharded: &ShardedInvertedIndex,
@@ -175,16 +234,26 @@ fn classify_arrow_batch_sharded_internal(
     best_hit_only: bool,
 ) -> Result<RecordBatch, ArrowClassifyError> {
     let records = batch_to_records(batch)?;
-    let hits = classify_batch_sharded_merge_join(sharded, negative_mins, &records, threshold, None)
-        .map_err(|e| ArrowClassifyError::Classification(e.to_string()))?;
+    let manifest = sharded.manifest();
 
-    let hits = if best_hit_only {
-        crate::classify::filter_best_hits(hits)
-    } else {
-        hits
-    };
+    // Timed to match classify_batch_sharded_merge_join, whose extraction step
+    // this replaces: --timing must still report an extraction phase for the
+    // Arrow path. `records` borrows `batch`, so there is nothing to release
+    // early here — batch_to_records is zero-copy and the sequence bytes belong
+    // to the caller's RecordBatch either way.
+    let t_extract = std::time::Instant::now();
+    let extracted = crate::extract_batch_minimizers(
+        manifest.k,
+        manifest.w,
+        manifest.salt,
+        negative_mins,
+        &records,
+    );
+    crate::log_timing("merge_join: extraction", t_extract.elapsed().as_millis());
 
-    hits_to_record_batch(hits)
+    let query_ids: Vec<i64> = records.iter().map(|(id, _, _)| *id).collect();
+
+    classify_arrow_from_extracted(sharded, extracted, &query_ids, threshold, best_hit_only)
 }
 
 #[cfg(test)]
@@ -199,10 +268,19 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
 
-    /// Helper to generate a DNA sequence.
-    fn generate_sequence(len: usize, seed: u8) -> Vec<u8> {
+    /// Deterministic pseudo-DNA. Distinct `seed`s give distinct minimizer sets;
+    /// a period-4 pattern would make every seed a rotation of the same sequence.
+    fn generate_sequence(len: usize, seed: u64) -> Vec<u8> {
         let bases = [b'A', b'C', b'G', b'T'];
-        (0..len).map(|i| bases[(i + seed as usize) % 4]).collect()
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                bases[((state >> 33) % 4) as usize]
+            })
+            .collect()
     }
 
     /// Helper to create a test batch.
@@ -271,6 +349,39 @@ mod tests {
         assert_eq!(result.schema().field(0).name(), COL_QUERY_ID);
         assert_eq!(result.schema().field(1).name(), COL_BUCKET_ID);
         assert_eq!(result.schema().field(2).name(), COL_SCORE);
+    }
+
+    /// A length mismatch must be rejected, not absorbed. The scoring loop pairs
+    /// reads with ids positionally and stops at the shorter of the two, so
+    /// without this guard the extra reads are classified and then silently
+    /// dropped — a short result batch and no error. The log-ratio sibling,
+    /// classify_log_ratio_from_extracted, rejects the same mismatch.
+    #[test]
+    fn test_classify_arrow_from_extracted_rejects_length_mismatch() {
+        let (_dir, index) = create_test_parquet_index();
+        let query_seq = generate_sequence(100, 0);
+        let records: Vec<crate::QueryRecord> = vec![
+            (1, query_seq.as_slice(), None),
+            (2, query_seq.as_slice(), None),
+            (3, query_seq.as_slice(), None),
+        ];
+        let manifest = index.manifest();
+        let extracted =
+            crate::extract_batch_minimizers(manifest.k, manifest.w, manifest.salt, None, &records);
+
+        // Three reads, two ids.
+        let err = classify_arrow_from_extracted(&index, extracted.clone(), &[1, 2], 0.0, false)
+            .expect_err("length mismatch must be an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("2") && msg.contains("3"),
+            "error should report both lengths, got: {}",
+            msg
+        );
+
+        // Matching lengths still work.
+        classify_arrow_from_extracted(&index, extracted, &[1, 2, 3], 0.0, false)
+            .expect("matching lengths should classify");
     }
 
     #[test]

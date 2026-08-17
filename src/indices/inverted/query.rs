@@ -1,6 +1,7 @@
 //! Query inverted index for merge-join classification.
 
 use crate::constants::{MAX_READS, RC_FLAG_BIT, READ_INDEX_MASK};
+use std::borrow::Borrow;
 
 /// Query inverted index for merge-join classification.
 /// Stores sorted COO (coordinate) entries: (minimizer, packed_read_id).
@@ -107,13 +108,20 @@ impl QueryInvertedIndex {
     /// * `queries` - For each read: (forward_minimizers, reverse_complement_minimizers).
     ///   Each vector should be sorted and deduplicated (as returned by `get_paired_minimizers_into`).
     ///
+    /// Generic over `Borrow` so a caller can pass either the owned
+    /// `&[(Vec<u64>, Vec<u64>)]` or a borrowed selection
+    /// `&[&(Vec<u64>, Vec<u64>)]`. The latter lets a caller classify a subset of
+    /// an already-extracted batch without cloning the minimizers of the reads it
+    /// selects — see `classify_log_ratio_from_extracted`, where the subset is
+    /// most of the batch.
+    ///
     /// # Returns
     /// A QueryInvertedIndex with sorted COO entries.
     ///
     /// # Panics
     /// - If `queries.len()` exceeds `MAX_READS` (2^31 - 1)
     /// - If total minimizer count overflows `usize`
-    pub fn build(queries: &[(Vec<u64>, Vec<u64>)]) -> Self {
+    pub fn build<Q: Borrow<(Vec<u64>, Vec<u64>)>>(queries: &[Q]) -> Self {
         assert!(
             queries.len() <= Self::MAX_READS,
             "Batch size {} exceeds maximum {} reads (31-bit limit)",
@@ -135,7 +143,8 @@ impl QueryInvertedIndex {
         let mut fwd_counts = Vec::with_capacity(queries.len());
         let mut rc_counts = Vec::with_capacity(queries.len());
 
-        for (fwd, rc) in queries {
+        for q in queries {
+            let (fwd, rc) = q.borrow();
             total_entries = total_entries
                 .checked_add(fwd.len())
                 .and_then(|t| t.checked_add(rc.len()))
@@ -155,7 +164,8 @@ impl QueryInvertedIndex {
 
         // Collect all (minimizer, packed_read_id) tuples
         let mut entries: Vec<(u64, u32)> = Vec::with_capacity(total_entries);
-        for (read_idx, (fwd, rc)) in queries.iter().enumerate() {
+        for (read_idx, q) in queries.iter().enumerate() {
+            let (fwd, rc) = q.borrow();
             let read_idx = read_idx as u32;
             for &m in fwd {
                 entries.push((m, Self::pack_read_id(read_idx, false)));
