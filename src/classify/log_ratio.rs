@@ -300,12 +300,16 @@ pub fn classify_log_ratio_from_extracted(
     // Build needs-denom subset
     let needs_denom_set: HashSet<i64> = partition.needs_denom_query_ids.iter().copied().collect();
 
-    let mut denom_extracted = Vec::new();
+    // Borrow the selected reads rather than cloning their minimizers. With the
+    // default skip threshold (disabled) every read needs the denominator, so a
+    // clone here would be a second full copy of the batch's minimizers — at
+    // Arrow group scale that is the largest allocation in the pass.
+    let mut denom_extracted: Vec<&(Vec<u64>, Vec<u64>)> = Vec::new();
     let mut denom_ids = Vec::new();
     for (i, ext) in extracted.iter().enumerate() {
         let seq_id = i as i64;
         if needs_denom_set.contains(&seq_id) {
-            denom_extracted.push(ext.clone());
+            denom_extracted.push(ext);
             denom_ids.push(seq_id);
         }
     }
