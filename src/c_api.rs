@@ -1901,6 +1901,42 @@ mod arrow_ffi {
     // the input, classifies it, and yields the result. Memory usage is O(1)
     // with respect to the number of batches.
 
+    /// Validate a caller-supplied `classify_batch_rows`.
+    ///
+    /// A group becomes one `QueryInvertedIndex`, which packs the read index into
+    /// 31 bits and asserts on the limit. Rejecting here turns "caller passed
+    /// SIZE_MAX meaning no limit" into a named error instead of an assert firing
+    /// deep inside a rayon worker — or an OOM long before the limit is reached.
+    fn validate_classify_rows(classify_rows: size_t) -> Result<(), String> {
+        if classify_rows > crate::constants::MAX_READS {
+            return Err(format!(
+                "classify_batch_rows ({}) exceeds the maximum of {} reads per \
+                 classification pass; pass 0 to classify each input batch on its own",
+                classify_rows,
+                crate::constants::MAX_READS
+            ));
+        }
+        Ok(())
+    }
+
+    /// Convert a caught panic payload into an Arrow error.
+    ///
+    /// Mirrors the payload handling in `rype_classify`, which is the convention
+    /// for panics reaching the C boundary in this file.
+    fn panic_to_arrow_error(payload: Box<dyn std::any::Any + Send>) -> arrow::error::ArrowError {
+        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic".to_string()
+        };
+        arrow::error::ArrowError::ComputeError(format!(
+            "panic during Arrow stream classification: {}",
+            msg
+        ))
+    }
+
     /// Streaming classifier that wraps an input stream and classifies on-demand.
     struct StreamingClassifier<F> {
         input_reader: ArrowArrayStreamReader,
@@ -1932,10 +1968,19 @@ mod arrow_ffi {
         type Item = Result<RecordBatch, arrow::error::ArrowError>;
 
         fn next(&mut self) -> Option<Self::Item> {
-            match self.input_reader.next() {
-                Some(Ok(batch)) => Some((self.classify_fn)(&batch)),
-                Some(Err(e)) => Some(Err(e)),
-                None => None,
+            // Reached through the exported stream's `get_next` function pointer:
+            // a panic unwinding out of here would cross into C. See
+            // `panic_to_arrow_error`.
+            let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match self.input_reader.next() {
+                    Some(Ok(batch)) => Some((self.classify_fn)(&batch)),
+                    Some(Err(e)) => Some(Err(e)),
+                    None => None,
+                }
+            }));
+            match step {
+                Ok(item) => item,
+                Err(payload) => Some(Err(panic_to_arrow_error(payload))),
             }
         }
     }
@@ -2061,6 +2106,28 @@ mod arrow_ffi {
                 return None;
             }
 
+            // Reached through the exported stream's `get_next` function pointer:
+            // a panic unwinding out of here would cross into C. Reachable from
+            // caller-controlled input — extraction allocates in proportion to
+            // the group, and QueryInvertedIndex::build asserts on MAX_READS.
+            let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.next_group()));
+            match step {
+                Ok(item) => item,
+                Err(payload) => {
+                    // Accumulation state is unknown after a panic; do not resume.
+                    self.input_done = true;
+                    Some(Err(panic_to_arrow_error(payload)))
+                }
+            }
+        }
+    }
+
+    impl<F> AccumulatingClassifier<F>
+    where
+        F: Fn(ExtractedMinimizers, Vec<i64>) -> Result<RecordBatch, arrow::error::ArrowError>,
+    {
+        /// Accumulate input batches until the group is full, then classify once.
+        fn next_group(&mut self) -> Option<Result<RecordBatch, arrow::error::ArrowError>> {
             let mut extracted: ExtractedMinimizers = Vec::new();
             let mut query_ids: Vec<i64> = Vec::new();
             let mut consumed_any = false;
@@ -2099,13 +2166,29 @@ mod arrow_ffi {
                 }
                 drop(batch);
 
-                if self.classify_rows == 0 || query_ids.len() >= self.classify_rows {
+                // The MAX_READS term is a backstop, not the caller's setting:
+                // `classify_rows` is validated at the entry point, but a group
+                // can also reach the limit through one oversized input batch.
+                if self.classify_rows == 0
+                    || query_ids.len() >= self.classify_rows
+                    || query_ids.len() >= crate::constants::MAX_READS
+                {
                     break;
                 }
             }
 
             if !consumed_any {
                 return None;
+            }
+            if query_ids.len() > crate::constants::MAX_READS {
+                // Only reachable from a single input batch larger than the limit,
+                // since the loop above stops accumulating at it.
+                self.input_done = true;
+                return Some(Err(arrow::error::ArrowError::ComputeError(format!(
+                    "input batch of {} reads exceeds the {}-read limit of the query index",
+                    query_ids.len(),
+                    crate::constants::MAX_READS
+                ))));
             }
             Some((self.classify_fn)(extracted, query_ids))
         }
@@ -2189,8 +2272,12 @@ mod arrow_ffi {
         best_hit: bool,
     ) -> i32 {
         // Validate parameters
-        if index_ptr.is_null() {
-            set_last_error("index is NULL".to_string());
+        if !is_nonnull_aligned(index_ptr) {
+            set_last_error("index is NULL or misaligned".to_string());
+            return -1;
+        }
+        if !negative_set_ptr.is_null() && !is_nonnull_aligned(negative_set_ptr) {
+            set_last_error("negative_set is misaligned".to_string());
             return -1;
         }
         if input_stream.is_null() {
@@ -2202,6 +2289,10 @@ mod arrow_ffi {
             return -1;
         }
         if let Err(e) = validate_threshold(threshold) {
+            set_last_error(e);
+            return -1;
+        }
+        if let Err(e) = validate_classify_rows(classify_rows) {
             set_last_error(e);
             return -1;
         }
@@ -2889,6 +2980,10 @@ mod arrow_ffi {
         }
         if out_stream.is_null() {
             set_last_error("out_stream is NULL".to_string());
+            return -1;
+        }
+        if let Err(e) = validate_classify_rows(classify_rows) {
+            set_last_error(e);
             return -1;
         }
 

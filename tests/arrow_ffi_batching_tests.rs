@@ -420,9 +420,113 @@ fn classify_arrow_ex_exposes_result_schema() -> Result<()> {
     let rc =
         unsafe { rype_classify_arrow_ex(index, std::ptr::null(), &mut input, 0.0, 64, &mut out) };
     assert_eq!(rc, 0);
-    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut out) }?;
-    assert_eq!(reader.schema(), rype::arrow::result_schema());
-
+    {
+        let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut out) }?;
+        assert_eq!(reader.schema(), rype::arrow::result_schema());
+    }
+    // The reader owns a pointer to the index; freeing it first is the
+    // use-after-free the header's safety contract warns about, even though
+    // dropping the reader happens not to dereference it today.
     rype_index_free(index);
+    Ok(())
+}
+
+/// `classify_batch_rows` becomes one `QueryInvertedIndex`, which packs the read
+/// index into 31 bits and asserts on the limit.
+///
+/// A caller passing SIZE_MAX to mean "no limit" must get a named error at the
+/// entry point. Without this check the group would simply keep growing — an OOM
+/// long before the limit, and past it an assert firing inside a rayon worker,
+/// unwinding toward the C `get_next` callback.
+#[test]
+fn classify_arrow_ex_rejects_classify_batch_rows_above_the_read_limit() -> Result<()> {
+    // Mirrors MAX_READS in src/constants.rs (31 bits; bit 31 is the strand flag).
+    const MAX_READS: usize = 0x7FFF_FFFF;
+
+    let dir = tempdir()?;
+    let index_path = build_index(dir.path(), "pos.ryxdi", &[7])?;
+    let num_path = build_index(dir.path(), "num.ryxdi", &[7])?;
+    let denom_path = build_index(dir.path(), "denom.ryxdi", &[11])?;
+    let index = load(&index_path);
+    let num = load(&num_path);
+    let denom = load(&denom_path);
+
+    let mut input = ffi_input_stream(make_input_batches(4, 2));
+    let mut out = FFI_ArrowArrayStream::empty();
+    let rc = unsafe {
+        rype_classify_arrow_ex(
+            index,
+            std::ptr::null(),
+            &mut input,
+            0.0,
+            usize::MAX,
+            &mut out,
+        )
+    };
+    assert_eq!(rc, -1, "SIZE_MAX must be rejected, not accumulated");
+    assert!(
+        last_error().contains("classify_batch_rows"),
+        "the error must name the offending parameter, got: {}",
+        last_error()
+    );
+
+    // Same guard on the log-ratio entry point.
+    let mut input = ffi_input_stream(make_input_batches(4, 2));
+    let mut out = FFI_ArrowArrayStream::empty();
+    let rc = unsafe {
+        rype_classify_arrow_log_ratio_ex(num, denom, &mut input, 0.0, usize::MAX, &mut out)
+    };
+    assert_eq!(rc, -1, "log-ratio must reject SIZE_MAX too");
+    assert!(last_error().contains("classify_batch_rows"));
+
+    // The limit itself is legal — the group just ends when the input does.
+    let mut input = ffi_input_stream(make_input_batches(4, 2));
+    let mut out = FFI_ArrowArrayStream::empty();
+    let rc = unsafe {
+        rype_classify_arrow_ex(
+            index,
+            std::ptr::null(),
+            &mut input,
+            0.0,
+            MAX_READS,
+            &mut out,
+        )
+    };
+    assert_eq!(rc, 0, "MAX_READS must be accepted: {}", last_error());
+    let (batches, rows) = drain_hits(out)?;
+    assert_eq!(batches, 1, "one group, ended by end-of-input");
+    assert!(!rows.is_empty());
+
+    rype_index_free(denom);
+    rype_index_free(num);
+    rype_index_free(index);
+    Ok(())
+}
+
+/// A NULL index must be refused rather than dereferenced. The entry point also
+/// rejects misaligned pointers, matching `rype_classify_arrow_log_ratio_ex` and
+/// the other 20-odd entry points in c_api.rs; that half is not exercised here
+/// because constructing a misaligned pointer would be undefined behaviour if the
+/// guard were ever removed, and no test in this repo does it.
+#[test]
+fn classify_arrow_ex_rejects_null_index() -> Result<()> {
+    let mut input = ffi_input_stream(make_input_batches(4, 2));
+    let mut out = FFI_ArrowArrayStream::empty();
+    let rc = unsafe {
+        rype_classify_arrow_ex(
+            std::ptr::null(),
+            std::ptr::null(),
+            &mut input,
+            0.0,
+            64,
+            &mut out,
+        )
+    };
+    assert_eq!(rc, -1);
+    assert!(
+        last_error().contains("index"),
+        "error should name the index pointer, got: {}",
+        last_error()
+    );
     Ok(())
 }
