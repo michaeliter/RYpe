@@ -278,6 +278,10 @@ pub fn classify_log_ratio_from_extracted(
         ));
     }
 
+    // Deliberately re-checked here even when the caller already validated: this
+    // is a public entry point that would otherwise classify against mismatched
+    // or multi-bucket indices and return meaningless ratios. The check reads two
+    // manifests, which is nothing beside the two shard passes below.
     validate_log_ratio_indices(numerator, denominator)?;
 
     // Use sequential 0..N internally: partition_by_numerator_score uses dense

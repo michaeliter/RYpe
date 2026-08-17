@@ -447,6 +447,18 @@ size_t rype_parse_byte_suffix(const char* str);
  * classify_batch_rows; input RecordBatches may then be sized however the caller
  * likes, since they no longer determine how often the shard loop runs.
  *
+ * Note that the two numbers are bounded by different things, and is_large_binary
+ * below constrains only the first:
+ *
+ *   - Input batch rows are capped by the Arrow Binary offset limit, since one
+ *     batch's sequence bytes must fit a single array. A caller sizing input
+ *     batches independently of this function's return value stays responsible
+ *     for that limit — nothing else enforces it.
+ *   - classify_batch_rows is bounded by memory (see rype_classify_arrow_ex()
+ *     for the per-read group cost) and by the query index's 2^31-1 read limit.
+ *     The offset limit does not apply to it, because a group holds minimizers
+ *     rather than sequence bytes.
+ *
  * @param index            Non-NULL RypeIndex pointer from rype_index_load()
  * @param avg_read_length  Average nucleotide length of individual reads (must be > 0)
  * @param is_paired        Non-zero for paired-end, 0 for single-end
@@ -1350,10 +1362,27 @@ int rype_classify_arrow_best_hit(
  * are identical to rype_classify_arrow() for the same input; only the grouping
  * of output batches differs.
  *
+ * ## Sizing classify_batch_rows
+ *
+ * A group's minimizers are resident for the whole pass, and the query index
+ * built over them holds a (minimizer, read) entry per occurrence. Budget on the
+ * order of 24 bytes per minimizer occurrence — roughly 8 for the extracted
+ * minimizer plus 16 for its query-index entry — not 8. For 150 bp reads at
+ * k=32, w=10 that is about 24 occurrences per read (both strands), so ~600
+ * bytes of group state per read, independent of read length in the sequence
+ * bytes sense.
+ *
+ * Output is also one RecordBatch per pass, sized classify_batch_rows x buckets
+ * scoring at or above the threshold. With a many-bucket index and a low
+ * threshold that batch can be large; raise the threshold or lower
+ * classify_batch_rows if the consumer needs bounded output batches.
+ *
  * @param classify_batch_rows  Reads to accumulate per classification pass. 0
  *                             reproduces rype_classify_arrow() exactly (one
- *                             pass per input batch). See
- *                             rype_recommend_batch_size().
+ *                             pass per input batch) — it does not mean
+ *                             "unlimited". Must not exceed 2^31-1, the query
+ *                             index's read limit; larger values return -1.
+ *                             See rype_recommend_batch_size().
  *
  * All other parameters, ownership rules, and schemas match
  * rype_classify_arrow().
@@ -1370,9 +1399,19 @@ int rype_classify_arrow_ex(
 /**
  * Best-hit counterpart to rype_classify_arrow_ex()
  *
- * Best-hit filtering applies per classification group. A read is never split
- * across groups, and one read is one query, so grouping does not change which
- * hit wins.
+ * Best-hit filtering applies per classification group, and a read is never
+ * split across groups.
+ *
+ * ## Required: query ids unique across the whole stream
+ *
+ * Best-hit keeps the highest-scoring bucket per query id. Because the filter is
+ * applied per group, and a group spans as many input batches as
+ * classify_batch_rows requires, two rows sharing a query id that previously
+ * landed in different input batches can now land in the same group — where they
+ * are reduced to one row. Ids must therefore be unique across the entire input
+ * stream, not merely within an input batch. Rows sharing an id are treated as
+ * one query by design; if a caller needs both halves of a pair reported
+ * separately, they must carry distinct ids.
  */
 int rype_classify_arrow_best_hit_ex(
     const RypeIndex* index,

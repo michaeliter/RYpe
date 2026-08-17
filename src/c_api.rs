@@ -2043,8 +2043,16 @@ mod arrow_ffi {
     //
     // This reader extracts each input batch's minimizers and drops the batch
     // immediately. Sequence residency is one input batch regardless of corpus
-    // size; only the minimizers accumulate, and they are a fraction of the
-    // sequence bytes. The number of index passes is unchanged.
+    // size; only the minimizers accumulate. The number of index passes is
+    // unchanged.
+    //
+    // What a group actually costs is more than the minimizers themselves: the
+    // QueryInvertedIndex built over them holds a (u64, u32) entry per minimizer
+    // occurrence, 16 bytes after padding, on top of the 8-byte occurrence in
+    // `extracted`. Budget ~24 bytes per occurrence when sizing a group against a
+    // memory limit, and note the output RecordBatch is also one per pass, sized
+    // group_rows x buckets above threshold. See rype.h on rype_classify_arrow_ex
+    // for the caller-facing version of this.
 
     /// Type alias for an accumulated group's extracted minimizers: one
     /// (forward, reverse-complement) pair per read, in input order.
@@ -2443,10 +2451,21 @@ mod arrow_ffi {
     /// Results are identical to `rype_classify_arrow` for the same input; only
     /// the grouping of output batches differs.
     ///
+    /// # Sizing `classify_batch_rows`
+    ///
+    /// A group's minimizers stay resident for the whole pass, and the
+    /// `QueryInvertedIndex` built over them adds a padded `(u64, u32)` entry per
+    /// minimizer occurrence. Budget ~24 bytes per occurrence, not 8. The output
+    /// RecordBatch is also one per pass, sized `classify_batch_rows` x buckets
+    /// at or above the threshold, which is unbounded for a many-bucket index at
+    /// a low threshold.
+    ///
     /// # Arguments
     /// Same as `rype_classify_arrow`, plus:
     /// - `classify_batch_rows`: reads to accumulate per classification pass.
-    ///   0 reproduces `rype_classify_arrow` exactly (one pass per input batch).
+    ///   0 reproduces `rype_classify_arrow` exactly (one pass per input batch) —
+    ///   it does not mean "unlimited". Values above `MAX_READS` (2^31-1), the
+    ///   query index's read limit, are rejected with -1.
     ///   Use `rype_recommend_batch_size` to pick a value.
     ///
     /// # Safety
@@ -2522,10 +2541,16 @@ mod arrow_ffi {
 
     /// Best-hit counterpart to `rype_classify_arrow_ex`.
     ///
-    /// See `rype_classify_arrow_ex` for what `classify_batch_rows` does. Note
-    /// that best-hit filtering applies per classification group, so a query
-    /// whose reads span groups is not affected — one read is one query, and a
-    /// read is never split across groups.
+    /// See `rype_classify_arrow_ex` for what `classify_batch_rows` does.
+    ///
+    /// # Requires query ids unique across the whole stream
+    ///
+    /// Best-hit keeps the highest-scoring bucket per query id, and the filter is
+    /// applied per classification group. A group spans as many input batches as
+    /// `classify_batch_rows` requires, so two rows sharing a query id that
+    /// previously landed in different input batches can now land in the same
+    /// group, where they are reduced to one row. Ids must be unique across the
+    /// entire input stream, not merely within an input batch.
     ///
     /// # Safety
     /// - index_ptr must remain valid until the output stream is fully consumed
@@ -3023,8 +3048,10 @@ mod arrow_ffi {
             let num_idx = unsafe { num_send.get() };
             let denom_idx = unsafe { denom_send.get() };
 
-            // classify_log_ratio_from_extracted validates indices internally on
-            // each call, but we already validated eagerly above for fast failure
+            // Validated eagerly above so a bad pair fails before the stream is
+            // created; classify_log_ratio_from_extracted re-checks per group as a
+            // guard on its own public contract, which costs two manifest reads
+            // against a shard pass.
             let lr_results = crate::classify_log_ratio_from_extracted(
                 &num_idx.0,
                 &denom_idx.0,
