@@ -13,19 +13,17 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 use rype::arrow::{
-    batch_to_records, classify_arrow_batch_sharded, hits_to_record_batch, result_schema,
-    validate_input_schema, ShardedStreamClassifier, COL_ID, COL_PAIR_SEQUENCE, COL_SEQUENCE,
+    batch_to_records, classify_arrow_batch_sharded, classify_arrow_batch_sharded_best_hit,
+    hits_to_record_batch, result_schema, validate_input_schema, ShardedStreamClassifier, COL_ID,
+    COL_PAIR_SEQUENCE, COL_SEQUENCE,
 };
 use rype::{
     classify_batch_sharded_merge_join, create_parquet_inverted_index, extract_into, BucketData,
     MinimizerWorkspace, ParquetWriteOptions, ShardedInvertedIndex,
 };
 
-/// Generate a DNA sequence of given length with a deterministic pattern.
-fn generate_sequence(len: usize, seed: u8) -> Vec<u8> {
-    let bases = [b'A', b'C', b'G', b'T'];
-    (0..len).map(|i| bases[(i + seed as usize) % 4]).collect()
-}
+mod common;
+use common::generate_sequence;
 
 /// Create a test batch with the expected schema.
 fn make_test_batch(ids: &[i64], seqs: &[&[u8]]) -> RecordBatch {
@@ -230,7 +228,7 @@ fn test_arrow_large_batch() -> Result<()> {
     let num_queries = 1000;
     let ids: Vec<i64> = (0..num_queries).collect();
     let sequences: Vec<Vec<u8>> = (0..num_queries)
-        .map(|i| generate_sequence(100, (i % 4) as u8))
+        .map(|i| generate_sequence(100, (i % 4) as u64))
         .collect();
     let seq_refs: Vec<&[u8]> = sequences.iter().map(|s| s.as_slice()).collect();
 
@@ -279,19 +277,43 @@ fn test_arrow_streaming_multiple_batches() -> Result<()> {
 fn test_arrow_threshold_filtering() -> Result<()> {
     let (_dir, index) = create_test_parquet_index();
 
-    let query_seq = generate_sequence(100, 0);
-    let batch = make_test_batch(&[1], &[&query_seq]);
+    // A query that fully matches bucket 1 scores 1.0 and a query that matches
+    // nothing is never reported, so neither can distinguish one threshold from
+    // another. Use a chimera — half of bucket 1's reference, half novel — which
+    // lands strictly between 0 and 1 and so is reported at a low threshold and
+    // filtered at a high one.
+    let ref_seq = generate_sequence(100, 0);
+    let novel = generate_sequence(100, 9_001);
+    let mut chimera = ref_seq[..50].to_vec();
+    chimera.extend_from_slice(&novel[..50]);
+    let batch = make_test_batch(&[1], &[&chimera]);
 
-    // With very high threshold
-    let high_result = classify_arrow_batch_sharded(&index, None, &batch, 1.0)?;
-
-    // With zero threshold
     let low_result = classify_arrow_batch_sharded(&index, None, &batch, 0.0)?;
+    let high_result = classify_arrow_batch_sharded(&index, None, &batch, 0.99)?;
 
-    // High threshold should filter more results
+    // Pin the premise: the chimera must actually score in between, otherwise the
+    // comparison below would hold for uninteresting reasons.
+    let scores = low_result
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert!(low_result.num_rows() > 0, "chimera should hit bucket 1");
+    let score = scores.value(0);
     assert!(
-        low_result.num_rows() >= high_result.num_rows(),
-        "Lower threshold should have more or equal results"
+        score > 0.0 && score < 0.99,
+        "chimera score {} must be strictly between the two thresholds for this \
+         test to discriminate",
+        score
+    );
+
+    // Strictly fewer, not merely "no more": a classifier that ignored the
+    // threshold would satisfy >= but not >.
+    assert!(
+        low_result.num_rows() > high_result.num_rows(),
+        "raising the threshold above the score must drop the hit (low={}, high={})",
+        low_result.num_rows(),
+        high_result.num_rows()
     );
 
     Ok(())
@@ -408,6 +430,76 @@ fn test_arrow_hits_to_batch_roundtrip() -> Result<()> {
         assert_eq!(query_ids.value(i), hit.query_id);
         assert_eq!(bucket_ids.value(i), hit.bucket_id);
         assert!((scores.value(i) - hit.score).abs() < 1e-10);
+    }
+
+    Ok(())
+}
+
+/// `classify_arrow_batch_sharded_best_hit` is the library counterpart of the C
+/// API's best-hit entry points and shares `classify_arrow_from_extracted` with
+/// them, so this is also the non-FFI check on that shared reduction.
+#[test]
+fn test_arrow_best_hit_keeps_one_row_per_query() -> Result<()> {
+    let (_dir, index) = create_test_parquet_index();
+
+    // Chimeras of the two references so each query hits both buckets with
+    // different scores — otherwise there is nothing for best-hit to choose
+    // between and the reduction would be untestable.
+    let ref1 = generate_sequence(100, 0);
+    let ref2 = generate_sequence(100, 2);
+    let mut q1 = ref1[..70].to_vec();
+    q1.extend_from_slice(&ref2[..30]);
+    let mut q2 = ref2[..70].to_vec();
+    q2.extend_from_slice(&ref1[..30]);
+    let batch = make_test_batch(&[1, 2], &[&q1, &q2]);
+
+    let all = classify_arrow_batch_sharded(&index, None, &batch, 0.0)?;
+    let best = classify_arrow_batch_sharded_best_hit(&index, None, &batch, 0.0)?;
+
+    assert_eq!(best.schema(), result_schema());
+    assert!(
+        all.num_rows() > best.num_rows(),
+        "each query should hit both buckets ({} rows) and reduce to one ({} rows)",
+        all.num_rows(),
+        best.num_rows()
+    );
+
+    let ids = best
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut seen: Vec<i64> = (0..best.num_rows()).map(|i| ids.value(i)).collect();
+    let total = seen.len();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen.len(), total, "best-hit emitted a query id twice");
+
+    // The kept row must be the query's maximum score, not an arbitrary one.
+    let best_scores = best
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let all_ids = all.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    let all_scores = all
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    for i in 0..best.num_rows() {
+        let qid = ids.value(i);
+        let max = (0..all.num_rows())
+            .filter(|&j| all_ids.value(j) == qid)
+            .map(|j| all_scores.value(j))
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            (best_scores.value(i) - max).abs() < 1e-12,
+            "query {} kept score {} but its best is {}",
+            qid,
+            best_scores.value(i),
+            max
+        );
     }
 
     Ok(())

@@ -42,8 +42,6 @@ use std::slice;
 use std::sync::Arc;
 
 #[cfg(feature = "arrow-ffi")]
-use crate::arrow::{classify_arrow_batch_sharded, classify_arrow_batch_sharded_best_hit};
-#[cfg(feature = "arrow-ffi")]
 use arrow::ffi::FFI_ArrowSchema;
 #[cfg(feature = "arrow-ffi")]
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
@@ -622,6 +620,12 @@ pub extern "C" fn rype_calculate_batch_config(
         let arrow_binary_safe_max = MAX_ARROW_BINARY_BYTES / avg_read_length;
         batch_config.batch_size.min(arrow_binary_safe_max)
     };
+    // Also cap at the query index's 31-bit read limit. rype.h directs callers to
+    // pass this value as classify_batch_rows, which validate_classify_rows
+    // rejects above MAX_READS — without this clamp the library could recommend a
+    // batch size its own entry points refuse. Reachable with is_large_binary=1,
+    // where the offset cap above does not apply.
+    let capped_batch_size = capped_batch_size.min(crate::constants::MAX_READS);
 
     clear_last_error();
     if capped_batch_size == batch_config.batch_size {
@@ -1795,32 +1799,25 @@ mod arrow_ffi {
     // Helper: Sharded Negative Filtering for Arrow Batches
     // -------------------------------------------------------------------------
 
-    /// Collect negative minimizers from a sharded index for the given batch.
+    /// Collect negative minimizers from a sharded index for already-extracted
+    /// query minimizers.
     ///
     /// Returns a HashSet of minimizers that should be filtered out during
     /// classification. This processes the negative index shard-by-shard to
     /// avoid loading all negative minimizers into memory at once.
-    fn collect_negative_mins_for_batch(
+    ///
+    /// Takes extracted minimizers rather than the RecordBatch so the caller can
+    /// release the sequence bytes first, and so extraction is not repeated for
+    /// the negative pass.
+    fn collect_negative_mins_for_extracted(
         negative_index: &ShardedInvertedIndex,
-        batch: &RecordBatch,
-        positive_index: &ShardedInvertedIndex,
+        extracted: &[(Vec<u64>, Vec<u64>)],
     ) -> Result<HashSet<u64>, arrow::error::ArrowError> {
-        use crate::arrow::batch_to_records;
         use crate::classify::collect_negative_minimizers_sharded;
 
-        // Convert batch to records
-        let records = batch_to_records(batch)
-            .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))?;
-
-        if records.is_empty() {
+        if extracted.is_empty() {
             return Ok(HashSet::new());
         }
-
-        let manifest = positive_index.manifest();
-
-        // Extract minimizers using the shared batch extraction function
-        let extracted =
-            crate::extract_batch_minimizers(manifest.k, manifest.w, manifest.salt, None, &records);
 
         // Build sorted unique minimizers for querying negative index
         let mut all_minimizers: Vec<u64> = extracted
@@ -1910,11 +1907,50 @@ mod arrow_ffi {
     // the input, classifies it, and yields the result. Memory usage is O(1)
     // with respect to the number of batches.
 
+    /// Validate a caller-supplied `classify_batch_rows`.
+    ///
+    /// A group becomes one `QueryInvertedIndex`, which packs the read index into
+    /// 31 bits and asserts on the limit. Rejecting here turns "caller passed
+    /// SIZE_MAX meaning no limit" into a named error instead of an assert firing
+    /// deep inside a rayon worker — or an OOM long before the limit is reached.
+    fn validate_classify_rows(classify_rows: size_t) -> Result<(), String> {
+        if classify_rows > crate::constants::MAX_READS {
+            return Err(format!(
+                "classify_batch_rows ({}) exceeds the maximum of {} reads per \
+                 classification pass; pass 0 to classify each input batch on its own",
+                classify_rows,
+                crate::constants::MAX_READS
+            ));
+        }
+        Ok(())
+    }
+
+    /// Convert a caught panic payload into an Arrow error.
+    ///
+    /// Mirrors the payload handling in `rype_classify`, which is the convention
+    /// for panics reaching the C boundary in this file.
+    fn panic_to_arrow_error(payload: Box<dyn std::any::Any + Send>) -> arrow::error::ArrowError {
+        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic".to_string()
+        };
+        arrow::error::ArrowError::ComputeError(format!(
+            "panic during Arrow stream classification: {}",
+            msg
+        ))
+    }
+
     /// Streaming classifier that wraps an input stream and classifies on-demand.
     struct StreamingClassifier<F> {
         input_reader: ArrowArrayStreamReader,
         output_schema: SchemaRef,
         classify_fn: F,
+        /// Set after a caught panic. The reader's state is unknown at that
+        /// point, so the stream ends rather than being re-entered.
+        poisoned: bool,
     }
 
     impl<F> StreamingClassifier<F>
@@ -1930,6 +1966,7 @@ mod arrow_ffi {
                 input_reader,
                 output_schema,
                 classify_fn,
+                poisoned: false,
             }
         }
     }
@@ -1941,10 +1978,28 @@ mod arrow_ffi {
         type Item = Result<RecordBatch, arrow::error::ArrowError>;
 
         fn next(&mut self) -> Option<Self::Item> {
-            match self.input_reader.next() {
-                Some(Ok(batch)) => Some((self.classify_fn)(&batch)),
-                Some(Err(e)) => Some(Err(e)),
-                None => None,
+            if self.poisoned {
+                return None;
+            }
+            // Reached through the exported stream's `get_next` function pointer:
+            // a panic unwinding out of here would cross into C. See
+            // `panic_to_arrow_error`.
+            let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match self.input_reader.next() {
+                    Some(Ok(batch)) => Some((self.classify_fn)(&batch)),
+                    Some(Err(e)) => Some(Err(e)),
+                    None => None,
+                }
+            }));
+            match step {
+                Ok(item) => item,
+                Err(payload) => {
+                    // The panic may have come from inside input_reader.next(),
+                    // leaving the imported stream mid-operation. Refuse to
+                    // re-enter it, as AccumulatingClassifier does.
+                    self.poisoned = true;
+                    Some(Err(panic_to_arrow_error(payload)))
+                }
             }
         }
     }
@@ -1993,6 +2048,227 @@ mod arrow_ffi {
     }
 
     // -------------------------------------------------------------------------
+    // Accumulating Classification Reader
+    // -------------------------------------------------------------------------
+    //
+    // Decouples the *input* batch size from the *classification* batch size.
+    //
+    // Classification cost is dominated by the pass over the index's Parquet
+    // shards, and that pass happens once per classified group however many
+    // reads the group holds — so input batches cannot simply be made small
+    // without multiplying I/O. But reaching a useful group size by holding whole
+    // input batches means the sequence bytes accumulate, which is what made peak
+    // RSS scale with the corpus (the-miint/Qiita#459).
+    //
+    // This reader extracts each input batch's minimizers and drops the batch
+    // immediately. Sequence residency is one input batch regardless of corpus
+    // size; only the minimizers accumulate. The number of index passes is
+    // unchanged.
+    //
+    // What a group actually costs is more than the minimizers themselves: the
+    // QueryInvertedIndex built over them holds a (u64, u32) entry per minimizer
+    // occurrence, 16 bytes after padding, on top of the 8-byte occurrence in
+    // `extracted`. Budget ~24 bytes per occurrence when sizing a group against a
+    // memory limit, and note the output RecordBatch is also one per pass, sized
+    // group_rows x buckets above threshold. See rype.h on rype_classify_arrow_ex
+    // for the caller-facing version of this.
+
+    /// Type alias for an accumulated group's extracted minimizers: one
+    /// (forward, reverse-complement) pair per read, in input order.
+    type ExtractedMinimizers = Vec<(Vec<u64>, Vec<u64>)>;
+
+    /// Reads input batches, extracts minimizers, and classifies once per group.
+    struct AccumulatingClassifier<F> {
+        input_reader: ArrowArrayStreamReader,
+        output_schema: SchemaRef,
+        /// Classifies one accumulated group. Takes ownership of the minimizers
+        /// so it can filter them in place (negative sets) and free them before
+        /// building the output batch.
+        classify_fn: F,
+        /// Minimizer parameters, taken from the index manifest at setup.
+        k: usize,
+        w: usize,
+        salt: u64,
+        /// Reads to accumulate before classifying. 0 classifies each input batch
+        /// on its own, which is the one-batch-in/one-batch-out behavior the
+        /// non-`_ex` entry points have always had.
+        classify_rows: usize,
+        input_done: bool,
+    }
+
+    impl<F> AccumulatingClassifier<F>
+    where
+        F: Fn(ExtractedMinimizers, Vec<i64>) -> Result<RecordBatch, arrow::error::ArrowError>,
+    {
+        #[allow(clippy::too_many_arguments)]
+        fn new(
+            input_reader: ArrowArrayStreamReader,
+            output_schema: SchemaRef,
+            classify_fn: F,
+            k: usize,
+            w: usize,
+            salt: u64,
+            classify_rows: usize,
+        ) -> Self {
+            Self {
+                input_reader,
+                output_schema,
+                classify_fn,
+                k,
+                w,
+                salt,
+                classify_rows,
+                input_done: false,
+            }
+        }
+
+        /// Accumulate input batches until the group is full, then classify once.
+        fn next_group(&mut self) -> Option<Result<RecordBatch, arrow::error::ArrowError>> {
+            let mut extracted: ExtractedMinimizers = Vec::new();
+            let mut query_ids: Vec<i64> = Vec::new();
+            let mut consumed_any = false;
+
+            loop {
+                let batch = match self.input_reader.next() {
+                    Some(Ok(batch)) => batch,
+                    Some(Err(e)) => {
+                        self.input_done = true;
+                        return Some(Err(e));
+                    }
+                    None => {
+                        self.input_done = true;
+                        break;
+                    }
+                };
+                consumed_any = true;
+
+                // Inner scope: `records` borrows `batch`, so both must go out of
+                // scope before the next pull. This is the release point for the
+                // sequence bytes — everything kept past it is minimizers.
+                {
+                    let records = match crate::arrow::batch_to_records(&batch) {
+                        Ok(records) => records,
+                        Err(e) => {
+                            self.input_done = true;
+                            return Some(Err(arrow::error::ArrowError::ExternalError(Box::new(e))));
+                        }
+                    };
+                    if !records.is_empty() {
+                        query_ids.extend(records.iter().map(|(id, _, _)| *id));
+                        extracted.extend(crate::extract_batch_minimizers(
+                            self.k, self.w, self.salt, None, &records,
+                        ));
+                    }
+                }
+                drop(batch);
+
+                // The MAX_READS term is a backstop, not the caller's setting:
+                // `classify_rows` is validated at the entry point, but a group
+                // can also reach the limit through one oversized input batch.
+                if self.classify_rows == 0
+                    || query_ids.len() >= self.classify_rows
+                    || query_ids.len() >= crate::constants::MAX_READS
+                {
+                    break;
+                }
+            }
+
+            if !consumed_any {
+                return None;
+            }
+            if query_ids.len() > crate::constants::MAX_READS {
+                // Only reachable from a single input batch larger than the limit,
+                // since the loop above stops accumulating at it.
+                self.input_done = true;
+                return Some(Err(arrow::error::ArrowError::ComputeError(format!(
+                    "input batch of {} reads exceeds the {}-read limit of the query index",
+                    query_ids.len(),
+                    crate::constants::MAX_READS
+                ))));
+            }
+            Some((self.classify_fn)(extracted, query_ids))
+        }
+    }
+
+    impl<F> Iterator for AccumulatingClassifier<F>
+    where
+        F: Fn(ExtractedMinimizers, Vec<i64>) -> Result<RecordBatch, arrow::error::ArrowError>,
+    {
+        type Item = Result<RecordBatch, arrow::error::ArrowError>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.input_done {
+                return None;
+            }
+
+            // Reached through the exported stream's `get_next` function pointer:
+            // a panic unwinding out of here would cross into C. Reachable from
+            // caller-controlled input — extraction allocates in proportion to
+            // the group, and QueryInvertedIndex::build asserts on MAX_READS.
+            let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.next_group()));
+            match step {
+                Ok(item) => item,
+                Err(payload) => {
+                    // Accumulation state is unknown after a panic; do not resume.
+                    self.input_done = true;
+                    Some(Err(panic_to_arrow_error(payload)))
+                }
+            }
+        }
+    }
+
+    // SAFETY: identical reasoning to StreamingClassifier above —
+    // ArrowArrayStreamReader is Send, SchemaRef is Send+Sync, and F is bounded
+    // Send. The accumulated Vecs are plain owned data.
+    unsafe impl<F: Send> Send for AccumulatingClassifier<F> {}
+
+    impl<F> RecordBatchReader for AccumulatingClassifier<F>
+    where
+        F: Fn(ExtractedMinimizers, Vec<i64>) -> Result<RecordBatch, arrow::error::ArrowError>
+            + Send,
+    {
+        fn schema(&self) -> SchemaRef {
+            self.output_schema.clone()
+        }
+    }
+
+    /// Creates a streaming FFI output stream backed by an [`AccumulatingClassifier`].
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn create_accumulating_output<F>(
+        input_stream: *mut FFI_ArrowArrayStream,
+        out_stream: *mut FFI_ArrowArrayStream,
+        output_schema: SchemaRef,
+        classify_fn: F,
+        k: usize,
+        w: usize,
+        salt: u64,
+        classify_rows: usize,
+    ) -> Result<(), String>
+    where
+        F: Fn(ExtractedMinimizers, Vec<i64>) -> Result<RecordBatch, arrow::error::ArrowError>
+            + Send
+            + 'static,
+    {
+        let input_reader = ArrowArrayStreamReader::from_raw(input_stream)
+            .map_err(|e| format!("Failed to create stream reader: {}", e))?;
+
+        let accumulating = AccumulatingClassifier::new(
+            input_reader,
+            output_schema,
+            classify_fn,
+            k,
+            w,
+            salt,
+            classify_rows,
+        );
+
+        let export_stream = FFI_ArrowArrayStream::new(Box::new(accumulating));
+        std::ptr::write(out_stream, export_stream);
+
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
     // Internal helper: Shared Arrow classification logic
     // -------------------------------------------------------------------------
 
@@ -2003,6 +2279,9 @@ mod arrow_ffi {
     /// classify closure (with optional negative filtering and best-hit filtering),
     /// and creates the streaming output.
     ///
+    /// `classify_rows` is the number of reads to accumulate before running a
+    /// classification pass; 0 means one pass per input batch.
+    ///
     /// # Safety
     /// - index_ptr must remain valid until the output stream is fully consumed
     /// - negative_set_ptr (if non-null) must remain valid until output is consumed
@@ -2011,12 +2290,17 @@ mod arrow_ffi {
         negative_set_ptr: *const RypeNegativeSet,
         input_stream: *mut FFI_ArrowArrayStream,
         threshold: c_double,
+        classify_rows: size_t,
         out_stream: *mut FFI_ArrowArrayStream,
         best_hit: bool,
     ) -> i32 {
         // Validate parameters
-        if index_ptr.is_null() {
-            set_last_error("index is NULL".to_string());
+        if !is_nonnull_aligned(index_ptr) {
+            set_last_error("index is NULL or misaligned".to_string());
+            return -1;
+        }
+        if !negative_set_ptr.is_null() && !is_nonnull_aligned(negative_set_ptr) {
+            set_last_error("negative_set is misaligned".to_string());
             return -1;
         }
         if input_stream.is_null() {
@@ -2028,6 +2312,10 @@ mod arrow_ffi {
             return -1;
         }
         if let Err(e) = validate_threshold(threshold) {
+            set_last_error(e);
+            return -1;
+        }
+        if let Err(e) = validate_classify_rows(classify_rows) {
             set_last_error(e);
             return -1;
         }
@@ -2063,35 +2351,42 @@ mod arrow_ffi {
             }
         }
 
-        let classify_fn = move |batch: &RecordBatch| {
+        let manifest = unsafe { &*index_ptr }.0.manifest();
+        let (k, w, salt) = (manifest.k, manifest.w, manifest.salt);
+
+        let classify_fn = move |mut extracted: ExtractedMinimizers, query_ids: Vec<i64>| {
             let index = unsafe { index_send.get() };
 
-            // Handle sharded negative filtering: collect hitting minimizers per batch
-            let neg_mins_owned: Option<HashSet<u64>> = if let Some(ref neg_send) = neg_set_send {
+            // Sharded negative filtering: drop query minimizers that hit the
+            // negative index. Equivalent to filtering during extraction (see
+            // classify::common::filter_negative_mins), but deferred so a single
+            // negative pass covers the whole accumulated group.
+            if let Some(ref neg_send) = neg_set_send {
                 let neg_index = unsafe { &neg_send.get().index };
-                Some(collect_negative_mins_for_batch(neg_index, batch, &index.0)?)
-            } else {
-                None
-            };
+                let neg_mins = collect_negative_mins_for_extracted(neg_index, &extracted)?;
+                if !neg_mins.is_empty() {
+                    for (fwd, rc) in extracted.iter_mut() {
+                        fwd.retain(|m| !neg_mins.contains(m));
+                        rc.retain(|m| !neg_mins.contains(m));
+                    }
+                }
+            }
 
-            let result = if best_hit {
-                classify_arrow_batch_sharded_best_hit(
-                    &index.0,
-                    neg_mins_owned.as_ref(),
-                    batch,
-                    threshold,
-                )
-            } else {
-                classify_arrow_batch_sharded(&index.0, neg_mins_owned.as_ref(), batch, threshold)
-            };
-            result.map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
+            crate::arrow::classify_arrow_from_extracted(
+                &index.0, extracted, &query_ids, threshold, best_hit,
+            )
+            .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
         };
 
-        match create_streaming_output(
+        match create_accumulating_output(
             input_stream,
             out_stream,
             crate::arrow::result_schema(),
             classify_fn,
+            k,
+            w,
+            salt,
+            classify_rows,
         ) {
             Ok(()) => {
                 clear_last_error();
@@ -2149,6 +2444,66 @@ mod arrow_ffi {
             negative_set_ptr,
             input_stream,
             threshold,
+            0,
+            out_stream,
+            false,
+        )
+    }
+
+    /// Same as `rype_classify_arrow`, but decouples the input batch size from
+    /// the classification batch size.
+    ///
+    /// `rype_classify_arrow` runs one classification pass — one full pass over
+    /// the index's Parquet shards — per input RecordBatch, so a caller that
+    /// wants to bound the memory held by any single input batch has to pay for
+    /// the extra index passes. This entry point instead accumulates input
+    /// batches until `classify_batch_rows` reads are pending, extracting each
+    /// batch's minimizers and releasing its sequence bytes as it goes, and then
+    /// classifies the whole group in one pass.
+    ///
+    /// Peak sequence residency becomes one input batch rather than one
+    /// classification group, and the number of index passes is unchanged.
+    /// Results are identical to `rype_classify_arrow` for the same input; only
+    /// the grouping of output batches differs.
+    ///
+    /// # Sizing `classify_batch_rows`
+    ///
+    /// A group's minimizers stay resident for the whole pass, and the
+    /// `QueryInvertedIndex` built over them adds a padded `(u64, u32)` entry per
+    /// minimizer occurrence. Budget ~24 bytes per occurrence, not 8. The output
+    /// RecordBatch is also one per pass, sized `classify_batch_rows` x buckets
+    /// at or above the threshold, which is unbounded for a many-bucket index at
+    /// a low threshold.
+    ///
+    /// # Arguments
+    /// Same as `rype_classify_arrow`, plus:
+    /// - `classify_batch_rows`: reads to accumulate per classification pass.
+    ///   0 reproduces `rype_classify_arrow` exactly (one pass per input batch) —
+    ///   it does not mean "unlimited". Values above `MAX_READS` (2^31-1), the
+    ///   query index's read limit, are rejected with -1.
+    ///   Use `rype_recommend_batch_size` to pick a value.
+    ///
+    /// # Safety
+    /// - index_ptr must remain valid until the output stream is fully consumed
+    /// - negative_set_ptr (if non-null) must remain valid until output is consumed
+    ///
+    /// # Returns
+    /// 0 on success, -1 on error. Call rype_get_last_error() for details.
+    #[no_mangle]
+    pub unsafe extern "C" fn rype_classify_arrow_ex(
+        index_ptr: *const RypeIndex,
+        negative_set_ptr: *const RypeNegativeSet,
+        input_stream: *mut FFI_ArrowArrayStream,
+        threshold: c_double,
+        classify_batch_rows: size_t,
+        out_stream: *mut FFI_ArrowArrayStream,
+    ) -> i32 {
+        classify_arrow_internal(
+            index_ptr,
+            negative_set_ptr,
+            input_stream,
+            threshold,
+            classify_batch_rows,
             out_stream,
             false,
         )
@@ -2193,6 +2548,46 @@ mod arrow_ffi {
             negative_set_ptr,
             input_stream,
             threshold,
+            0,
+            out_stream,
+            true,
+        )
+    }
+
+    /// Best-hit counterpart to `rype_classify_arrow_ex`.
+    ///
+    /// See `rype_classify_arrow_ex` for what `classify_batch_rows` does.
+    ///
+    /// # Requires query ids unique across the whole stream
+    ///
+    /// Best-hit keeps the highest-scoring bucket per query id, and the filter is
+    /// applied per classification group. A group spans as many input batches as
+    /// `classify_batch_rows` requires, so two rows sharing a query id that
+    /// previously landed in different input batches can now land in the same
+    /// group, where they are reduced to one row. Ids must be unique across the
+    /// entire input stream, not merely within an input batch.
+    ///
+    /// # Safety
+    /// - index_ptr must remain valid until the output stream is fully consumed
+    /// - negative_set_ptr (if non-null) must remain valid until output is consumed
+    ///
+    /// # Returns
+    /// 0 on success, -1 on error. Call rype_get_last_error() for details.
+    #[no_mangle]
+    pub unsafe extern "C" fn rype_classify_arrow_best_hit_ex(
+        index_ptr: *const RypeIndex,
+        negative_set_ptr: *const RypeNegativeSet,
+        input_stream: *mut FFI_ArrowArrayStream,
+        threshold: c_double,
+        classify_batch_rows: size_t,
+        out_stream: *mut FFI_ArrowArrayStream,
+    ) -> i32 {
+        classify_arrow_internal(
+            index_ptr,
+            negative_set_ptr,
+            input_stream,
+            threshold,
+            classify_batch_rows,
             out_stream,
             true,
         )
@@ -2594,28 +2989,20 @@ mod arrow_ffi {
         }
     }
 
-    /// Classify sequences from an Arrow stream using log-ratio (numerator vs denominator).
+    /// Internal helper for Arrow FFI log-ratio classification, shared by
+    /// `rype_classify_arrow_log_ratio` and `rype_classify_arrow_log_ratio_ex`.
     ///
-    /// TRUE STREAMING: Processes one batch at a time. Memory usage is O(batch_size).
-    ///
-    /// `numerator_skip_threshold` semantics:
-    ///   - `<= 0.0` → disabled (all reads classified against both indices)
-    ///   - `(0.0, 1.0]` → enabled; reads scoring >= threshold get +inf fast-path
-    ///   - `> 1.0`, NaN, inf → error (returns -1)
+    /// `classify_rows` is the number of reads to accumulate before running a
+    /// classification pass; 0 means one pass per input batch.
     ///
     /// # Safety
-    ///
-    /// - numerator and denominator must remain valid until the output stream is fully consumed
-    ///
-    /// # Returns
-    ///
-    /// 0 on success, -1 on error. Call rype_get_last_error() for details.
-    #[no_mangle]
-    pub unsafe extern "C" fn rype_classify_arrow_log_ratio(
+    /// - numerator and denominator must remain valid until output is consumed
+    unsafe fn classify_arrow_log_ratio_internal(
         numerator: *const RypeIndex,
         denominator: *const RypeIndex,
         input_stream: *mut FFI_ArrowArrayStream,
         numerator_skip_threshold: c_double,
+        classify_rows: size_t,
         out_stream: *mut FFI_ArrowArrayStream,
     ) -> i32 {
         // Validate pointers
@@ -2635,6 +3022,10 @@ mod arrow_ffi {
             set_last_error("out_stream is NULL".to_string());
             return -1;
         }
+        if let Err(e) = validate_classify_rows(classify_rows) {
+            set_last_error(e);
+            return -1;
+        }
 
         // Validate threshold
         let skip_threshold = if numerator_skip_threshold.is_nan()
@@ -2652,32 +3043,39 @@ mod arrow_ffi {
             Some(numerator_skip_threshold)
         };
 
-        // Validate indices eagerly (fail fast before creating the stream)
+        // Validate indices eagerly (fail fast before creating the stream) and
+        // take the minimizer parameters the accumulating reader extracts with.
         let num = &*numerator;
         let denom = &*denominator;
-        if let Err(e) = crate::validate_log_ratio_indices(&num.0, &denom.0) {
-            set_last_error(format!("{}", e));
-            return -1;
-        }
+        let (k, w, salt) = match crate::validate_log_ratio_indices(&num.0, &denom.0) {
+            Ok(params) => params,
+            Err(e) => {
+                set_last_error(format!("{}", e));
+                return -1;
+            }
+        };
 
         // Wrap pointers in Send-safe wrappers
         let num_send = SendRypeIndexPtr::new(numerator);
         let denom_send = SendRypeIndexPtr::new(denominator);
 
-        let classify_fn = move |batch: &RecordBatch| {
-            use crate::arrow::batch_to_records;
-
+        let classify_fn = move |extracted: ExtractedMinimizers, input_ids: Vec<i64>| {
             let num_idx = unsafe { num_send.get() };
             let denom_idx = unsafe { denom_send.get() };
 
-            let records = batch_to_records(batch)
-                .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))?;
-
-            // classify_log_ratio_batch validates indices internally on each call,
-            // but we already validated eagerly above for fast failure
-            let lr_results =
-                crate::classify_log_ratio_batch(&num_idx.0, &denom_idx.0, &records, skip_threshold)
-                    .map_err(|e| arrow::error::ArrowError::ExternalError(e.into()))?;
+            // Validated eagerly above so a bad pair fails before the stream is
+            // created; classify_log_ratio_from_extracted re-checks per group as a
+            // guard on its own public contract, which costs two manifest reads
+            // against a shard pass.
+            let lr_results = crate::classify_log_ratio_from_extracted(
+                &num_idx.0,
+                &denom_idx.0,
+                &extracted,
+                &input_ids,
+                skip_threshold,
+            )
+            .map_err(|e| arrow::error::ArrowError::ExternalError(e.into()))?;
+            drop(extracted);
 
             // Convert Vec<LogRatioResult> → Arrow RecordBatch
             use arrow::array::{Float64Array, Int32Array, Int64Array};
@@ -2711,11 +3109,15 @@ mod arrow_ffi {
             .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
         };
 
-        match create_streaming_output(
+        match create_accumulating_output(
             input_stream,
             out_stream,
             crate::arrow::log_ratio_result_schema(),
             classify_fn,
+            k,
+            w,
+            salt,
+            classify_rows,
         ) {
             Ok(()) => {
                 clear_last_error();
@@ -2726,6 +3128,78 @@ mod arrow_ffi {
                 -1
             }
         }
+    }
+
+    /// Classify sequences from an Arrow stream using log-ratio (numerator vs denominator).
+    ///
+    /// TRUE STREAMING: Processes one batch at a time. Memory usage is O(batch_size).
+    ///
+    /// `numerator_skip_threshold` semantics:
+    ///   - `<= 0.0` → disabled (all reads classified against both indices)
+    ///   - `(0.0, 1.0]` → enabled; reads scoring >= threshold get +inf fast-path
+    ///   - `> 1.0`, NaN, inf → error (returns -1)
+    ///
+    /// # Safety
+    ///
+    /// - numerator and denominator must remain valid until the output stream is fully consumed
+    ///
+    /// # Returns
+    ///
+    /// 0 on success, -1 on error. Call rype_get_last_error() for details.
+    #[no_mangle]
+    pub unsafe extern "C" fn rype_classify_arrow_log_ratio(
+        numerator: *const RypeIndex,
+        denominator: *const RypeIndex,
+        input_stream: *mut FFI_ArrowArrayStream,
+        numerator_skip_threshold: c_double,
+        out_stream: *mut FFI_ArrowArrayStream,
+    ) -> i32 {
+        classify_arrow_log_ratio_internal(
+            numerator,
+            denominator,
+            input_stream,
+            numerator_skip_threshold,
+            0,
+            out_stream,
+        )
+    }
+
+    /// Same as `rype_classify_arrow_log_ratio`, but decouples the input batch
+    /// size from the classification batch size.
+    ///
+    /// See `rype_classify_arrow_ex` for the rationale. `classify_batch_rows`
+    /// reads are accumulated — as minimizers, with each input batch's sequence
+    /// bytes released once extracted — before a classification pass runs.
+    /// 0 reproduces `rype_classify_arrow_log_ratio` exactly.
+    ///
+    /// Note that the numerator fast-path partition is computed per
+    /// classification group, exactly as it is per input batch today; grouping
+    /// affects neither which reads take the fast path nor the reported ratios.
+    ///
+    /// # Safety
+    ///
+    /// - numerator and denominator must remain valid until the output stream is fully consumed
+    ///
+    /// # Returns
+    ///
+    /// 0 on success, -1 on error. Call rype_get_last_error() for details.
+    #[no_mangle]
+    pub unsafe extern "C" fn rype_classify_arrow_log_ratio_ex(
+        numerator: *const RypeIndex,
+        denominator: *const RypeIndex,
+        input_stream: *mut FFI_ArrowArrayStream,
+        numerator_skip_threshold: c_double,
+        classify_batch_rows: size_t,
+        out_stream: *mut FFI_ArrowArrayStream,
+    ) -> i32 {
+        classify_arrow_log_ratio_internal(
+            numerator,
+            denominator,
+            input_stream,
+            numerator_skip_threshold,
+            classify_batch_rows,
+            out_stream,
+        )
     }
 }
 

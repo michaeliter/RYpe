@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use rayon::prelude::*;
+use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -418,9 +419,12 @@ pub fn classify_from_query_index(
 ///
 /// # Returns
 /// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
-pub fn classify_from_extracted_minimizers(
+///
+/// Generic over `Borrow` so `extracted` may be either owned entries or a
+/// borrowed selection (`&[&(Vec<u64>, Vec<u64>)]`); see [`QueryInvertedIndex::build`].
+pub fn classify_from_extracted_minimizers<Q: Borrow<(Vec<u64>, Vec<u64>)>>(
     sharded: &ShardedInvertedIndex,
-    extracted: &[(Vec<u64>, Vec<u64>)],
+    extracted: &[Q],
     query_ids: &[i64],
     threshold: f64,
     read_options: Option<&crate::indices::parquet::ParquetReadOptions>,
@@ -769,9 +773,9 @@ pub fn classify_from_query_index_parallel_rg(
 ///
 /// # Returns
 /// Vector of HitResult for all (query, bucket) pairs meeting the threshold.
-pub fn classify_from_extracted_minimizers_parallel_rg(
+pub fn classify_from_extracted_minimizers_parallel_rg<Q: Borrow<(Vec<u64>, Vec<u64>)>>(
     sharded: &ShardedInvertedIndex,
-    extracted: &[(Vec<u64>, Vec<u64>)],
+    extracted: &[Q],
     query_ids: &[i64],
     threshold: f64,
     _read_options: Option<&crate::indices::parquet::ParquetReadOptions>,
@@ -1445,8 +1449,10 @@ mod tests {
     fn test_classify_from_query_index_empty() {
         let (_dir, index, _seqs) = create_test_index();
 
-        // Empty query index
-        let query_idx = QueryInvertedIndex::build(&[]);
+        // Empty query index. `build` is generic over Borrow, so an empty literal
+        // slice needs an element type.
+        let empty: [(Vec<u64>, Vec<u64>); 0] = [];
+        let query_idx = QueryInvertedIndex::build(&empty);
         let results = classify_from_query_index(&index, &query_idx, &[], 0.1, None).unwrap();
         assert!(results.is_empty());
     }
