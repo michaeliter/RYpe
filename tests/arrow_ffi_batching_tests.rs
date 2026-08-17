@@ -45,19 +45,8 @@ const K: usize = 16;
 const W: usize = 5;
 const SALT: u64 = 0x12345;
 
-/// Deterministic pseudo-DNA. Distinct `seed`s give distinct minimizer sets.
-fn generate_sequence(len: usize, seed: u64) -> Vec<u8> {
-    let bases = [b'A', b'C', b'G', b'T'];
-    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
-    (0..len)
-        .map(|_| {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            bases[((state >> 33) % 4) as usize]
-        })
-        .collect()
-}
+mod common;
+use common::generate_sequence;
 
 fn input_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -126,6 +115,17 @@ fn ffi_input_stream(batches: Vec<RecordBatch>) -> FFI_ArrowArrayStream {
     let schema = input_schema();
     let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
     FFI_ArrowArrayStream::new(Box::new(reader))
+}
+
+/// Release a stream the callee never took ownership of.
+///
+/// rype.h: on -1 from argument validation the stream was never consumed and the
+/// caller still owns it. Tests that exercise those rejections must release it or
+/// they leak the boxed reader and its batches.
+fn release_unconsumed(mut stream: FFI_ArrowArrayStream) {
+    if let Some(release) = stream.release {
+        unsafe { release(&mut stream) };
+    }
 }
 
 fn last_error() -> String {
@@ -203,8 +203,24 @@ fn drain_log_ratios(out: FFI_ArrowArrayStream) -> Result<(usize, Vec<LogRatioRow
             rows.push((ids.value(i), ratios.value(i), fast.value(i)));
         }
     }
-    rows.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // Sort on the query id alone. Ratios may be NaN (compute_log_ratio returns
+    // NaN for a read matching neither index), and a tuple comparison reaching
+    // one makes partial_cmp return None, panicking the unwrap.
+    rows.sort_by_key(|r| r.0);
     Ok((batch_count, rows))
+}
+
+/// Compare log-ratio results treating NaN as equal to NaN.
+///
+/// A read matching neither index yields NaN by design (compute_log_ratio, and
+/// rype.h lists NaN as a valid log_ratio). Under `assert_eq!` such a row never
+/// compares equal to itself, so a test asserting "batching did not change the
+/// result" would fail for a reason that has nothing to do with batching.
+fn log_ratios_match(a: &[LogRatioRow], b: &[LogRatioRow]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            x.0 == y.0 && x.2 == y.2 && (x.1 == y.1 || (x.1.is_nan() && y.1.is_nan()))
+        })
 }
 
 /// Build a Parquet index whose buckets are drawn from the same generator as the
@@ -391,8 +407,8 @@ fn classify_arrow_log_ratio_ex_results_are_independent_of_input_batching() -> Re
     assert_eq!(rc, 0, "log_ratio_ex failed: {}", last_error());
     let (accumulated_batches, accumulated) = drain_log_ratios(out)?;
 
-    assert_eq!(
-        accumulated, baseline,
+    assert!(
+        log_ratios_match(&accumulated, &baseline),
         "splitting the input into batches changed the log ratios"
     );
     assert_eq!(accumulated_batches, 1);
@@ -523,6 +539,7 @@ fn classify_arrow_ex_rejects_classify_batch_rows_above_the_read_limit() -> Resul
         "the error must name the offending parameter, got: {}",
         last_error()
     );
+    release_unconsumed(input);
 
     // Same guard on the log-ratio entry point.
     let mut input = ffi_input_stream(make_input_batches(4, 2));
@@ -532,6 +549,7 @@ fn classify_arrow_ex_rejects_classify_batch_rows_above_the_read_limit() -> Resul
     };
     assert_eq!(rc, -1, "log-ratio must reject SIZE_MAX too");
     assert!(last_error().contains("classify_batch_rows"));
+    release_unconsumed(input);
 
     // The limit itself is legal — the group just ends when the input does.
     let mut input = ffi_input_stream(make_input_batches(4, 2));
@@ -582,6 +600,7 @@ fn classify_arrow_ex_rejects_null_index() -> Result<()> {
         "error should name the index pointer, got: {}",
         last_error()
     );
+    release_unconsumed(input);
     Ok(())
 }
 
@@ -727,7 +746,10 @@ fn classify_arrow_log_ratio_ex_fast_path_split_is_independent_of_input_batching(
     };
     assert_eq!(rc, 0, "log_ratio_ex failed: {}", last_error());
     let (one_group_batches, one_group) = drain_log_ratios(out)?;
-    assert_eq!(one_group, baseline, "batching changed the fast-path split");
+    assert!(
+        log_ratios_match(&one_group, &baseline),
+        "batching changed the fast-path split"
+    );
     assert_eq!(one_group_batches, 1);
 
     // Four groups of 8: the partition is per group, so this is the case where a
@@ -738,7 +760,10 @@ fn classify_arrow_log_ratio_ex_fast_path_split_is_independent_of_input_batching(
         unsafe { rype_classify_arrow_log_ratio_ex(num, denom, &mut input, threshold, 8, &mut out) };
     assert_eq!(rc, 0, "log_ratio_ex failed: {}", last_error());
     let (multi_batches, multi) = drain_log_ratios(out)?;
-    assert_eq!(multi, baseline, "regrouping changed the fast-path split");
+    assert!(
+        log_ratios_match(&multi, &baseline),
+        "regrouping changed the fast-path split"
+    );
     assert_eq!(multi_batches, 4, "expected 32/8 = 4 classification passes");
 
     // classify_batch_rows=0 must reproduce one pass per input batch, which no
@@ -749,7 +774,7 @@ fn classify_arrow_log_ratio_ex_fast_path_split_is_independent_of_input_batching(
         unsafe { rype_classify_arrow_log_ratio_ex(num, denom, &mut input, threshold, 0, &mut out) };
     assert_eq!(rc, 0, "log_ratio_ex failed: {}", last_error());
     let (per_batch_batches, per_batch) = drain_log_ratios(out)?;
-    assert_eq!(per_batch, baseline);
+    assert!(log_ratios_match(&per_batch, &baseline));
     assert_eq!(
         per_batch_batches, 8,
         "classify_batch_rows=0 must classify each input batch on its own"
