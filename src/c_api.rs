@@ -620,6 +620,12 @@ pub extern "C" fn rype_calculate_batch_config(
         let arrow_binary_safe_max = MAX_ARROW_BINARY_BYTES / avg_read_length;
         batch_config.batch_size.min(arrow_binary_safe_max)
     };
+    // Also cap at the query index's 31-bit read limit. rype.h directs callers to
+    // pass this value as classify_batch_rows, which validate_classify_rows
+    // rejects above MAX_READS — without this clamp the library could recommend a
+    // batch size its own entry points refuse. Reachable with is_large_binary=1,
+    // where the offset cap above does not apply.
+    let capped_batch_size = capped_batch_size.min(crate::constants::MAX_READS);
 
     clear_last_error();
     if capped_batch_size == batch_config.batch_size {
@@ -1942,6 +1948,9 @@ mod arrow_ffi {
         input_reader: ArrowArrayStreamReader,
         output_schema: SchemaRef,
         classify_fn: F,
+        /// Set after a caught panic. The reader's state is unknown at that
+        /// point, so the stream ends rather than being re-entered.
+        poisoned: bool,
     }
 
     impl<F> StreamingClassifier<F>
@@ -1957,6 +1966,7 @@ mod arrow_ffi {
                 input_reader,
                 output_schema,
                 classify_fn,
+                poisoned: false,
             }
         }
     }
@@ -1968,6 +1978,9 @@ mod arrow_ffi {
         type Item = Result<RecordBatch, arrow::error::ArrowError>;
 
         fn next(&mut self) -> Option<Self::Item> {
+            if self.poisoned {
+                return None;
+            }
             // Reached through the exported stream's `get_next` function pointer:
             // a panic unwinding out of here would cross into C. See
             // `panic_to_arrow_error`.
@@ -1980,7 +1993,13 @@ mod arrow_ffi {
             }));
             match step {
                 Ok(item) => item,
-                Err(payload) => Some(Err(panic_to_arrow_error(payload))),
+                Err(payload) => {
+                    // The panic may have come from inside input_reader.next(),
+                    // leaving the imported stream mid-operation. Refuse to
+                    // re-enter it, as AccumulatingClassifier does.
+                    self.poisoned = true;
+                    Some(Err(panic_to_arrow_error(payload)))
+                }
             }
         }
     }
@@ -2081,6 +2100,7 @@ mod arrow_ffi {
     where
         F: Fn(ExtractedMinimizers, Vec<i64>) -> Result<RecordBatch, arrow::error::ArrowError>,
     {
+        #[allow(clippy::too_many_arguments)]
         fn new(
             input_reader: ArrowArrayStreamReader,
             output_schema: SchemaRef,
@@ -2101,39 +2121,7 @@ mod arrow_ffi {
                 input_done: false,
             }
         }
-    }
 
-    impl<F> Iterator for AccumulatingClassifier<F>
-    where
-        F: Fn(ExtractedMinimizers, Vec<i64>) -> Result<RecordBatch, arrow::error::ArrowError>,
-    {
-        type Item = Result<RecordBatch, arrow::error::ArrowError>;
-
-        fn next(&mut self) -> Option<Self::Item> {
-            if self.input_done {
-                return None;
-            }
-
-            // Reached through the exported stream's `get_next` function pointer:
-            // a panic unwinding out of here would cross into C. Reachable from
-            // caller-controlled input — extraction allocates in proportion to
-            // the group, and QueryInvertedIndex::build asserts on MAX_READS.
-            let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.next_group()));
-            match step {
-                Ok(item) => item,
-                Err(payload) => {
-                    // Accumulation state is unknown after a panic; do not resume.
-                    self.input_done = true;
-                    Some(Err(panic_to_arrow_error(payload)))
-                }
-            }
-        }
-    }
-
-    impl<F> AccumulatingClassifier<F>
-    where
-        F: Fn(ExtractedMinimizers, Vec<i64>) -> Result<RecordBatch, arrow::error::ArrowError>,
-    {
         /// Accumulate input batches until the group is full, then classify once.
         fn next_group(&mut self) -> Option<Result<RecordBatch, arrow::error::ArrowError>> {
             let mut extracted: ExtractedMinimizers = Vec::new();
@@ -2199,6 +2187,33 @@ mod arrow_ffi {
                 ))));
             }
             Some((self.classify_fn)(extracted, query_ids))
+        }
+    }
+
+    impl<F> Iterator for AccumulatingClassifier<F>
+    where
+        F: Fn(ExtractedMinimizers, Vec<i64>) -> Result<RecordBatch, arrow::error::ArrowError>,
+    {
+        type Item = Result<RecordBatch, arrow::error::ArrowError>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.input_done {
+                return None;
+            }
+
+            // Reached through the exported stream's `get_next` function pointer:
+            // a panic unwinding out of here would cross into C. Reachable from
+            // caller-controlled input — extraction allocates in proportion to
+            // the group, and QueryInvertedIndex::build asserts on MAX_READS.
+            let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.next_group()));
+            match step {
+                Ok(item) => item,
+                Err(payload) => {
+                    // Accumulation state is unknown after a panic; do not resume.
+                    self.input_done = true;
+                    Some(Err(panic_to_arrow_error(payload)))
+                }
+            }
         }
     }
 
