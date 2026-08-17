@@ -98,7 +98,7 @@ use std::collections::HashSet;
 
 use arrow::record_batch::RecordBatch;
 
-use crate::{classify_batch_sharded_merge_join, ShardedInvertedIndex};
+use crate::ShardedInvertedIndex;
 
 /// Classify sequences from an Arrow RecordBatch using a ShardedInvertedIndex.
 ///
@@ -166,6 +166,52 @@ pub fn classify_arrow_batch_sharded_best_hit(
     classify_arrow_batch_sharded_internal(sharded, negative_mins, batch, threshold, true)
 }
 
+/// Classify from pre-extracted minimizers and build the result RecordBatch.
+///
+/// The tail of [`classify_arrow_batch_sharded`] — classify, optionally reduce to
+/// the best hit per query, encode — split out so a caller that has already
+/// extracted minimizers does not have to keep the sequence bytes alive. The
+/// Arrow FFI streaming path uses this to drop each input RecordBatch as soon as
+/// its minimizers are extracted, while still classifying many batches' worth of
+/// reads in a single pass over the shards. Mirrors
+/// [`crate::classify_log_ratio_from_extracted`] on the log-ratio path.
+///
+/// Negative filtering is the caller's responsibility here: `extracted` must
+/// already have had any negative-set minimizers removed.
+///
+/// `query_ids` supplies one caller-facing query id per entry in `extracted`, in
+/// the same order.
+///
+/// Takes `extracted` by value and releases it as soon as classification is done,
+/// before the result columns are built. That ordering is the reason this is a
+/// shared function rather than a snippet each caller repeats: with a large
+/// accumulated group the minimizers and the output columns are both substantial,
+/// and holding them at the same time is what the streaming path exists to avoid.
+///
+/// # Errors
+///
+/// Returns an error if classification fails or the results cannot be encoded.
+pub fn classify_arrow_from_extracted(
+    sharded: &ShardedInvertedIndex,
+    extracted: Vec<(Vec<u64>, Vec<u64>)>,
+    query_ids: &[i64],
+    threshold: f64,
+    best_hit_only: bool,
+) -> Result<RecordBatch, ArrowClassifyError> {
+    let hits =
+        crate::classify_from_extracted_minimizers(sharded, &extracted, query_ids, threshold, None)
+            .map_err(|e| ArrowClassifyError::Classification(e.to_string()))?;
+    drop(extracted);
+
+    let hits = if best_hit_only {
+        crate::classify::filter_best_hits(hits)
+    } else {
+        hits
+    };
+
+    hits_to_record_batch(hits)
+}
+
 /// Internal implementation that supports both regular and best-hit modes.
 fn classify_arrow_batch_sharded_internal(
     sharded: &ShardedInvertedIndex,
@@ -175,16 +221,18 @@ fn classify_arrow_batch_sharded_internal(
     best_hit_only: bool,
 ) -> Result<RecordBatch, ArrowClassifyError> {
     let records = batch_to_records(batch)?;
-    let hits = classify_batch_sharded_merge_join(sharded, negative_mins, &records, threshold, None)
-        .map_err(|e| ArrowClassifyError::Classification(e.to_string()))?;
+    let manifest = sharded.manifest();
+    let extracted = crate::extract_batch_minimizers(
+        manifest.k,
+        manifest.w,
+        manifest.salt,
+        negative_mins,
+        &records,
+    );
+    let query_ids: Vec<i64> = records.iter().map(|(id, _, _)| *id).collect();
+    drop(records);
 
-    let hits = if best_hit_only {
-        crate::classify::filter_best_hits(hits)
-    } else {
-        hits
-    };
-
-    hits_to_record_batch(hits)
+    classify_arrow_from_extracted(sharded, extracted, &query_ids, threshold, best_hit_only)
 }
 
 #[cfg(test)]

@@ -2258,19 +2258,10 @@ mod arrow_ffi {
                 }
             }
 
-            let hits = crate::classify_from_extracted_minimizers(
-                &index.0, &extracted, &query_ids, threshold, None,
+            crate::arrow::classify_arrow_from_extracted(
+                &index.0, extracted, &query_ids, threshold, best_hit,
             )
-            .map_err(|e| arrow::error::ArrowError::ExternalError(e.into()))?;
-            drop(extracted);
-
-            let hits = if best_hit {
-                crate::filter_best_hits(hits)
-            } else {
-                hits
-            };
-            crate::arrow::hits_to_record_batch(hits)
-                .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
+            .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
         };
 
         match create_accumulating_output(
