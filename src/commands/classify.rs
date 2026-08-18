@@ -277,6 +277,11 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
                 format_classification_results(&results, &headers, &metadata.bucket_names)
             };
             out_writer.write_chunk(chunk_out)?;
+            // This branch does one full index scan per input batch (the
+            // accumulator/single-pass path doesn't apply here — see the
+            // comment above `process_batch`), so it's still a pass in the
+            // sense --timing's pass count reports.
+            *pass_num += 1;
         } else {
             let t_extract = std::time::Instant::now();
             let extracted =

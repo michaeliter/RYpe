@@ -6364,3 +6364,92 @@ fn test_multi_pass_byte_budget_run_yields_expected_pass_count() -> Result<()> {
 
     Ok(())
 }
+
+/// Regression: `--negative-index` runs must report a nonzero pass count.
+///
+/// `pass_num` was only incremented inside the `QueryAccumulator` flush path;
+/// the negative-index branch of `process_batch` classifies immediately per
+/// input batch (it can't use the accumulator — see the comment above
+/// `process_batch` in `commands/classify.rs`) but never touched `pass_num`.
+/// So a `--negative-index` run always logged "processed in 0 passes" despite
+/// doing one full index scan per input batch — in a PR whose stated
+/// deliverable is pass-count visibility, the one configuration that still
+/// does the most scanning is the one that claimed to do none.
+#[test]
+fn test_negative_index_run_reports_nonzero_passes() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let pos_index_path = dir.path().join("pos.ryxdi");
+    let neg_index_path = dir.path().join("neg.ryxdi");
+
+    for out in [&pos_index_path, &neg_index_path] {
+        let output = Command::new(&binary)
+            .args([
+                "index",
+                "create",
+                "-o",
+                out.to_str().unwrap(),
+                "-r",
+                phix_path.to_str().unwrap(),
+                "-k",
+                "32",
+                "-w",
+                "10",
+            ])
+            .output()?;
+        assert!(
+            output.status.success(),
+            "Index creation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        "@q0\nGAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )?;
+
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            pos_index_path.to_str().unwrap(),
+            "-N",
+            neg_index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "-t",
+            "0.0",
+            "--verbose",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Classification failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let summary_line = stderr
+        .lines()
+        .find(|l| l.contains("Classification complete"))
+        .unwrap_or_else(|| panic!("no 'Classification complete' line in stderr:\n{stderr}"));
+
+    assert!(
+        !summary_line.contains("in 0 passes"),
+        "negative-index run reported 0 passes despite scanning the index at least \
+         once per input batch: {summary_line}"
+    );
+
+    Ok(())
+}
