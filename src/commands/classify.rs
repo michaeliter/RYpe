@@ -243,13 +243,31 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
     // rayon's reduce identities) — see fold_reduce_accumulator_fanout's
     // doc. Scale the per-read reservation by that factor so should_flush()
     // accounts for the real worst case, not just one accumulator.
-    let accumulator_bytes_per_read = rype::memory::estimate_accumulator_bytes_per_read(
+    let merge_join_bytes_per_read = rype::memory::estimate_accumulator_bytes_per_read(
         max_bucket_id as usize + 1,
     )
     .unwrap_or(0)
     .saturating_mul(rype::memory::fold_reduce_accumulator_fanout(
         rayon::current_num_threads(),
     ));
+
+    // --wide additionally builds a HashMap<i64, HashMap<u32, f64>> grouping
+    // structure plus a Vec::with_capacity(headers.len() * (num_buckets*8+32))
+    // output buffer in format_results_wide, both sized by the whole pass
+    // (not one input batch, now that a pass spans the whole corpus) — not
+    // modeled anywhere else, so a run classify_byte_budget says fits could
+    // still OOM at format time, after the expensive shard scan already
+    // completed. Fold a conservative per-read estimate into the same
+    // per-read reservation: the output line (num_buckets*8+32 bytes) plus
+    // up to num_buckets HashMap<u32, f64> entries (~48 bytes/entry,
+    // hashbrown's per-entry overhead) for a read that scored in every bucket.
+    let wide_format_bytes_per_read = wide_bucket_ids
+        .as_deref()
+        .map(|bucket_ids| estimate_wide_format_bytes_per_read(bucket_ids.len()))
+        .unwrap_or(0);
+
+    let accumulator_bytes_per_read =
+        merge_join_bytes_per_read.saturating_add(wide_format_bytes_per_read);
 
     let mut acc: rype::QueryAccumulator<String> =
         rype::QueryAccumulator::with_budget(batch_result.classify_byte_budget)
@@ -502,6 +520,16 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
     input_reader.finish()?;
 
     Ok(())
+}
+
+/// Estimate the per-read cost `format_results_wide` adds for a pass: one
+/// output line (`num_buckets * 8 + 32` bytes, matching its own
+/// `Vec::with_capacity` sizing) plus up to `num_buckets` entries in its
+/// `HashMap<u32, f64>` grouping structure (~48 bytes/entry, hashbrown's
+/// approximate per-entry overhead) for a read that scored in every bucket.
+/// `0` when `--wide` isn't in use.
+fn estimate_wide_format_bytes_per_read(num_buckets: usize) -> usize {
+    (num_buckets * 8 + 32) + num_buckets * 48
 }
 
 /// Drain `acc` into a `QueryInvertedIndex` and run one classification pass
@@ -1396,6 +1424,25 @@ pub fn format_results_wide<S: AsRef<str>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: `estimate_wide_format_bytes_per_read` must be nonzero
+    /// and scale with bucket count, so `--wide` runs reserve budget for
+    /// `format_results_wide`'s HashMap + output-buffer cost instead of it
+    /// going unmodeled (the run could otherwise OOM at format time, after
+    /// the shard scan already completed, on a run classify_byte_budget said
+    /// would fit).
+    #[test]
+    fn test_estimate_wide_format_bytes_per_read_scales_with_buckets() {
+        assert_eq!(estimate_wide_format_bytes_per_read(0), 32);
+        let small = estimate_wide_format_bytes_per_read(10);
+        let large = estimate_wide_format_bytes_per_read(160);
+        assert!(small > 0);
+        assert!(
+            large > small,
+            "cost should grow with bucket count: 160-bucket ({large}) should exceed \
+             10-bucket ({small})"
+        );
+    }
 
     #[test]
     fn test_build_wide_header_produces_correct_header() {
