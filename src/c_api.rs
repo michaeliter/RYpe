@@ -671,6 +671,35 @@ pub extern "C" fn rype_calculate_batch_config(
     }
 }
 
+/// Estimate how many classification passes a corpus will take.
+///
+/// Each pass performs one full scan of the index's Parquet shards —
+/// dominant on large indices, where shard load can be 90%+ of wall time — so
+/// this is the primary cost driver for a classify run and worth checking
+/// before paying for it. `rype_recommend_batch_size`'s documentation has
+/// always warned that a batch size too small relative to the index makes
+/// shard I/O dominate; this makes the resulting pass count visible ahead of
+/// time rather than only in `--timing` output after the fact.
+///
+/// `batch_size` is `classify_batch_rows` as passed to
+/// `rype_classify_arrow_ex`/`_best_hit_ex`/`_log_ratio_ex` (or `batch_size`
+/// from `rype_calculate_batch_config`/`rype_recommend_batch_size` for the
+/// same effect on the non-`_ex` entry points' one-pass-per-input-batch
+/// behavior — pass count is then `total_reads` divided by the size of each
+/// input `RecordBatch`, which the caller controls directly).
+///
+/// # Returns
+/// `ceil(total_reads / batch_size)`, or 0 if `batch_size` is 0.
+#[no_mangle]
+pub extern "C" fn rype_estimate_pass_count(total_reads: size_t, batch_size: size_t) -> size_t {
+    if batch_size == 0 {
+        return 0;
+    }
+    // total_reads.div_ceil(batch_size) would be simpler but div_ceil on usize
+    // was stabilized in Rust 1.73, above this crate's declared MSRV (1.70).
+    total_reads.saturating_add(batch_size - 1) / batch_size
+}
+
 // --- Bucket Name Lookup ---
 
 // Thread-local storage for bucket name CStrings to maintain lifetime.
@@ -1353,6 +1382,32 @@ pub extern "C" fn rype_get_last_error() -> *const c_char {
     })
 }
 
+/// Enable or disable `[TIMING]` diagnostics on stderr.
+///
+/// The classification hot path (`classify::sharded::classify_shard_loop` and
+/// friends) already logs per-phase timing — `shard_load_total`,
+/// `merge_join_total`, `scoring`, and a per-pass `build_query_index`/
+/// `extraction` breakdown — the same lines the CLI's `--timing` flag prints.
+/// That instrumentation runs unconditionally; only the switch to enable it
+/// was previously CLI-only (set by `logging::init_logger`, which library and
+/// C API callers have no way to reach). This is that switch: it toggles the
+/// same crate-global flag, so once enabled, C API callers (including
+/// classification driven through `rype_classify_arrow`/`_ex` and friends) see
+/// identical output on stderr — in particular one `shard_load_total` line per
+/// classification pass, which is the direct way to observe pass count during
+/// a run rather than only estimating it beforehand with
+/// `rype_estimate_pass_count`.
+///
+/// Global and process-wide, not scoped to one index or stream — matches
+/// `--timing`'s behavior in the CLI. Safe to call at any time, including
+/// concurrently with classification in progress.
+///
+/// `enabled`: any non-zero value enables timing, 0 disables it.
+#[no_mangle]
+pub extern "C" fn rype_enable_timing(enabled: c_int) {
+    crate::ENABLE_TIMING.store(enabled != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
 // =============================================================================
 // Minimizer Extraction API
 // =============================================================================
@@ -1799,36 +1854,31 @@ mod arrow_ffi {
     // Helper: Sharded Negative Filtering for Arrow Batches
     // -------------------------------------------------------------------------
 
-    /// Collect negative minimizers from a sharded index for already-extracted
-    /// query minimizers.
+    /// Collect negative minimizers from a sharded index for an already-built
+    /// query index.
     ///
     /// Returns a HashSet of minimizers that should be filtered out during
     /// classification. This processes the negative index shard-by-shard to
     /// avoid loading all negative minimizers into memory at once.
     ///
-    /// Takes extracted minimizers rather than the RecordBatch so the caller can
-    /// release the sequence bytes first, and so extraction is not repeated for
-    /// the negative pass.
-    fn collect_negative_mins_for_extracted(
+    /// Takes the built `QueryInvertedIndex` rather than raw extracted
+    /// minimizers so the caller can release per-read minimizer vectors first
+    /// (see `QueryIndexAccumulatingClassifier`), and its `unique_minimizers()`
+    /// is already sorted and deduplicated — no separate flatten/sort/dedup
+    /// pass is needed here.
+    fn collect_negative_mins_for_query_index(
         negative_index: &ShardedInvertedIndex,
-        extracted: &[(Vec<u64>, Vec<u64>)],
+        query_idx: &crate::QueryInvertedIndex,
     ) -> Result<HashSet<u64>, arrow::error::ArrowError> {
         use crate::classify::collect_negative_minimizers_sharded;
 
-        if extracted.is_empty() {
+        if query_idx.num_reads() == 0 {
             return Ok(HashSet::new());
         }
 
-        // Build sorted unique minimizers for querying negative index
-        let mut all_minimizers: Vec<u64> = extracted
-            .iter()
-            .flat_map(|(fwd, rc)| fwd.iter().chain(rc.iter()).copied())
-            .collect();
-        all_minimizers.sort_unstable();
-        all_minimizers.dedup();
+        let unique_mins = query_idx.unique_minimizers();
 
-        // Collect hitting minimizers from negative index (memory-efficient)
-        collect_negative_minimizers_sharded(negative_index, &all_minimizers, None).map_err(|e| {
+        collect_negative_minimizers_sharded(negative_index, &unique_mins, None).map_err(|e| {
             arrow::error::ArrowError::ComputeError(format!(
                 "Failed to collect negative minimizers: {}",
                 e
@@ -2269,6 +2319,215 @@ mod arrow_ffi {
     }
 
     // -------------------------------------------------------------------------
+    // Accumulating Classification Reader — pre-built QueryInvertedIndex variant
+    // -------------------------------------------------------------------------
+    //
+    // Counterpart to AccumulatingClassifier above, for the plain (non-log-ratio)
+    // classify entry points only. AccumulatingClassifier accumulates full
+    // `extracted` (8 B/minimizer) and only builds the QueryInvertedIndex
+    // (16 B/minimizer, padded) at classify time, so both representations are
+    // resident together at peak. This reader pushes each batch's extracted
+    // minimizers straight into a QueryAccumulator, so only the flat COO
+    // representation is ever resident.
+    //
+    // Log-ratio keeps using AccumulatingClassifier unchanged: its per-read
+    // fast-path skip logic (classify_log_ratio_from_extracted) needs each
+    // read's own minimizer vectors, not a pre-merged flat index, so there is
+    // nothing to share below the read-accumulation loop — duplicating that
+    // loop shape here is smaller and safer than forcing both call shapes
+    // through one generic accumulator.
+
+    /// Reads input batches, extracts minimizers directly into a
+    /// `QueryAccumulator`, and classifies once per group via a pre-built
+    /// `QueryInvertedIndex`.
+    struct QueryIndexAccumulatingClassifier<F> {
+        input_reader: ArrowArrayStreamReader,
+        output_schema: SchemaRef,
+        /// Classifies one accumulated group's pre-built query index.
+        classify_fn: F,
+        /// Minimizer parameters, taken from the index manifest at setup.
+        k: usize,
+        w: usize,
+        salt: u64,
+        /// Reads to accumulate before classifying. 0 classifies each input
+        /// batch on its own — see AccumulatingClassifier::classify_rows.
+        classify_rows: usize,
+        input_done: bool,
+    }
+
+    impl<F> QueryIndexAccumulatingClassifier<F>
+    where
+        F: Fn(crate::QueryInvertedIndex, Vec<i64>) -> Result<RecordBatch, arrow::error::ArrowError>,
+    {
+        #[allow(clippy::too_many_arguments)]
+        fn new(
+            input_reader: ArrowArrayStreamReader,
+            output_schema: SchemaRef,
+            classify_fn: F,
+            k: usize,
+            w: usize,
+            salt: u64,
+            classify_rows: usize,
+        ) -> Self {
+            Self {
+                input_reader,
+                output_schema,
+                classify_fn,
+                k,
+                w,
+                salt,
+                classify_rows,
+                input_done: false,
+            }
+        }
+
+        /// Accumulate input batches until the group is full, then classify once.
+        fn next_group(&mut self) -> Option<Result<RecordBatch, arrow::error::ArrowError>> {
+            let mut acc: crate::QueryAccumulator<i64> =
+                crate::QueryAccumulator::with_budget(usize::MAX);
+            let mut consumed_any = false;
+
+            loop {
+                let batch = match self.input_reader.next() {
+                    Some(Ok(batch)) => batch,
+                    Some(Err(e)) => {
+                        self.input_done = true;
+                        return Some(Err(e));
+                    }
+                    None => {
+                        self.input_done = true;
+                        break;
+                    }
+                };
+                consumed_any = true;
+
+                // Inner scope: `records` borrows `batch`, so both must go out of
+                // scope before the next pull — same release point as
+                // AccumulatingClassifier.
+                {
+                    let records = match crate::arrow::batch_to_records(&batch) {
+                        Ok(records) => records,
+                        Err(e) => {
+                            self.input_done = true;
+                            return Some(Err(arrow::error::ArrowError::ExternalError(Box::new(e))));
+                        }
+                    };
+                    if !records.is_empty() {
+                        // Checked before accumulating, unlike AccumulatingClassifier's
+                        // post-loop check: QueryAccumulator::push asserts on this
+                        // limit rather than silently overflowing, so an oversized
+                        // single batch must be caught before extend_extracted runs.
+                        if acc.len().saturating_add(records.len()) > crate::constants::MAX_READS {
+                            self.input_done = true;
+                            return Some(Err(arrow::error::ArrowError::ComputeError(format!(
+                                "input batch of {} reads would push the group to {} reads, \
+                                 exceeding the {}-read limit of the query index",
+                                records.len(),
+                                acc.len() + records.len(),
+                                crate::constants::MAX_READS
+                            ))));
+                        }
+                        let ids: Vec<i64> = records.iter().map(|(id, _, _)| *id).collect();
+                        let extracted = crate::extract_batch_minimizers(
+                            self.k, self.w, self.salt, None, &records,
+                        );
+                        acc.extend_extracted(ids, extracted);
+                    }
+                }
+                drop(batch);
+
+                if self.classify_rows == 0
+                    || acc.len() >= self.classify_rows
+                    || acc.len() >= crate::constants::MAX_READS
+                {
+                    break;
+                }
+            }
+
+            if !consumed_any {
+                return None;
+            }
+
+            let (query_idx, query_ids) = acc.drain();
+            Some((self.classify_fn)(query_idx, query_ids))
+        }
+    }
+
+    impl<F> Iterator for QueryIndexAccumulatingClassifier<F>
+    where
+        F: Fn(crate::QueryInvertedIndex, Vec<i64>) -> Result<RecordBatch, arrow::error::ArrowError>,
+    {
+        type Item = Result<RecordBatch, arrow::error::ArrowError>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.input_done {
+                return None;
+            }
+
+            // Reached through the exported stream's `get_next` function pointer —
+            // same panic-safety reasoning as AccumulatingClassifier::next.
+            let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.next_group()));
+            match step {
+                Ok(item) => item,
+                Err(payload) => {
+                    self.input_done = true;
+                    Some(Err(panic_to_arrow_error(payload)))
+                }
+            }
+        }
+    }
+
+    // SAFETY: identical reasoning to AccumulatingClassifier above.
+    unsafe impl<F: Send> Send for QueryIndexAccumulatingClassifier<F> {}
+
+    impl<F> RecordBatchReader for QueryIndexAccumulatingClassifier<F>
+    where
+        F: Fn(crate::QueryInvertedIndex, Vec<i64>) -> Result<RecordBatch, arrow::error::ArrowError>
+            + Send,
+    {
+        fn schema(&self) -> SchemaRef {
+            self.output_schema.clone()
+        }
+    }
+
+    /// Creates a streaming FFI output stream backed by a
+    /// [`QueryIndexAccumulatingClassifier`].
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn create_query_index_accumulating_output<F>(
+        input_stream: *mut FFI_ArrowArrayStream,
+        out_stream: *mut FFI_ArrowArrayStream,
+        output_schema: SchemaRef,
+        classify_fn: F,
+        k: usize,
+        w: usize,
+        salt: u64,
+        classify_rows: usize,
+    ) -> Result<(), String>
+    where
+        F: Fn(crate::QueryInvertedIndex, Vec<i64>) -> Result<RecordBatch, arrow::error::ArrowError>
+            + Send
+            + 'static,
+    {
+        let input_reader = ArrowArrayStreamReader::from_raw(input_stream)
+            .map_err(|e| format!("Failed to create stream reader: {}", e))?;
+
+        let accumulating = QueryIndexAccumulatingClassifier::new(
+            input_reader,
+            output_schema,
+            classify_fn,
+            k,
+            w,
+            salt,
+            classify_rows,
+        );
+
+        let export_stream = FFI_ArrowArrayStream::new(Box::new(accumulating));
+        std::ptr::write(out_stream, export_stream);
+
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
     // Internal helper: Shared Arrow classification logic
     // -------------------------------------------------------------------------
 
@@ -2354,31 +2613,27 @@ mod arrow_ffi {
         let manifest = unsafe { &*index_ptr }.0.manifest();
         let (k, w, salt) = (manifest.k, manifest.w, manifest.salt);
 
-        let classify_fn = move |mut extracted: ExtractedMinimizers, query_ids: Vec<i64>| {
+        let classify_fn = move |mut query_idx: crate::QueryInvertedIndex, query_ids: Vec<i64>| {
             let index = unsafe { index_send.get() };
 
             // Sharded negative filtering: drop query minimizers that hit the
-            // negative index. Equivalent to filtering during extraction (see
-            // classify::common::filter_negative_mins), but deferred so a single
-            // negative pass covers the whole accumulated group.
+            // negative index, then recompute per-read counts. Equivalent to
+            // filtering during extraction (see classify::common::filter_negative_mins),
+            // but deferred so a single negative pass covers the whole
+            // accumulated group instead of one per read.
             if let Some(ref neg_send) = neg_set_send {
                 let neg_index = unsafe { &neg_send.get().index };
-                let neg_mins = collect_negative_mins_for_extracted(neg_index, &extracted)?;
-                if !neg_mins.is_empty() {
-                    for (fwd, rc) in extracted.iter_mut() {
-                        fwd.retain(|m| !neg_mins.contains(m));
-                        rc.retain(|m| !neg_mins.contains(m));
-                    }
-                }
+                let neg_mins = collect_negative_mins_for_query_index(neg_index, &query_idx)?;
+                query_idx.retain_minimizers_not_in(&neg_mins);
             }
 
-            crate::arrow::classify_arrow_from_extracted(
-                &index.0, extracted, &query_ids, threshold, best_hit,
+            crate::arrow::classify_arrow_from_query_index(
+                &index.0, query_idx, &query_ids, threshold, best_hit,
             )
             .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
         };
 
-        match create_accumulating_output(
+        match create_query_index_accumulating_output(
             input_stream,
             out_stream,
             crate::arrow::result_schema(),

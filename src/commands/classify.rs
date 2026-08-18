@@ -9,10 +9,10 @@ use std::path::PathBuf;
 
 use rype::memory::format_bytes;
 use rype::{
-    classify_batch_sharded_merge_join, classify_batch_sharded_parallel_rg,
-    classify_with_sharded_negative, filter_best_hits, log_timing, partition_by_numerator_score,
-    validate_compatible_indices, validate_single_bucket_index, PartitionResult,
-    ShardedInvertedIndex,
+    classify_from_query_index, classify_from_query_index_parallel_rg,
+    classify_with_sharded_negative, extract_batch_minimizers, filter_best_hits, log_timing,
+    partition_by_numerator_score, validate_compatible_indices, validate_single_bucket_index,
+    PartitionResult, QueryAccumulator, ShardedInvertedIndex,
 };
 
 use super::helpers::seq_writer::rewalk_and_write_passing;
@@ -187,18 +187,24 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
 
     let mut total_reads = 0;
     let mut batch_num = 0;
+    let mut pass_num = 0usize;
 
     if args.common.parallel_rg {
         log::info!(
-            "Starting parallel row group classification (batch_size={})",
+            "Starting parallel row group classification (input batch_size={})",
             effective_batch_size
         );
     } else {
         log::info!(
-            "Starting merge-join classification with sequential shard loading (batch_size={})",
+            "Starting merge-join classification with sequential shard loading (input batch_size={})",
             effective_batch_size
         );
     }
+    log::info!(
+        "Classification pass budget: {} (max_reads={:?})",
+        format_bytes(batch_result.classify_byte_budget as u64),
+        batch_result.classify_max_reads
+    );
 
     // Log which I/O path will be used for Parquet input
     let parquet_needs_owned = args.common.trim_to.is_some() || args.common.minimum_length.is_some();
@@ -214,42 +220,91 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
         }
     }
 
-    // Helper closure for classification
-    // Note: uses effective_threshold (0.0 for wide format, args.common.threshold otherwise)
-    // Sequences are pre-trimmed at read time when --trim-to is specified.
-    let classify_records = |batch_refs: &[rype::QueryRecord]| -> Result<Vec<rype::HitResult>> {
-        // If negative index is provided, use memory-efficient sharded filtering
+    let manifest = sharded.manifest();
+    let (idx_k, idx_w, idx_salt) = (manifest.k, manifest.w, manifest.salt);
+
+    // The accumulator scales with minimizer count, but the classification-pass
+    // HitAccumulator scales with read count — a pass with few but long reads
+    // against a many-bucket index can exceed its budget in accumulator
+    // allocation even while entries stay small. Reserve per-read headroom for
+    // it so should_flush() catches that case too.
+    let accumulator_bytes_per_read =
+        rype::memory::estimate_accumulator_bytes_per_read(metadata.bucket_names.len())
+            .unwrap_or(0);
+
+    let mut acc: rype::QueryAccumulator<String> =
+        rype::QueryAccumulator::with_budget(batch_result.classify_byte_budget)
+            .with_max_reads(batch_result.classify_max_reads)
+            .with_accumulator_cost_per_read(accumulator_bytes_per_read);
+
+    // Route each input batch to one of two paths:
+    // - Negative-index filtering keeps the existing per-batch immediate-classify
+    //   behavior. The sharded negative-index query (`collect_negative_minimizers_sharded`)
+    //   is crate-private to the library; folding it into the accumulator would mean
+    //   exposing or duplicating that machinery for a workload issue #21 doesn't
+    //   describe (no negative index) and which already has reduced feature parity
+    //   (rejected with `--parallel-rg` below, same as before this change).
+    // - Otherwise, extract this batch's minimizers and push them into the
+    //   accumulator; a classification pass happens only when should_flush() fires,
+    //   which is what collapses many input batches into few index scans.
+    let process_batch = |batch_refs: &[rype::QueryRecord],
+                              headers: Vec<String>,
+                              out_writer: &mut OutputWriter,
+                              acc: &mut rype::QueryAccumulator<String>,
+                              pass_num: &mut usize|
+     -> Result<()> {
         if let Some(ref neg) = negative_sharded {
-            // Negative filtering not supported with parallel-rg
             if args.common.parallel_rg {
                 return Err(anyhow!(
                     "Negative index filtering is not supported with --parallel-rg."
                 ));
             }
-            classify_with_sharded_negative(
+            let results = classify_with_sharded_negative(
                 &sharded,
                 Some(neg),
                 batch_refs,
                 effective_threshold,
                 read_options.as_ref(),
-            )
-        } else if args.common.parallel_rg {
-            classify_batch_sharded_parallel_rg(
-                &sharded,
-                None,
-                batch_refs,
-                effective_threshold,
-                read_options.as_ref(),
-            )
+            )?;
+            let results = if args.best_hit {
+                filter_best_hits(results)
+            } else {
+                results
+            };
+            let chunk_out = if let Some(ref bucket_ids) = wide_bucket_ids {
+                format_results_wide(&results, &headers, bucket_ids)
+            } else {
+                format_classification_results(&results, &headers, &metadata.bucket_names)
+            };
+            out_writer.write_chunk(chunk_out)?;
         } else {
-            classify_batch_sharded_merge_join(
-                &sharded,
-                None,
-                batch_refs,
-                effective_threshold,
-                read_options.as_ref(),
-            )
+            let t_extract = std::time::Instant::now();
+            let extracted =
+                extract_batch_minimizers(idx_k, idx_w, idx_salt, None, batch_refs);
+            log_timing("batch: extract", t_extract.elapsed().as_millis());
+            acc.extend_extracted(headers, extracted);
+
+            if acc.should_flush() {
+                *pass_num += 1;
+                let read_count = flush_accumulated_pass(
+                    acc,
+                    &sharded,
+                    args.common.parallel_rg,
+                    effective_threshold,
+                    read_options.as_ref(),
+                    args.best_hit,
+                    wide_bucket_ids.as_deref(),
+                    &metadata.bucket_names,
+                    out_writer,
+                )?;
+                log::info!(
+                    "Classification pass {}: {} reads",
+                    *pass_num,
+                    read_count
+                );
+            }
         }
+        Ok(())
     };
 
     loop {
@@ -289,31 +344,16 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
                         batch_refs.len()
                     );
 
-                    let results = classify_records(&batch_refs)?;
-                    let results = if args.best_hit {
-                        filter_best_hits(results)
-                    } else {
-                        results
-                    };
+                    process_batch(
+                        &batch_refs,
+                        result.headers,
+                        &mut out_writer,
+                        &mut acc,
+                        &mut pass_num,
+                    )?;
 
-                    let t_format = std::time::Instant::now();
-                    let chunk_out = if let Some(ref bucket_ids) = wide_bucket_ids {
-                        format_results_wide(&results, &result.headers, bucket_ids)
-                    } else {
-                        format_classification_results(
-                            &results,
-                            &result.headers,
-                            &metadata.bucket_names,
-                        )
-                    };
-                    log_timing("batch: format_output", t_format.elapsed().as_millis());
-
-                    let t_write = std::time::Instant::now();
-                    out_writer.write_chunk(chunk_out)?;
-                    log_timing("batch: io_write", t_write.elapsed().as_millis());
-
-                    log::info!(
-                        "Processed batch {} ({} row groups): {} reads ({} total)",
+                    log::debug!(
+                        "Read batch {} ({} row groups): {} reads ({} total)",
                         batch_num,
                         result.rg_count,
                         batch_read_count,
@@ -324,80 +364,41 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
                         break;
                     }
                 } else {
-                    // Zero-copy Parquet path with batch stacking (no trimming)
-                    let mut stacked_batches: Vec<(RecordBatch, Vec<String>)> = Vec::new();
-                    let mut stacked_rows = 0usize;
-                    let mut reached_end = false;
-
-                    // Accumulate batches until we have enough rows or run out of data
-                    loop {
-                        let batch_opt = reader.next_batch()?;
-                        let Some(parquet_batch) = batch_opt else {
-                            reached_end = true;
-                            break;
-                        };
-                        let (record_batch, headers) = parquet_batch.into_arrow();
-
-                        let batch_rows = record_batch.num_rows();
-                        stacked_rows += batch_rows;
-                        stacked_batches.push((record_batch, headers));
-
-                        if stacked_rows >= effective_batch_size {
-                            break;
-                        }
-                    }
-
+                    // Zero-copy Parquet path. No stacking: the accumulator now
+                    // absorbs many input batches per classification pass, so
+                    // there's no need to stack batches up to a target size here.
+                    let batch_opt = reader.next_batch()?;
                     log_timing("batch: io_read", t_io_read.elapsed().as_millis());
 
-                    if stacked_batches.is_empty() {
+                    let Some(parquet_batch) = batch_opt else {
                         break;
-                    }
+                    };
+                    let (record_batch, headers) = parquet_batch.into_arrow();
 
-                    let is_final_batch = reached_end;
+                    let batch_read_count = record_batch.num_rows();
                     batch_num += 1;
-                    total_reads += stacked_rows;
+                    total_reads += batch_read_count;
 
                     let t_convert = std::time::Instant::now();
-                    let (batch_refs, headers) = stacked_batches_to_records(&stacked_batches)?;
+                    let stacked = [(record_batch, headers)];
+                    let (batch_refs, headers) = stacked_batches_to_records(&stacked)?;
                     log_timing("batch: convert_refs", t_convert.elapsed().as_millis());
 
+                    let headers: Vec<String> = headers.into_iter().map(String::from).collect();
+                    process_batch(
+                        &batch_refs,
+                        headers,
+                        &mut out_writer,
+                        &mut acc,
+                        &mut pass_num,
+                    )?;
+
                     log::debug!(
-                        "Stacked {} row groups into {} records",
-                        stacked_batches.len(),
-                        batch_refs.len()
-                    );
-
-                    // already_trimmed=false since we're using zero-copy (no trimming at read)
-                    let results = classify_records(&batch_refs)?;
-                    let results = if args.best_hit {
-                        filter_best_hits(results)
-                    } else {
-                        results
-                    };
-
-                    let t_format = std::time::Instant::now();
-                    let chunk_out = if let Some(ref bucket_ids) = wide_bucket_ids {
-                        format_results_wide_ref(&results, &headers, bucket_ids)
-                    } else {
-                        format_classification_results(&results, &headers, &metadata.bucket_names)
-                    };
-                    log_timing("batch: format_output", t_format.elapsed().as_millis());
-
-                    let t_write = std::time::Instant::now();
-                    out_writer.write_chunk(chunk_out)?;
-                    log_timing("batch: io_write", t_write.elapsed().as_millis());
-
-                    log::info!(
-                        "Processed batch {} ({} batches stacked): {} reads ({} total)",
+                        "Read batch {}: {} reads ({} total)",
                         batch_num,
-                        stacked_batches.len(),
-                        stacked_rows,
+                        batch_read_count,
                         total_reads
                     );
-
-                    if is_final_batch {
-                        break;
-                    }
                 }
             }
             ClassificationInput::Fastx(io) => {
@@ -420,28 +421,16 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
                     .collect();
                 log_timing("batch: convert_refs", t_convert.elapsed().as_millis());
 
-                // already_trimmed=true since FASTX reader now trims at read time
-                let results = classify_records(&batch_refs)?;
-                let results = if args.best_hit {
-                    filter_best_hits(results)
-                } else {
-                    results
-                };
+                process_batch(
+                    &batch_refs,
+                    headers,
+                    &mut out_writer,
+                    &mut acc,
+                    &mut pass_num,
+                )?;
 
-                let t_format = std::time::Instant::now();
-                let chunk_out = if let Some(ref bucket_ids) = wide_bucket_ids {
-                    format_results_wide(&results, &headers, bucket_ids)
-                } else {
-                    format_classification_results(&results, &headers, &metadata.bucket_names)
-                };
-                log_timing("batch: format_output", t_format.elapsed().as_millis());
-
-                let t_write = std::time::Instant::now();
-                out_writer.write_chunk(chunk_out)?;
-                log_timing("batch: io_write", t_write.elapsed().as_millis());
-
-                log::info!(
-                    "Processed batch {}: {} reads ({} total)",
+                log::debug!(
+                    "Read batch {}: {} reads ({} total)",
                     batch_num,
                     batch_read_count,
                     total_reads
@@ -450,11 +439,95 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
         }
     }
 
-    log::info!("Classification complete: {} reads processed", total_reads);
+    // Final pass over whatever remains accumulated (the common case: everything,
+    // if the whole corpus fit inside the byte budget).
+    if !acc.is_empty() {
+        pass_num += 1;
+        let read_count = flush_accumulated_pass(
+            &mut acc,
+            &sharded,
+            args.common.parallel_rg,
+            effective_threshold,
+            read_options.as_ref(),
+            args.best_hit,
+            wide_bucket_ids.as_deref(),
+            &metadata.bucket_names,
+            &mut out_writer,
+        )?;
+        log::info!("Classification pass {}: {} reads", pass_num, read_count);
+    }
+
+    log::info!(
+        "Classification complete: {} reads processed in {} pass{}",
+        total_reads,
+        pass_num,
+        if pass_num == 1 { "" } else { "es" }
+    );
     out_writer.finish()?;
     input_reader.finish()?;
 
     Ok(())
+}
+
+/// Drain `acc` into a `QueryInvertedIndex` and run one classification pass
+/// (one full scan of the sharded index's shards) against it, formatting and
+/// writing the results. Returns the number of reads in this pass, or `0` if
+/// `acc` was empty.
+///
+/// This is the seam that collapses many accumulated input batches into a
+/// single index scan: `classify_from_query_index`/`_parallel_rg`
+/// (`src/classify/sharded.rs`) already stream shards one at a time
+/// regardless of how many reads are in `query_idx`, so growing the
+/// accumulator's flush threshold directly reduces the number of passes
+/// without changing per-shard memory behavior.
+#[allow(clippy::too_many_arguments)]
+fn flush_accumulated_pass(
+    acc: &mut QueryAccumulator<String>,
+    sharded: &ShardedInvertedIndex,
+    parallel_rg: bool,
+    threshold: f64,
+    read_options: Option<&rype::ParquetReadOptions>,
+    best_hit: bool,
+    wide_bucket_ids: Option<&[u32]>,
+    bucket_names: &HashMap<u32, String>,
+    out_writer: &mut OutputWriter,
+) -> Result<usize> {
+    if acc.is_empty() {
+        return Ok(0);
+    }
+
+    let (query_idx, headers) = acc.drain();
+    let read_count = headers.len();
+    // Read indices in `query_idx` are 0..n in push order (see
+    // `QueryAccumulator::push`), and `headers[i]` is that same read's header,
+    // so query_ids are simply the identity mapping here.
+    let query_ids: Vec<i64> = (0..read_count as i64).collect();
+
+    let results = if parallel_rg {
+        classify_from_query_index_parallel_rg(
+            sharded,
+            &query_idx,
+            &query_ids,
+            threshold,
+            read_options,
+        )?
+    } else {
+        classify_from_query_index(sharded, &query_idx, &query_ids, threshold, read_options)?
+    };
+    let results = if best_hit {
+        filter_best_hits(results)
+    } else {
+        results
+    };
+
+    let chunk_out = if let Some(bucket_ids) = wide_bucket_ids {
+        format_results_wide(&results, &headers, bucket_ids)
+    } else {
+        format_classification_results(&results, &headers, bucket_names)
+    };
+    out_writer.write_chunk(chunk_out)?;
+
+    Ok(read_count)
 }
 
 /// Arguments for the classify aggregate command.
@@ -1285,19 +1358,6 @@ pub fn format_results_wide<S: AsRef<str>>(
     output
 }
 
-/// Format classification results in wide format for TSV output (borrowed headers variant).
-///
-/// This is an alias for `format_results_wide` that accepts `&[&str]` directly.
-/// Kept for backwards compatibility and explicit type annotation.
-#[inline]
-pub fn format_results_wide_ref(
-    results: &[rype::HitResult],
-    headers: &[&str],
-    bucket_ids: &[u32],
-) -> Vec<u8> {
-    format_results_wide(results, headers, bucket_ids)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1482,7 +1542,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_results_wide_ref_works_with_str_refs() {
+    fn test_format_results_wide_works_with_str_refs() {
         use rype::HitResult;
 
         let results = vec![
@@ -1500,7 +1560,7 @@ mod tests {
         let headers: Vec<&str> = vec!["read_1"];
         let bucket_ids = vec![1, 2];
 
-        let output = format_results_wide_ref(&results, &headers, &bucket_ids);
+        let output = format_results_wide(&results, &headers, &bucket_ids);
         let output_str = String::from_utf8(output).unwrap();
 
         assert_eq!(output_str, "read_1\t0.8500\t0.7500\n");

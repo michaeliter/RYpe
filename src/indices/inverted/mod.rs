@@ -12,11 +12,13 @@
 // The k-way merge heap type is complex but clear in context
 #![allow(clippy::type_complexity)]
 
+mod accumulate;
 mod query;
 mod query_loading;
 mod shard_parquet;
 
 // Re-export public types
+pub use accumulate::QueryAccumulator;
 pub use query::QueryInvertedIndex;
 pub use query_loading::{get_row_group_ranges, load_row_group_pairs, RowGroupRangeInfo};
 

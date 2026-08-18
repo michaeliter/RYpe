@@ -8,11 +8,11 @@ use anyhow::Result;
 use rype::c_api::{
     rype_bucket_file_stats, rype_bucket_file_stats_free, rype_bucket_name,
     rype_calculate_batch_config, rype_classify, rype_classify_best_hit, rype_classify_log_ratio,
-    rype_classify_with_negative, rype_get_last_error, rype_index_free, rype_index_is_sharded,
-    rype_index_k, rype_index_load, rype_index_num_buckets, rype_index_num_shards, rype_index_salt,
-    rype_index_w, rype_log_ratio_results_free, rype_negative_set_create, rype_negative_set_free,
-    rype_negative_set_size, rype_recommend_batch_size, rype_results_free,
-    rype_validate_log_ratio_indices, RypeQuery,
+    rype_classify_with_negative, rype_enable_timing, rype_estimate_pass_count, rype_get_last_error,
+    rype_index_free, rype_index_is_sharded, rype_index_k, rype_index_load, rype_index_num_buckets,
+    rype_index_num_shards, rype_index_salt, rype_index_w, rype_log_ratio_results_free,
+    rype_negative_set_create, rype_negative_set_free, rype_negative_set_size,
+    rype_recommend_batch_size, rype_results_free, rype_validate_log_ratio_indices, RypeQuery,
 };
 use rype::{
     extract_into, BucketData, IndexMetadata, InvertedIndex, MinimizerWorkspace, ParquetWriteOptions,
@@ -1370,6 +1370,39 @@ fn test_recommend_batch_size_basic() -> Result<()> {
 
     rype_index_free(idx);
     Ok(())
+}
+
+#[test]
+fn test_estimate_pass_count_basic() {
+    // Evenly divisible: exactly one pass per batch_size reads.
+    assert_eq!(rype_estimate_pass_count(1000, 100), 10);
+    // Not evenly divisible: rounds up (a partial group still costs a pass).
+    assert_eq!(rype_estimate_pass_count(1001, 100), 11);
+    assert_eq!(rype_estimate_pass_count(1, 100), 1);
+    // Fewer reads than one batch: still one pass.
+    assert_eq!(rype_estimate_pass_count(0, 100), 0);
+}
+
+#[test]
+fn test_estimate_pass_count_zero_batch_size_returns_zero() {
+    assert_eq!(rype_estimate_pass_count(1000, 0), 0);
+}
+
+#[test]
+fn test_enable_timing_toggles_global_flag() {
+    use std::sync::atomic::Ordering;
+
+    // Save and restore: this flag is process-global, and other tests in this
+    // binary run concurrently and may rely on its default (off) state.
+    let restore = rype::ENABLE_TIMING.load(Ordering::Relaxed);
+
+    rype_enable_timing(1);
+    assert!(rype::ENABLE_TIMING.load(Ordering::Relaxed));
+
+    rype_enable_timing(0);
+    assert!(!rype::ENABLE_TIMING.load(Ordering::Relaxed));
+
+    rype_enable_timing(restore as i32);
 }
 
 /// Use a tight memory budget so paired vs single-end and large vs small memory

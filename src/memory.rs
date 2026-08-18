@@ -899,6 +899,15 @@ pub const MAX_BATCH_SIZE: usize = 100_000_000;
 const SAFETY_MARGIN_PERCENT: f64 = 0.10;
 const SAFETY_MARGIN_MIN_BYTES: usize = 256 * 1024 * 1024;
 
+/// Safety margin held back from `max_memory`: `max(256MB, 10% of max_memory)`.
+///
+/// Exposed so callers outside this module (e.g. the CLI's classify-budget
+/// computation) can apply the same margin without duplicating the constants.
+pub fn safety_margin_bytes(max_memory: usize) -> usize {
+    let safety_margin = (max_memory as f64 * SAFETY_MARGIN_PERCENT).round() as usize;
+    safety_margin.max(SAFETY_MARGIN_MIN_BYTES)
+}
+
 /// Fudge factor for memory estimation (accounts for HashMap overhead, HitResults, etc.)
 ///
 /// This factor accounts for:
@@ -915,6 +924,32 @@ const MEMORY_FUDGE_FACTOR: f64 = 1.8;
 /// This factor accounts for peak memory during RecordBatch construction
 /// in the prefetch thread before the batch is handed to the main thread.
 const ARROW_BUILDER_OVERHEAD: f64 = 1.5;
+
+/// Estimate the per-read cost of the `HitAccumulator` that
+/// `classify::sharded::classify_shard_loop`/`_parallel_rg` allocate for a
+/// pass over an index with `num_buckets` buckets.
+///
+/// Mirrors `classify::sharded::use_dense_accumulator`'s threshold exactly, so
+/// batch/pass sizing agrees with what actually gets allocated: dense
+/// (`num_buckets <= DENSE_ACCUMULATOR_MAX_BUCKETS`) is a flat `Vec<(u32,u32)>`
+/// of `(num_buckets + 1)` slots per read at 8 bytes each — for a 160-bucket
+/// index that's ~1.3 KB/read, allocated whether or not the bucket is ever
+/// hit. Sparse is a per-read `HashMap<u32, (u32,u32)>` holding only buckets
+/// actually seen, estimated at ~4 buckets/read on average.
+///
+/// `num_buckets` is a count while the dense stride is `max_bucket_id + 1`;
+/// these agree for contiguously numbered buckets, which is what the index
+/// builders produce. An index with sparse bucket ids uses more than this.
+///
+/// Returns `None` on arithmetic overflow (only reachable with a pathological
+/// `num_buckets` near `usize::MAX`).
+pub fn estimate_accumulator_bytes_per_read(num_buckets: usize) -> Option<usize> {
+    if num_buckets > 0 && num_buckets <= DENSE_ACCUMULATOR_MAX_BUCKETS {
+        num_buckets.checked_add(1)?.checked_mul(8)
+    } else {
+        4.min(num_buckets).checked_mul(24) // HashMap entry overhead
+    }
+}
 
 /// Estimate memory usage for a single batch.
 ///
@@ -964,16 +999,7 @@ pub fn estimate_batch_memory(
     // `num_buckets` is a count while the dense stride is max_bucket_id + 1.
     // These agree for contiguously numbered buckets, which is what the index
     // builders produce; an index with sparse bucket ids uses more than this.
-    let accumulators = if num_buckets > 0 && num_buckets <= DENSE_ACCUMULATOR_MAX_BUCKETS {
-        batch_size
-            .checked_mul(num_buckets.checked_add(1)?)?
-            .checked_mul(8)?
-    } else {
-        let estimated_buckets_per_read = 4.min(num_buckets);
-        batch_size
-            .checked_mul(estimated_buckets_per_read)?
-            .checked_mul(24)? // HashMap entry overhead
-    };
+    let accumulators = batch_size.checked_mul(estimate_accumulator_bytes_per_read(num_buckets)?)?;
 
     // Sum components with overflow checking
     let mut base_estimate = input_records
@@ -1079,8 +1105,7 @@ fn estimate_total_batch_memory(
 /// FASTX uses 2 slots, Parquet uses 4 slots.
 pub fn calculate_batch_config(config: &MemoryConfig) -> BatchConfig {
     // Calculate safety margin
-    let safety_margin = (config.max_memory as f64 * SAFETY_MARGIN_PERCENT).round() as usize;
-    let safety_margin = safety_margin.max(SAFETY_MARGIN_MIN_BYTES);
+    let safety_margin = safety_margin_bytes(config.max_memory);
 
     // Base reserved memory (not dependent on batch_size)
     let base_reserved = config

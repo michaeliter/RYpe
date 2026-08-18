@@ -9,7 +9,7 @@ use anyhow::Result;
 
 use rype::memory::{
     calculate_batch_config, detect_available_memory, estimate_shard_reservation, format_bytes,
-    InputFormat, MemoryConfig, MemorySource, ReadMemoryProfile,
+    safety_margin_bytes, InputFormat, MemoryConfig, MemorySource, ReadMemoryProfile,
 };
 
 use super::load_index_metadata;
@@ -49,6 +49,15 @@ pub struct BatchSizeResult {
     pub input_format: InputFormat,
     /// Memory reserved for shard loading (for logging)
     pub shard_reservation: usize,
+    /// Byte budget for the `QueryAccumulator` that drives classification pass
+    /// count — independent of `batch_size`, which now only bounds input
+    /// (sequence-byte) residency. `usize::MAX` when unconstrained (a caller
+    /// gave an explicit `batch_size_override`; see `classify_max_reads`).
+    pub classify_byte_budget: usize,
+    /// When set, the accumulator must also flush after this many reads,
+    /// regardless of byte budget. Set only when the caller passed an explicit
+    /// `batch_size_override`, to preserve read-count semantics for that case.
+    pub classify_max_reads: Option<usize>,
 }
 
 /// Determine the correct `InputFormat` for memory estimation.
@@ -96,6 +105,11 @@ pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSiz
             peak_memory: 0, // Unknown for user-specified
             input_format,
             shard_reservation: 0, // Unknown for user-specified
+            // An explicit batch size is a read-count request, not a memory
+            // budget: preserve it as a read-count flush trigger rather than
+            // guessing at a byte budget with no read-length sample.
+            classify_byte_budget: usize::MAX,
+            classify_max_reads: Some(bs),
         });
     }
 
@@ -201,11 +215,22 @@ pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSiz
 
     let batch_config = calculate_batch_config(&mem_config);
 
+    // Classification-pass budget: what's left of max_memory after the shard
+    // reservation (index residency during a shard scan) and the safety margin,
+    // available for the QueryAccumulator's flat COO entries. This is
+    // independent of `batch_size`, which now only bounds input-batch
+    // (sequence-byte) residency ahead of extraction.
+    let classify_byte_budget = mem_limit
+        .saturating_sub(shard_reservation)
+        .saturating_sub(safety_margin_bytes(mem_limit));
+
     Ok(BatchSizeResult {
         batch_size: batch_config.batch_size,
         peak_memory: batch_config.peak_memory,
         input_format,
         shard_reservation,
+        classify_byte_budget,
+        classify_max_reads: None,
     })
 }
 
