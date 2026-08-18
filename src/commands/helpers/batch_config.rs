@@ -215,14 +215,30 @@ pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSiz
 
     let batch_config = calculate_batch_config(&mem_config);
 
-    // Classification-pass budget: what's left of max_memory after the shard
-    // reservation (index residency during a shard scan) and the safety margin,
+    // What's actually resident, concurrently with the accumulator, while
+    // reading and extracting one input batch (raw records + I/O prefetch
+    // buffers — not the CSR/accumulator terms `calculate_batch_config`'s own
+    // `peak_memory` still models, which no longer materialize per batch on
+    // this path; see `estimate_accumulator_path_input_residency`'s doc).
+    let input_batch_residency = rype::memory::estimate_accumulator_path_input_residency(
+        batch_config.batch_size,
+        &mem_config.read_profile,
+        &mem_config,
+    )
+    .unwrap_or(0);
+
+    // Classification-pass budget: what's left of max_memory after everything
+    // else concurrently resident during a pass — the shard reservation
+    // (index residency during a shard scan), the safety margin, the
+    // reference index itself, and one input batch's worth of raw records —
     // available for the QueryAccumulator's flat COO entries. This is
     // independent of `batch_size`, which now only bounds input-batch
     // (sequence-byte) residency ahead of extraction.
     let classify_byte_budget = mem_limit
         .saturating_sub(shard_reservation)
-        .saturating_sub(safety_margin_bytes(mem_limit));
+        .saturating_sub(safety_margin_bytes(mem_limit))
+        .saturating_sub(estimated_index_mem)
+        .saturating_sub(input_batch_residency);
 
     Ok(BatchSizeResult {
         batch_size: batch_config.batch_size,
@@ -487,9 +503,18 @@ num_entries = 3
     /// producing batch sizes ~4-8x smaller than necessary. `batch_size` now
     /// only bounds input (sequence-byte) residency (see `QueryAccumulator`),
     /// so this regression check moved to `classify_byte_budget`, the field
-    /// that now drives classification pass count. The assertion threshold
-    /// (>32GB of a 64GB budget) is scale-independent: it holds for both
-    /// fixtures below regardless of shard count or size.
+    /// that now drives classification pass count.
+    ///
+    /// The threshold is a fraction of `max_memory`, not an absolute GB
+    /// figure: `classify_byte_budget` now honestly subtracts the reference
+    /// index, the shard reservation, and one input batch's real raw-record
+    /// residency (see `estimate_accumulator_path_input_residency`) — for a
+    /// query file of very long reads, that last term alone can be tens of
+    /// GB, so a fixed "> 32GB of a 64GB budget" assumption doesn't hold
+    /// across read-length regimes. A generous 10% floor still catches the
+    /// actual bug this test guards against (the shard-count over-reservation
+    /// crippling the budget to near-zero) without depending on how large the
+    /// query reads happen to be.
     fn check_real_sharded_index_batch_size_is_reasonable(index_path: &std::path::Path) {
         let query_path = std::path::Path::new("perf-assessment/query-files/long_read.parquet");
 
@@ -525,12 +550,19 @@ num_entries = 3
             result.classify_byte_budget as f64 / (1024.0 * 1024.0 * 1024.0)
         );
 
-        // With batch_count=1 fix, classify_byte_budget should be the large
-        // majority of max_memory, not crippled by shard-count over-reservation.
+        // With batch_count=1 fix, classify_byte_budget should be a healthy
+        // fraction of max_memory, not crippled by shard-count
+        // over-reservation. A 10% floor (not the honest-accounting fraction
+        // itself, which varies with read length — see the doc comment
+        // above) still catches that specific regression.
+        let min_expected = config.max_memory / 10;
         assert!(
-            result.classify_byte_budget > 32 * 1024 * 1024 * 1024,
-            "{}: classify_byte_budget should be > 32GB for a 64GB max-memory run, got {} bytes",
+            result.classify_byte_budget > min_expected,
+            "{}: classify_byte_budget should be > 10% of max_memory ({} bytes) for a {}GB \
+             max-memory run, got {} bytes",
             index_path.display(),
+            min_expected,
+            config.max_memory / (1024 * 1024 * 1024),
             result.classify_byte_budget
         );
     }

@@ -960,6 +960,38 @@ pub fn estimate_accumulator_bytes_per_read(num_buckets: usize) -> Option<usize> 
     }
 }
 
+/// Estimate what's actually resident during input reading on the
+/// `QueryAccumulator` path (`commands::classify::run_classify`'s
+/// non-negative-index branch): the raw input records for one input batch
+/// plus its I/O prefetch buffers.
+///
+/// Deliberately narrower than [`estimate_batch_memory`]: on this path,
+/// extraction pushes straight into the accumulator (see
+/// `indices::inverted::accumulate::QueryAccumulator`), so the CSR/minimizer-
+/// vector/per-read-accumulator terms `estimate_batch_memory` still models
+/// never materialize per input batch — that memory is accounted for
+/// separately, by the classification-pass byte budget
+/// (`commands::helpers::batch_config::compute_effective_batch_size`'s
+/// `classify_byte_budget`), which is what's concurrently resident with this.
+/// `estimate_batch_memory` remains correct and necessary for the
+/// negative-index path, which still classifies immediately per batch and
+/// does materialize the full CSR + accumulator every time — this function
+/// is not a replacement for it, only a second, narrower estimate for the
+/// other path.
+///
+/// Returns `None` on arithmetic overflow.
+pub fn estimate_accumulator_path_input_residency(
+    batch_size: usize,
+    profile: &ReadMemoryProfile,
+    config: &MemoryConfig,
+) -> Option<usize> {
+    let record_overhead: usize = 72; // OwnedFastxRecord overhead, mirrors estimate_batch_memory
+    let input_records =
+        batch_size.checked_mul(record_overhead.checked_add(profile.avg_query_length)?)?;
+    let io_buffer_memory = estimate_io_buffer_memory(batch_size, config)?;
+    input_records.checked_add(io_buffer_memory)
+}
+
 /// Estimate memory usage for a single batch.
 ///
 /// Memory components:
@@ -970,6 +1002,12 @@ pub fn estimate_accumulator_bytes_per_read(num_buckets: usize) -> Option<usize> 
 /// - Accumulators: dense `batch_size * (num_buckets + 1) * 8` when the index is
 ///   small enough for the dense accumulator, otherwise sparse
 ///   `batch_size * estimated_buckets_per_read * 24`
+///
+/// Note: this models the *negative-index* classify path, which still
+/// materializes a full CSR + accumulator per input batch. The accumulator
+/// path (see `estimate_accumulator_path_input_residency`) no longer holds
+/// these per batch, so `compute_effective_batch_size`'s `classify_byte_budget`
+/// accounts for them separately instead of via this function.
 ///
 /// Returns None if arithmetic overflow occurs.
 pub fn estimate_batch_memory(
