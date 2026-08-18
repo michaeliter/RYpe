@@ -956,7 +956,8 @@ pub fn estimate_accumulator_bytes_per_read(num_buckets: usize) -> Option<usize> 
 /// Memory components:
 /// - Input records: batch_size * (72 + avg_query_length) for OwnedFastxRecord
 /// - Minimizers: batch_size * minimizers_per_query * 16 bytes (`Vec<u64>` for fwd + rc)
-/// - QueryInvertedIndex CSR: batch_size * minimizers_per_query * 12 bytes
+/// - QueryInvertedIndex CSR: batch_size * minimizers_per_query * 16 bytes
+///   (`(u64, u32)` entries are padded to 16 bytes by `u64`'s 8-byte alignment)
 /// - Accumulators: dense `batch_size * (num_buckets + 1) * 8` when the index is
 ///   small enough for the dense accumulator, otherwise sparse
 ///   `batch_size * estimated_buckets_per_read * 24`
@@ -978,11 +979,12 @@ pub fn estimate_batch_memory(
         .checked_mul(profile.minimizers_per_query)?
         .checked_mul(16)?;
 
-    // QueryInvertedIndex CSR structure
-    // minimizers: Vec<u64>, offsets: Vec<u32>, read_ids: Vec<u32>
+    // QueryInvertedIndex CSR structure: (u64, u32) entries, padded to 16
+    // bytes by u64's 8-byte alignment (std::mem::size_of::<(u64, u32)>()
+    // == 16, not the unpadded 8 + 4 == 12).
     let query_index = batch_size
         .checked_mul(profile.minimizers_per_query)?
-        .checked_mul(12)?;
+        .checked_mul(16)?;
 
     // Per-read accumulators. Two implementations exist and the choice is made
     // per index by classify::sharded::use_dense_accumulator:
@@ -1017,8 +1019,9 @@ pub fn estimate_batch_memory(
         let estimated_header_bytes: usize = 60;
         let per_read_overhead = meta_bytes.checked_add(estimated_header_bytes)?;
         // minimizers_per_query already includes both strands.
-        // Each minimizer stored as (u64, u32) = 12 bytes in COO entries.
-        let minimizer_cost = profile.minimizers_per_query.checked_mul(12)?;
+        // Each minimizer stored as (u64, u32) = 16 bytes in COO entries
+        // (padded by u64's 8-byte alignment, not the unpadded 12).
+        let minimizer_cost = profile.minimizers_per_query.checked_mul(16)?;
         // unique_minimizers() Vec: 8 bytes per minimizer (upper bound)
         let query_mins_cost = profile.minimizers_per_query.checked_mul(8)?;
         let deferred_memory = deferred_reads.checked_mul(
@@ -1257,7 +1260,9 @@ pub fn estimate_shard_reservation(largest_shard_entries: u64, num_threads: usize
         return 0;
     }
 
-    let bytes_per_entry: usize = 12; // u64 minimizer + u32 bucket_id
+    // (u64, u32) padded to 16 bytes by u64's 8-byte alignment — not the
+    // unpadded 8 + 4 == 12.
+    let bytes_per_entry: usize = 16;
     let rg_size = crate::constants::DEFAULT_ROW_GROUP_SIZE;
 
     // Parallel decode buffers: num_threads concurrent RG decodes with Arrow overhead
@@ -2548,10 +2553,10 @@ mod tests {
         // Real 8-shard index: largest shard = 62,443,845 entries, 8 threads
         let reservation = estimate_shard_reservation(62_443_845, 8);
 
-        // decode buffers: 8 * 100_000 * 12 * 3 (Arrow overhead) = 28,800,000 (~27.5MB)
-        // filtered CSR: 62_443_845 * 12 * 0.10 * 2 = 149,865,228 (~142.9MB)
-        // total ≈ 170MB
-        let expected_mb = 170;
+        // decode buffers: 8 * 100_000 * 16 * 3 (Arrow overhead) = 38,400,000 (~36.6MB)
+        // filtered CSR: 62_443_845 * 16 * 0.10 * 2 = 199,820,304 (~190.6MB)
+        // total ≈ 227MB (bytes_per_entry corrected from 12 to 16 — see Finding 9)
+        let expected_mb = 227;
         let actual_mb = reservation / (1024 * 1024);
         assert!(
             actual_mb >= expected_mb - 15 && actual_mb <= expected_mb + 15,
@@ -2699,10 +2704,10 @@ mod tests {
             is_log_ratio: false,
         };
 
-        // Realistic shard reservation for 62M-entry largest shard:
-        // decode buffers: 8 threads * 100K rows * 12 bytes = 9.6MB
-        // filtered CSR: 62M * 12 * 0.10 * 2 = 148.8MB
-        // total ≈ 158MB
+        // A representative shard reservation value (this test only checks
+        // that a larger reservation reduces batch_size, not this exact
+        // figure — see test_estimate_shard_reservation_realistic for the
+        // actual estimate_shard_reservation() arithmetic).
         let shard_reservation = 158 * 1024 * 1024;
         let config_with_reservation = MemoryConfig {
             shard_reservation,
