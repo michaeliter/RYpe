@@ -237,9 +237,19 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
     // bucket_names.len() here would under-estimate in that case and let
     // should_flush() admit a pass the real accumulator doesn't fit.
     let max_bucket_id = metadata.bucket_names.keys().max().copied().unwrap_or(0);
-    let accumulator_bytes_per_read =
-        rype::memory::estimate_accumulator_bytes_per_read(max_bucket_id as usize + 1)
-            .unwrap_or(0);
+    // Parallel CSR merge-join (classify::merge_join) allocates up to ~2x
+    // num_threads full-size HitAccumulators when a pass's read count lands
+    // at or under FOLD_REDUCE_MAX_READS (per-chunk accumulators plus
+    // rayon's reduce identities) — see fold_reduce_accumulator_fanout's
+    // doc. Scale the per-read reservation by that factor so should_flush()
+    // accounts for the real worst case, not just one accumulator.
+    let accumulator_bytes_per_read = rype::memory::estimate_accumulator_bytes_per_read(
+        max_bucket_id as usize + 1,
+    )
+    .unwrap_or(0)
+    .saturating_mul(rype::memory::fold_reduce_accumulator_fanout(
+        rayon::current_num_threads(),
+    ));
 
     let mut acc: rype::QueryAccumulator<String> =
         rype::QueryAccumulator::with_budget(batch_result.classify_byte_budget)

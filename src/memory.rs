@@ -960,6 +960,28 @@ pub fn estimate_accumulator_bytes_per_read(num_buckets: usize) -> Option<usize> 
     }
 }
 
+/// Worst-case concurrency multiplier for the parallel CSR merge-join's
+/// per-thread accumulator fan-out
+/// (`classify::merge_join::merge_join_csr_linear_parallel` /
+/// `gallop_join_csr_parallel`): whenever a pass's `num_reads` lands at or
+/// under `FOLD_REDUCE_MAX_READS`, each of `num_threads` chunks gets its own
+/// full-size `HitAccumulator` via `new_like()`, plus rayon's `reduce`
+/// identity closures — bounded by roughly the same degree of parallelism,
+/// so up to about `2 * num_threads` full-size accumulators can be live at
+/// once, not the one `estimate_accumulator_bytes_per_read` models.
+///
+/// A caller sizing `QueryAccumulator::with_accumulator_cost_per_read` for a
+/// whole pass doesn't know in advance whether that pass will land under
+/// `FOLD_REDUCE_MAX_READS` (that depends on how many reads accumulate
+/// before `should_flush()` fires) — so scale by this factor unconditionally
+/// as the conservative choice; it costs a somewhat smaller pass than
+/// strictly necessary once a pass exceeds `FOLD_REDUCE_MAX_READS` (where
+/// the sparse-hit-collection fallback applies instead and this multiplier
+/// is moot), rather than risking the actual OOM this finding describes.
+pub fn fold_reduce_accumulator_fanout(num_threads: usize) -> usize {
+    (2 * num_threads).max(1)
+}
+
 /// Estimate what's actually resident during input reading on the
 /// `QueryAccumulator` path (`commands::classify::run_classify`'s
 /// non-negative-index branch): the raw input records for one input batch
@@ -1395,6 +1417,24 @@ mod tests {
             "count-based and max-id-based estimates must diverge for non-contiguous \
              bucket ids — a caller using the wrong one silently mis-sizes the budget"
         );
+    }
+
+    /// Regression: the per-read accumulator reservation must scale with
+    /// thread count, matching the real worst-case fan-out of the parallel
+    /// CSR merge-join's per-chunk accumulators (see
+    /// `fold_reduce_accumulator_fanout`'s doc). Before this existed, a
+    /// caller reserving `estimate_accumulator_bytes_per_read(...)` alone
+    /// modeled exactly one accumulator regardless of thread count, while
+    /// `merge_join_csr_linear_parallel`/`gallop_join_csr_parallel` can
+    /// allocate on the order of `2 * num_threads` of them at once.
+    #[test]
+    fn test_fold_reduce_accumulator_fanout_scales_with_threads() {
+        assert_eq!(fold_reduce_accumulator_fanout(1), 2);
+        assert_eq!(fold_reduce_accumulator_fanout(8), 16);
+        assert_eq!(fold_reduce_accumulator_fanout(12), 24);
+        // Never zero, even in a pathological 0-thread input, so callers
+        // multiplying by this never accidentally zero out their reservation.
+        assert!(fold_reduce_accumulator_fanout(0) >= 1);
     }
 
     // === Byte suffix parsing tests ===
