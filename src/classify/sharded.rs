@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::constants::{
     COO_MERGE_JOIN_MAX_BUCKETS, DENSE_ACCUMULATOR_MAX_BUCKETS, ESTIMATED_MINIMIZERS_PER_SEQUENCE,
-    FOLD_REDUCE_MAX_READS,
+    FOLD_REDUCE_MAX_READS, PARALLEL_RG_COLLECT_CHUNK_SIZE,
 };
 use crate::core::extraction::get_paired_minimizers_into;
 use crate::core::workspace::MinimizerWorkspace;
@@ -592,26 +592,43 @@ where
                     Ok(a)
                 })?
         } else {
-            // Collect+merge: efficient for large batches (millions of short reads).
-            // SparseHits are small per-read, so materializing all at once is fine.
-            let results: Result<Vec<Vec<SparseHit>>> = work_items
-                .into_par_iter()
-                .map(|(shard_path, rg_idx)| {
-                    let pairs = load_row_group_pairs(&shard_path, rg_idx, query_minimizers)?;
-                    let pair_count = pairs.len();
-                    let hits = merge_join_pairs_sparse(query_idx, &pairs);
-                    pairs_ref.fetch_add(pair_count as u64, Ordering::Relaxed);
-                    rgs_done_ref.fetch_add(1, Ordering::Relaxed);
-                    Ok(hits)
-                })
-                .collect();
+            // Collect+merge: efficient for large batches (millions of short reads),
+            // since SparseHits are small per-read and don't scale with num_buckets
+            // the way a dense accumulator would (that's why the fold/reduce branch
+            // above, which needs one full accumulator per thread, isn't used here
+            // — see FOLD_REDUCE_MAX_READS's doc).
+            //
+            // work_items is chunked (not one big collect()) so peak SparseHit
+            // memory is bounded by one chunk, not by how many row groups this
+            // pass's minimizer range touches. That range used to be bounded by
+            // one input batch's worth of query minimizers; now that a whole
+            // pass spans the full accumulated corpus (see QueryAccumulator),
+            // work_items can cover most or all of a shard's row groups at once,
+            // and this code — unchanged by that shift — was written assuming
+            // "large batch" meant "one old-style input batch," not "the whole
+            // corpus." Merging each chunk into `acc` before starting the next
+            // drops that chunk's SparseHit buffer instead of holding every
+            // chunk's results simultaneously until the end.
             let mut acc = make_acc();
-            for rg_hits in results? {
-                if rg_hits.is_empty() {
-                    continue;
-                }
-                for (read_idx, bucket_id, fwd, rc) in rg_hits {
-                    acc.record_hit_counts(read_idx as usize, bucket_id, fwd, rc);
+            for chunk in work_items.chunks(PARALLEL_RG_COLLECT_CHUNK_SIZE) {
+                let results: Result<Vec<Vec<SparseHit>>> = chunk
+                    .par_iter()
+                    .map(|(shard_path, rg_idx)| {
+                        let pairs = load_row_group_pairs(shard_path, *rg_idx, query_minimizers)?;
+                        let pair_count = pairs.len();
+                        let hits = merge_join_pairs_sparse(query_idx, &pairs);
+                        pairs_ref.fetch_add(pair_count as u64, Ordering::Relaxed);
+                        rgs_done_ref.fetch_add(1, Ordering::Relaxed);
+                        Ok(hits)
+                    })
+                    .collect();
+                for rg_hits in results? {
+                    if rg_hits.is_empty() {
+                        continue;
+                    }
+                    for (read_idx, bucket_id, fwd, rc) in rg_hits {
+                        acc.record_hit_counts(read_idx as usize, bucket_id, fwd, rc);
+                    }
                 }
             }
             acc
@@ -1436,6 +1453,72 @@ mod tests {
                 "Scores should match: {} vs {}",
                 e.score,
                 n.score
+            );
+        }
+    }
+
+    /// Regression: `parallel_rg_inner`'s collect+merge branch (used when
+    /// `num_reads > FOLD_REDUCE_MAX_READS`) must produce the same results
+    /// whether or not `work_items` is split across multiple
+    /// `PARALLEL_RG_COLLECT_CHUNK_SIZE`-sized chunks — chunking was
+    /// introduced to bound peak `Vec<Vec<SparseHit>>` memory (previously
+    /// unbounded, scaling with however many row groups a pass's minimizer
+    /// range touched) without changing what gets merged into the final
+    /// accumulator. Forces the collect+merge branch specifically (not the
+    /// smaller-`num_reads` fold/reduce branch) by pushing `num_reads` past
+    /// `FOLD_REDUCE_MAX_READS`, and checks output against the
+    /// non-parallel-rg reference path.
+    #[test]
+    fn test_classify_from_query_index_parallel_rg_collect_merge_branch_matches_reference() {
+        let (_dir, index, seqs) = create_test_index();
+        let manifest = index.manifest();
+
+        // Repeat the same two real sequences past FOLD_REDUCE_MAX_READS
+        // (500_000) so this exercises the collect+merge branch, not
+        // fold/reduce. Cheap: QueryRecord borrows the same underlying
+        // seq1/seq2 buffers each time, nothing is duplicated in memory
+        // until extraction flattens into the query index.
+        const NUM_REPEATS: usize = FOLD_REDUCE_MAX_READS / 2 + 1; // > FOLD_REDUCE_MAX_READS total reads
+        let mut records: Vec<crate::types::QueryRecord> = Vec::with_capacity(NUM_REPEATS * 2);
+        for i in 0..NUM_REPEATS {
+            records.push(((i * 2) as i64, seqs[0].as_slice(), None));
+            records.push(((i * 2 + 1) as i64, seqs[1].as_slice(), None));
+        }
+        let query_ids: Vec<i64> = (0..records.len() as i64).collect();
+
+        let extracted =
+            extract_batch_minimizers(manifest.k, manifest.w, manifest.salt, None, &records);
+        let query_idx = QueryInvertedIndex::build(&extracted);
+        assert!(
+            query_idx.num_reads() > FOLD_REDUCE_MAX_READS,
+            "test setup: must exceed FOLD_REDUCE_MAX_READS to hit collect+merge"
+        );
+
+        let results_parallel_rg =
+            classify_from_query_index_parallel_rg(&index, &query_idx, &query_ids, 0.1, None)
+                .unwrap();
+        let results_reference =
+            classify_from_query_index(&index, &query_idx, &query_ids, 0.1, None).unwrap();
+
+        let sort_key = |r: &&HitResult| (r.query_id, r.bucket_id);
+        let mut a: Vec<&HitResult> = results_parallel_rg.iter().collect();
+        let mut b: Vec<&HitResult> = results_reference.iter().collect();
+        a.sort_by_key(sort_key);
+        b.sort_by_key(sort_key);
+
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "collect+merge (chunked) and reference paths should produce the same hit count"
+        );
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.query_id, y.query_id);
+            assert_eq!(x.bucket_id, y.bucket_id);
+            assert!(
+                (x.score - y.score).abs() < 1e-10,
+                "scores should match: {} vs {}",
+                x.score,
+                y.score
             );
         }
     }

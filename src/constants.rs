@@ -94,6 +94,22 @@ pub(crate) const MIN_PARALLEL_SHARD_SIZE: usize = 10_000;
 /// well within memory bounds across varying thread counts.
 pub(crate) const FOLD_REDUCE_MAX_READS: usize = 500_000;
 
+/// Maximum number of `(shard_path, row_group_index)` work items processed
+/// per collect+merge chunk in `classify::sharded::parallel_rg_inner`'s
+/// large-`num_reads` branch (see `FOLD_REDUCE_MAX_READS`'s doc for why that
+/// branch can't use per-thread dense accumulators instead).
+///
+/// A row group holds up to `DEFAULT_ROW_GROUP_SIZE` (100K) entries; at a
+/// generous 100% match rate that's 100K `SparseHit`s (16 bytes each) per
+/// row group. Bounding a chunk to 4096 row groups caps that chunk's
+/// `Vec<Vec<SparseHit>>` at roughly 4096 × 100K × 16B ≈ 6.4 GB worst case
+/// (far less at realistic selectivity, ~10% per the same assumption used
+/// elsewhere — see `SHARD_SELECTIVITY_ESTIMATE` in `memory.rs`), instead of
+/// scaling unboundedly with however many row groups a pass's minimizer
+/// range touches. Large enough relative to typical thread counts (tens to
+/// low hundreds) that rayon still load-balances well within a chunk.
+pub(crate) const PARALLEL_RG_COLLECT_CHUNK_SIZE: usize = 4096;
+
 // ============================================================================
 // Delimiters
 // ============================================================================
