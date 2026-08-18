@@ -17,6 +17,42 @@
 
 use super::query::QueryInvertedIndex;
 
+/// Approximate heap-allocation footprint of a `QueryAccumulator` per-read
+/// metadata payload, so `QueryAccumulator::approx_bytes()` can account for
+/// it directly instead of leaving it to each caller (as
+/// `DeferredDenomBuffer::approx_bytes` does for its `header: String` field —
+/// the pattern this generalizes). Implemented for the payload types
+/// `QueryAccumulator` is actually instantiated with: the CLI's owned
+/// `String` headers (real heap cost, and often the *largest* per-read term —
+/// e.g. short reads against a wide-window index can have more header bytes
+/// than minimizer entry bytes) and the Arrow/C-API path's `i64` query ids
+/// (no heap allocation).
+pub trait MetaHeapBytes {
+    fn heap_bytes(&self) -> usize;
+}
+
+impl MetaHeapBytes for String {
+    fn heap_bytes(&self) -> usize {
+        self.capacity()
+    }
+}
+
+impl MetaHeapBytes for i64 {
+    fn heap_bytes(&self) -> usize {
+        0
+    }
+}
+
+// Borrowed &str isn't a real payload type (nothing in the codebase
+// accumulates borrowed metadata across flushes, since drain()'d metadata
+// must outlive its originating input batch) but is used as a lightweight
+// stand-in in this module's own unit tests below.
+impl MetaHeapBytes for &str {
+    fn heap_bytes(&self) -> usize {
+        0
+    }
+}
+
 /// Accumulates extracted minimizers across many input batches as flat COO entries,
 /// flushing when a caller-supplied byte budget (not a read count) is reached.
 ///
@@ -29,12 +65,18 @@ pub struct QueryAccumulator<M> {
     fwd_counts: Vec<u32>,
     rc_counts: Vec<u32>,
     meta: Vec<M>,
+    /// Running total of `meta`'s heap allocations (see `MetaHeapBytes`),
+    /// updated incrementally in `push` rather than rescanned on every
+    /// `approx_bytes()` call — this is checked after every input batch via
+    /// `should_flush()`, so an O(n) rescan would make accumulation overall
+    /// O(n^2) in the number of batches.
+    meta_heap_bytes: usize,
     byte_budget: usize,
     max_reads: Option<usize>,
     accumulator_bytes_per_read: usize,
 }
 
-impl<M> QueryAccumulator<M> {
+impl<M: MetaHeapBytes> QueryAccumulator<M> {
     /// Create an accumulator that signals `should_flush()` once accumulated data
     /// reaches approximately `byte_budget` bytes.
     pub fn with_budget(byte_budget: usize) -> Self {
@@ -43,6 +85,7 @@ impl<M> QueryAccumulator<M> {
             fwd_counts: Vec::new(),
             rc_counts: Vec::new(),
             meta: Vec::new(),
+            meta_heap_bytes: 0,
             byte_budget,
             max_reads: None,
             accumulator_bytes_per_read: 0,
@@ -82,21 +125,22 @@ impl<M> QueryAccumulator<M> {
         self.meta.is_empty()
     }
 
-    /// Approximate heap bytes used by buffered COO entries and counts.
+    /// Approximate heap bytes used by buffered COO entries, counts, and
+    /// per-read metadata (see `MetaHeapBytes`) — e.g. for `String` headers,
+    /// which are often the *largest* per-read term (short reads against a
+    /// wide-window index can have more header bytes than minimizer entry
+    /// bytes), not a rounding error to leave out.
     ///
-    /// Measures `len()`, not `capacity()`: `drain()` does not retain the
-    /// buffers' allocated capacity (see its doc comment), so a capacity-based
-    /// estimate would keep reporting the full pre-drain size against an
-    /// empty accumulator and make `should_flush()` permanently true after
-    /// the first flush.
-    ///
-    /// Does not include `meta`'s own heap allocations (e.g. `String` header
-    /// bytes) — callers that need that precision should add it themselves, as
-    /// `DeferredDenomBuffer::approx_bytes` does for its `header` field.
+    /// Measures `entries`/`fwd_counts`/`rc_counts` by `len()`, not
+    /// `capacity()`: `drain()` does not retain the buffers' allocated
+    /// capacity (see its doc comment), so a capacity-based estimate would
+    /// keep reporting the full pre-drain size against an empty accumulator
+    /// and make `should_flush()` permanently true after the first flush.
     pub fn approx_bytes(&self) -> usize {
         self.entries.len() * std::mem::size_of::<(u64, u32)>()
             + self.fwd_counts.len() * std::mem::size_of::<u32>()
             + self.rc_counts.len() * std::mem::size_of::<u32>()
+            + self.meta_heap_bytes
     }
 
     /// `approx_bytes()` plus the projected cost of the classification-pass
@@ -137,6 +181,7 @@ impl<M> QueryAccumulator<M> {
 
         self.fwd_counts.push(fwd_count);
         self.rc_counts.push(rc_count);
+        self.meta_heap_bytes += meta.heap_bytes();
         self.meta.push(meta);
     }
 
@@ -192,6 +237,7 @@ impl<M> QueryAccumulator<M> {
         let fwd_counts = std::mem::take(&mut self.fwd_counts);
         let rc_counts = std::mem::take(&mut self.rc_counts);
         let meta = std::mem::take(&mut self.meta);
+        self.meta_heap_bytes = 0;
 
         entries.par_sort_unstable_by_key(|&(m, _)| m);
 
@@ -351,6 +397,34 @@ mod tests {
         let mut acc = QueryAccumulator::with_budget(usize::MAX);
         acc.push("r0", vec![100, 200], vec![300]);
         assert_eq!(acc.projected_pass_bytes(), acc.approx_bytes());
+    }
+
+    /// Regression: `String` header heap bytes must count toward
+    /// `approx_bytes()`, not be silently excluded. For short reads against
+    /// a wide-window index, header bytes can exceed entry bytes — a budget
+    /// that ignores them lets `should_flush()` admit a pass well past
+    /// `--max-memory` in exactly that regime.
+    #[test]
+    fn test_string_header_heap_bytes_counted_in_approx_bytes() {
+        let mut acc: QueryAccumulator<String> = QueryAccumulator::with_budget(usize::MAX);
+        // Two minimizers => 2 * 16 = 32 bytes of entries; a header far
+        // larger than that should dominate approx_bytes() if counted.
+        let long_header = "x".repeat(1000);
+        acc.push(long_header.clone(), vec![1, 2], vec![]);
+
+        assert!(
+            acc.approx_bytes() >= long_header.capacity(),
+            "approx_bytes() ({}) should be at least the header's heap size ({})",
+            acc.approx_bytes(),
+            long_header.capacity()
+        );
+
+        acc.drain();
+        assert_eq!(
+            acc.approx_bytes(),
+            0,
+            "meta_heap_bytes must reset to 0 on drain, same as entries/counts"
+        );
     }
 
     #[test]

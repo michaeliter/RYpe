@@ -378,9 +378,17 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
                         break;
                     }
                 } else {
-                    // Zero-copy Parquet path. No stacking: the accumulator now
-                    // absorbs many input batches per classification pass, so
-                    // there's no need to stack batches up to a target size here.
+                    // Zero-copy Parquet path — for sequences: batch_refs below
+                    // borrows &[u8] slices directly out of the Arrow RecordBatch,
+                    // no sequence data is copied. Headers are the exception: they
+                    // must outlive this input batch (the accumulator holds them
+                    // across many batches until drain(), see QueryAccumulator's
+                    // doc), so they're copied to owned Strings just below — that
+                    // copy is real and its heap cost is counted in the
+                    // accumulator's budget via MetaHeapBytes, not free. No
+                    // stacking: the accumulator now absorbs many input batches
+                    // per classification pass, so there's no need to stack
+                    // batches up to a target size here.
                     let batch_opt = reader.next_batch()?;
                     log_timing("batch: io_read", t_io_read.elapsed().as_millis());
 
@@ -398,6 +406,9 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
                     let (batch_refs, headers) = stacked_batches_to_records(&stacked)?;
                     log_timing("batch: convert_refs", t_convert.elapsed().as_millis());
 
+                    // headers must become owned here: they're borrowed from
+                    // `stacked`, which is dropped at the end of this loop
+                    // iteration, but the accumulator holds them until drain().
                     let headers: Vec<String> = headers.into_iter().map(String::from).collect();
                     process_batch(
                         &batch_refs,
