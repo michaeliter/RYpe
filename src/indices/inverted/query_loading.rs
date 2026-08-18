@@ -589,6 +589,22 @@ fn load_filtered_coo_pairs(
         .sum();
     let mut all_pairs: Vec<(u64, u32)> = Vec::with_capacity(total_len);
 
+    // Each chunk's own pairs are already sorted internally (built by a
+    // single sorted two-pointer pass per chunk, above); the only place
+    // concatenation could introduce a break is at a chunk boundary. Checking
+    // just those boundaries is O(num_chunks), not O(total_len), so it's
+    // cheap enough to run unconditionally in release builds — unlike the
+    // full `all_pairs.windows(2)` scan this replaces, which is exactly the
+    // per-entry cost the batching in this function exists to avoid.
+    //
+    // This guards a real invariant, not a hypothetical one: it holds for
+    // every shard this repo's writers produce (`ShardAccumulator::flush_shard`
+    // sorts before writing, `stream_to_parquet_shards` k-way-merges), but an
+    // externally produced or future `.ryxdi` that violates it would
+    // otherwise corrupt every downstream binary_search/partition_point/
+    // gallop_for_each silently, with no error and no way to detect it from
+    // the output — so violations are a hard error, not a debug-only assert.
+    let mut prev_chunk_last_min: Option<u64> = None;
     for (chunk_idx, result) in chunk_results.into_iter().enumerate() {
         let pairs = result.map_err(|e| {
             let first_rg = chunks[chunk_idx].first().map(|&(idx, _, _)| idx);
@@ -605,6 +621,26 @@ fn load_filtered_coo_pairs(
                 ),
             )
         })?;
+
+        if let Some((first_min, _)) = pairs.first().copied() {
+            if let Some(prev_last) = prev_chunk_last_min {
+                if prev_last > first_min {
+                    let first_rg = chunks[chunk_idx].first().map(|&(idx, _, _)| idx);
+                    return Err(RypeError::format(
+                        &path,
+                        format!(
+                            "non-monotonic minimizer stream at row group chunk boundary \
+                             (starting row group {:?}): previous chunk ended at {}, this \
+                             chunk starts at {} — shard file is not globally sorted by \
+                             minimizer, which every downstream binary search assumes",
+                            first_rg, prev_last, first_min
+                        ),
+                    ));
+                }
+            }
+            prev_chunk_last_min = pairs.last().map(|&(m, _)| m);
+        }
+
         all_pairs.extend(pairs);
     }
     log_timing(
@@ -618,12 +654,8 @@ fn load_filtered_coo_pairs(
     // non-overlapping contiguous slices of one globally sorted stream (the writer
     // emits one continuous sorted (minimizer, bucket_id) stream chunked into row
     // groups — has_overlapping_shards refers to overlap ACROSS shard files, not
-    // within one). So the concatenation above is already fully sorted; no re-sort
-    // needed.
-    debug_assert!(
-        all_pairs.windows(2).all(|w| w[0].0 <= w[1].0),
-        "load_filtered_coo_pairs: concatenated pairs should already be sorted by minimizer"
-    );
+    // within one). So the concatenation above is already fully sorted — verified,
+    // not just asserted, at each chunk boundary in the loop above.
 
     Ok(all_pairs)
 }
@@ -1085,6 +1117,75 @@ mod tests {
         assert!(
             err_msg.contains("sorted"),
             "Error message should mention sorting: {}",
+            err_msg
+        );
+
+        Ok(())
+    }
+
+    /// Regression: `load_filtered_coo_pairs` must reject a shard file whose
+    /// row groups are individually sorted but not globally sorted as a
+    /// whole (a non-monotonic concatenation), rather than silently
+    /// returning wrong data.
+    ///
+    /// The concatenation step assumes row groups form one continuous sorted
+    /// stream (true for every shard this repo's writers produce), and used
+    /// to guard that with `all_pairs.windows(2).all(...)` — a no-op in
+    /// release builds. This writes a shard file directly (bypassing the
+    /// normal sorted writer) with two row groups that are each internally
+    /// sorted but decreasing relative to each other, which is exactly the
+    /// class of corruption the guard exists to catch, and asserts it
+    /// surfaces as an error rather than silently wrong results.
+    #[test]
+    fn test_load_filtered_coo_pairs_rejects_non_monotonic_row_groups() -> Result<()> {
+        use arrow::array::{ArrayRef, UInt32Array, UInt64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        use std::sync::Arc;
+
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("adversarial.parquet");
+
+        // Row group 0: minimizers 100_000..100_010 (internally sorted).
+        // Row group 1: minimizers 0..10 (internally sorted).
+        // Concatenated (RG0 then RG1, ascending rg_idx order): decreasing at
+        // the boundary — exactly the violation this test targets.
+        let rg0_mins: Vec<u64> = (100_000u64..100_010).collect();
+        let rg1_mins: Vec<u64> = (0u64..10).collect();
+        let all_mins: Vec<u64> = rg0_mins.iter().chain(rg1_mins.iter()).copied().collect();
+        let all_bucket_ids: Vec<u32> = vec![1u32; all_mins.len()];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("minimizer", DataType::UInt64, false),
+            Field::new("bucket_id", DataType::UInt32, false),
+        ]));
+        // One row group per 10 rows, so the two halves land in separate row
+        // groups without needing multiple write_batch calls.
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(10))
+            .build();
+        let file = std::fs::File::create(&path)?;
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
+        let min_array: ArrayRef = Arc::new(UInt64Array::from(all_mins));
+        let bid_array: ArrayRef = Arc::new(UInt32Array::from(all_bucket_ids));
+        let batch = RecordBatch::try_new(schema, vec![min_array, bid_array])?;
+        writer.write(&batch)?;
+        writer.close()?;
+
+        // Query spans both row groups so both get selected for reading.
+        let query_minimizers = vec![5u64, 100_005u64];
+        let result = load_filtered_coo_pairs(&path, 64, &query_minimizers, None);
+
+        assert!(
+            result.is_err(),
+            "non-monotonic row-group concatenation must be rejected, not silently accepted"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("non-monotonic") || err_msg.contains("sorted"),
+            "error should describe the sortedness violation: {}",
             err_msg
         );
 
