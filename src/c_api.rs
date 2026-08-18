@@ -2122,33 +2122,180 @@ mod arrow_ffi {
     // memory limit, and note the output RecordBatch is also one per pass, sized
     // group_rows x buckets above threshold. See rype.h on rype_classify_arrow_ex
     // for the caller-facing version of this.
+    //
+    // Two call shapes share the same input-pull loop below via the GroupSink
+    // trait: log-ratio (classify_log_ratio_from_extracted) needs each read's
+    // own minimizer vectors for its per-read fast-path skip, so it accumulates
+    // full `extracted` (ExtractedSink); the plain classify path only ever
+    // needs a merged flat index, so it pushes straight into a QueryAccumulator
+    // (QueryIndexSink), never materializing `extracted` at all. Both sinks used
+    // to be two near-identical ~180-line copies of this reader (struct, `new`,
+    // the pull loop, `Iterator`, `unsafe impl Send`, `RecordBatchReader`,
+    // `create_*_output`) differing only in the sink — and had already diverged
+    // on MAX_READS check placement (see GroupSink::push_batch's doc).
 
     /// Type alias for an accumulated group's extracted minimizers: one
     /// (forward, reverse-complement) pair per read, in input order.
     type ExtractedMinimizers = Vec<(Vec<u64>, Vec<u64>)>;
 
-    /// Reads input batches, extracts minimizers, and classifies once per group.
-    struct AccumulatingClassifier<F> {
+    /// Per-batch accumulation sink for `GenericAccumulatingClassifier`'s
+    /// shared input-pull loop. Implemented once per call shape (`ExtractedSink`
+    /// for log-ratio, `QueryIndexSink` for plain classify) so both share one
+    /// implementation of the catch_unwind / MAX_READS / drop(batch)-release
+    /// protocol instead of duplicating it.
+    trait GroupSink: Default {
+        /// What `classify_fn` consumes once a group is complete.
+        type Output;
+
+        /// Reads accumulated so far — drives the flush/break condition
+        /// (`classify_rows`) the same way for every sink.
+        fn len(&self) -> usize;
+
+        /// Extract `records`' minimizers and accumulate them.
+        ///
+        /// Checks the MAX_READS limit *before* accumulating, not after: one
+        /// of the two duplicated readers this generalizes checked before
+        /// (`QueryAccumulator::push` asserts on the limit rather than
+        /// silently overflowing, so an oversized single batch had to be
+        /// caught before `extend_extracted` ran), the other checked after
+        /// (safe, since `Vec::extend` doesn't panic, but wastes an
+        /// extraction pass on the input that's about to be rejected).
+        /// Checking before uniformly is strictly better: same safety, no
+        /// wasted work on the reject path.
+        fn push_batch(
+            &mut self,
+            k: usize,
+            w: usize,
+            salt: u64,
+            records: &[crate::QueryRecord],
+        ) -> Result<(), String>;
+
+        /// Consume the sink into `classify_fn`'s input.
+        fn finish(self) -> Self::Output;
+    }
+
+    /// `GroupSink` for log-ratio: accumulates full `extracted` (8 B/minimizer)
+    /// alongside query ids, since `classify_log_ratio_from_extracted`'s
+    /// per-read fast-path skip needs each read's own minimizer vectors, not a
+    /// pre-merged flat index.
+    #[derive(Default)]
+    struct ExtractedSink {
+        extracted: ExtractedMinimizers,
+        query_ids: Vec<i64>,
+    }
+
+    impl GroupSink for ExtractedSink {
+        type Output = (ExtractedMinimizers, Vec<i64>);
+
+        fn len(&self) -> usize {
+            self.query_ids.len()
+        }
+
+        fn push_batch(
+            &mut self,
+            k: usize,
+            w: usize,
+            salt: u64,
+            records: &[crate::QueryRecord],
+        ) -> Result<(), String> {
+            if self.query_ids.len().saturating_add(records.len()) > crate::constants::MAX_READS {
+                return Err(format!(
+                    "input batch of {} reads would push the group to {} reads, exceeding the \
+                     {}-read limit of the query index",
+                    records.len(),
+                    self.query_ids.len() + records.len(),
+                    crate::constants::MAX_READS
+                ));
+            }
+            self.query_ids.extend(records.iter().map(|(id, _, _)| *id));
+            self.extracted
+                .extend(crate::extract_batch_minimizers(k, w, salt, None, records));
+            Ok(())
+        }
+
+        fn finish(self) -> Self::Output {
+            (self.extracted, self.query_ids)
+        }
+    }
+
+    /// `GroupSink` for the plain (non-log-ratio) classify path: pushes each
+    /// batch's extracted minimizers straight into a `QueryAccumulator`, so
+    /// only the flat COO representation is ever resident — `extracted` and
+    /// the built `QueryInvertedIndex` are never both alive together, unlike
+    /// `ExtractedSink`.
+    struct QueryIndexSink {
+        acc: crate::QueryAccumulator<i64>,
+    }
+
+    impl Default for QueryIndexSink {
+        fn default() -> Self {
+            Self {
+                acc: crate::QueryAccumulator::with_budget(usize::MAX),
+            }
+        }
+    }
+
+    impl GroupSink for QueryIndexSink {
+        type Output = (crate::QueryInvertedIndex, Vec<i64>);
+
+        fn len(&self) -> usize {
+            self.acc.len()
+        }
+
+        fn push_batch(
+            &mut self,
+            k: usize,
+            w: usize,
+            salt: u64,
+            records: &[crate::QueryRecord],
+        ) -> Result<(), String> {
+            if self.acc.len().saturating_add(records.len()) > crate::constants::MAX_READS {
+                return Err(format!(
+                    "input batch of {} reads would push the group to {} reads, exceeding the \
+                     {}-read limit of the query index",
+                    records.len(),
+                    self.acc.len() + records.len(),
+                    crate::constants::MAX_READS
+                ));
+            }
+            let ids: Vec<i64> = records.iter().map(|(id, _, _)| *id).collect();
+            let extracted = crate::extract_batch_minimizers(k, w, salt, None, records);
+            self.acc.extend_extracted(ids, extracted);
+            Ok(())
+        }
+
+        fn finish(mut self) -> Self::Output {
+            self.acc.drain()
+        }
+    }
+
+    /// Reads input batches, accumulates them into a `GroupSink`, and
+    /// classifies once per group. Generic over the sink so log-ratio
+    /// (`ExtractedSink`) and plain classify (`QueryIndexSink`) share one
+    /// implementation of the input-pull loop — see the module doc above.
+    struct GenericAccumulatingClassifier<S, F> {
         input_reader: ArrowArrayStreamReader,
         output_schema: SchemaRef,
-        /// Classifies one accumulated group. Takes ownership of the minimizers
-        /// so it can filter them in place (negative sets) and free them before
-        /// building the output batch.
+        /// Classifies one accumulated group. Takes `S::Output` by value so it
+        /// can filter/consume it in place (e.g. negative-set filtering) and
+        /// free it before building the output batch.
         classify_fn: F,
         /// Minimizer parameters, taken from the index manifest at setup.
         k: usize,
         w: usize,
         salt: u64,
-        /// Reads to accumulate before classifying. 0 classifies each input batch
-        /// on its own, which is the one-batch-in/one-batch-out behavior the
-        /// non-`_ex` entry points have always had.
+        /// Reads to accumulate before classifying. 0 classifies each input
+        /// batch on its own, which is the one-batch-in/one-batch-out
+        /// behavior the non-`_ex` entry points have always had.
         classify_rows: usize,
         input_done: bool,
+        _sink: std::marker::PhantomData<S>,
     }
 
-    impl<F> AccumulatingClassifier<F>
+    impl<S, F> GenericAccumulatingClassifier<S, F>
     where
-        F: Fn(ExtractedMinimizers, Vec<i64>) -> Result<RecordBatch, arrow::error::ArrowError>,
+        S: GroupSink,
+        F: Fn(S::Output) -> Result<RecordBatch, arrow::error::ArrowError>,
     {
         #[allow(clippy::too_many_arguments)]
         fn new(
@@ -2169,13 +2316,13 @@ mod arrow_ffi {
                 salt,
                 classify_rows,
                 input_done: false,
+                _sink: std::marker::PhantomData,
             }
         }
 
         /// Accumulate input batches until the group is full, then classify once.
         fn next_group(&mut self) -> Option<Result<RecordBatch, arrow::error::ArrowError>> {
-            let mut extracted: ExtractedMinimizers = Vec::new();
-            let mut query_ids: Vec<i64> = Vec::new();
+            let mut sink = S::default();
             let mut consumed_any = false;
 
             loop {
@@ -2194,7 +2341,7 @@ mod arrow_ffi {
 
                 // Inner scope: `records` borrows `batch`, so both must go out of
                 // scope before the next pull. This is the release point for the
-                // sequence bytes — everything kept past it is minimizers.
+                // sequence bytes — everything kept past it lives in `sink`.
                 {
                     let records = match crate::arrow::batch_to_records(&batch) {
                         Ok(records) => records,
@@ -2204,20 +2351,21 @@ mod arrow_ffi {
                         }
                     };
                     if !records.is_empty() {
-                        query_ids.extend(records.iter().map(|(id, _, _)| *id));
-                        extracted.extend(crate::extract_batch_minimizers(
-                            self.k, self.w, self.salt, None, &records,
-                        ));
+                        if let Err(msg) = sink.push_batch(self.k, self.w, self.salt, &records) {
+                            self.input_done = true;
+                            return Some(Err(arrow::error::ArrowError::ComputeError(msg)));
+                        }
                     }
                 }
                 drop(batch);
 
                 // The MAX_READS term is a backstop, not the caller's setting:
                 // `classify_rows` is validated at the entry point, but a group
-                // can also reach the limit through one oversized input batch.
+                // can also reach the limit through one oversized input batch
+                // (caught by push_batch's pre-check above before it can happen).
                 if self.classify_rows == 0
-                    || query_ids.len() >= self.classify_rows
-                    || query_ids.len() >= crate::constants::MAX_READS
+                    || sink.len() >= self.classify_rows
+                    || sink.len() >= crate::constants::MAX_READS
                 {
                     break;
                 }
@@ -2226,23 +2374,14 @@ mod arrow_ffi {
             if !consumed_any {
                 return None;
             }
-            if query_ids.len() > crate::constants::MAX_READS {
-                // Only reachable from a single input batch larger than the limit,
-                // since the loop above stops accumulating at it.
-                self.input_done = true;
-                return Some(Err(arrow::error::ArrowError::ComputeError(format!(
-                    "input batch of {} reads exceeds the {}-read limit of the query index",
-                    query_ids.len(),
-                    crate::constants::MAX_READS
-                ))));
-            }
-            Some((self.classify_fn)(extracted, query_ids))
+            Some((self.classify_fn)(sink.finish()))
         }
     }
 
-    impl<F> Iterator for AccumulatingClassifier<F>
+    impl<S, F> Iterator for GenericAccumulatingClassifier<S, F>
     where
-        F: Fn(ExtractedMinimizers, Vec<i64>) -> Result<RecordBatch, arrow::error::ArrowError>,
+        S: GroupSink,
+        F: Fn(S::Output) -> Result<RecordBatch, arrow::error::ArrowError>,
     {
         type Item = Result<RecordBatch, arrow::error::ArrowError>;
 
@@ -2269,20 +2408,22 @@ mod arrow_ffi {
 
     // SAFETY: identical reasoning to StreamingClassifier above —
     // ArrowArrayStreamReader is Send, SchemaRef is Send+Sync, and F is bounded
-    // Send. The accumulated Vecs are plain owned data.
-    unsafe impl<F: Send> Send for AccumulatingClassifier<F> {}
+    // Send. The accumulated sink is plain owned data.
+    unsafe impl<S: Send, F: Send> Send for GenericAccumulatingClassifier<S, F> {}
 
-    impl<F> RecordBatchReader for AccumulatingClassifier<F>
+    impl<S, F> RecordBatchReader for GenericAccumulatingClassifier<S, F>
     where
-        F: Fn(ExtractedMinimizers, Vec<i64>) -> Result<RecordBatch, arrow::error::ArrowError>
-            + Send,
+        S: GroupSink,
+        F: Fn(S::Output) -> Result<RecordBatch, arrow::error::ArrowError> + Send,
     {
         fn schema(&self) -> SchemaRef {
             self.output_schema.clone()
         }
     }
 
-    /// Creates a streaming FFI output stream backed by an [`AccumulatingClassifier`].
+    /// Creates a streaming FFI output stream backed by a
+    /// [`GenericAccumulatingClassifier`] over `ExtractedSink` (log-ratio's
+    /// call shape).
     #[allow(clippy::too_many_arguments)]
     unsafe fn create_accumulating_output<F>(
         input_stream: *mut FFI_ArrowArrayStream,
@@ -2295,81 +2436,15 @@ mod arrow_ffi {
         classify_rows: usize,
     ) -> Result<(), String>
     where
-        F: Fn(ExtractedMinimizers, Vec<i64>) -> Result<RecordBatch, arrow::error::ArrowError>
+        F: Fn(<ExtractedSink as GroupSink>::Output) -> Result<RecordBatch, arrow::error::ArrowError>
             + Send
             + 'static,
     {
         let input_reader = ArrowArrayStreamReader::from_raw(input_stream)
             .map_err(|e| format!("Failed to create stream reader: {}", e))?;
 
-        let accumulating = AccumulatingClassifier::new(
-            input_reader,
-            output_schema,
-            classify_fn,
-            k,
-            w,
-            salt,
-            classify_rows,
-        );
-
-        let export_stream = FFI_ArrowArrayStream::new(Box::new(accumulating));
-        std::ptr::write(out_stream, export_stream);
-
-        Ok(())
-    }
-
-    // -------------------------------------------------------------------------
-    // Accumulating Classification Reader — pre-built QueryInvertedIndex variant
-    // -------------------------------------------------------------------------
-    //
-    // Counterpart to AccumulatingClassifier above, for the plain (non-log-ratio)
-    // classify entry points only. AccumulatingClassifier accumulates full
-    // `extracted` (8 B/minimizer) and only builds the QueryInvertedIndex
-    // (16 B/minimizer, padded) at classify time, so both representations are
-    // resident together at peak. This reader pushes each batch's extracted
-    // minimizers straight into a QueryAccumulator, so only the flat COO
-    // representation is ever resident.
-    //
-    // Log-ratio keeps using AccumulatingClassifier unchanged: its per-read
-    // fast-path skip logic (classify_log_ratio_from_extracted) needs each
-    // read's own minimizer vectors, not a pre-merged flat index, so there is
-    // nothing to share below the read-accumulation loop — duplicating that
-    // loop shape here is smaller and safer than forcing both call shapes
-    // through one generic accumulator.
-
-    /// Reads input batches, extracts minimizers directly into a
-    /// `QueryAccumulator`, and classifies once per group via a pre-built
-    /// `QueryInvertedIndex`.
-    struct QueryIndexAccumulatingClassifier<F> {
-        input_reader: ArrowArrayStreamReader,
-        output_schema: SchemaRef,
-        /// Classifies one accumulated group's pre-built query index.
-        classify_fn: F,
-        /// Minimizer parameters, taken from the index manifest at setup.
-        k: usize,
-        w: usize,
-        salt: u64,
-        /// Reads to accumulate before classifying. 0 classifies each input
-        /// batch on its own — see AccumulatingClassifier::classify_rows.
-        classify_rows: usize,
-        input_done: bool,
-    }
-
-    impl<F> QueryIndexAccumulatingClassifier<F>
-    where
-        F: Fn(crate::QueryInvertedIndex, Vec<i64>) -> Result<RecordBatch, arrow::error::ArrowError>,
-    {
-        #[allow(clippy::too_many_arguments)]
-        fn new(
-            input_reader: ArrowArrayStreamReader,
-            output_schema: SchemaRef,
-            classify_fn: F,
-            k: usize,
-            w: usize,
-            salt: u64,
-            classify_rows: usize,
-        ) -> Self {
-            Self {
+        let accumulating: GenericAccumulatingClassifier<ExtractedSink, F> =
+            GenericAccumulatingClassifier::new(
                 input_reader,
                 output_schema,
                 classify_fn,
@@ -2377,121 +2452,17 @@ mod arrow_ffi {
                 w,
                 salt,
                 classify_rows,
-                input_done: false,
-            }
-        }
+            );
 
-        /// Accumulate input batches until the group is full, then classify once.
-        fn next_group(&mut self) -> Option<Result<RecordBatch, arrow::error::ArrowError>> {
-            let mut acc: crate::QueryAccumulator<i64> =
-                crate::QueryAccumulator::with_budget(usize::MAX);
-            let mut consumed_any = false;
+        let export_stream = FFI_ArrowArrayStream::new(Box::new(accumulating));
+        std::ptr::write(out_stream, export_stream);
 
-            loop {
-                let batch = match self.input_reader.next() {
-                    Some(Ok(batch)) => batch,
-                    Some(Err(e)) => {
-                        self.input_done = true;
-                        return Some(Err(e));
-                    }
-                    None => {
-                        self.input_done = true;
-                        break;
-                    }
-                };
-                consumed_any = true;
-
-                // Inner scope: `records` borrows `batch`, so both must go out of
-                // scope before the next pull — same release point as
-                // AccumulatingClassifier.
-                {
-                    let records = match crate::arrow::batch_to_records(&batch) {
-                        Ok(records) => records,
-                        Err(e) => {
-                            self.input_done = true;
-                            return Some(Err(arrow::error::ArrowError::ExternalError(Box::new(e))));
-                        }
-                    };
-                    if !records.is_empty() {
-                        // Checked before accumulating, unlike AccumulatingClassifier's
-                        // post-loop check: QueryAccumulator::push asserts on this
-                        // limit rather than silently overflowing, so an oversized
-                        // single batch must be caught before extend_extracted runs.
-                        if acc.len().saturating_add(records.len()) > crate::constants::MAX_READS {
-                            self.input_done = true;
-                            return Some(Err(arrow::error::ArrowError::ComputeError(format!(
-                                "input batch of {} reads would push the group to {} reads, \
-                                 exceeding the {}-read limit of the query index",
-                                records.len(),
-                                acc.len() + records.len(),
-                                crate::constants::MAX_READS
-                            ))));
-                        }
-                        let ids: Vec<i64> = records.iter().map(|(id, _, _)| *id).collect();
-                        let extracted = crate::extract_batch_minimizers(
-                            self.k, self.w, self.salt, None, &records,
-                        );
-                        acc.extend_extracted(ids, extracted);
-                    }
-                }
-                drop(batch);
-
-                if self.classify_rows == 0
-                    || acc.len() >= self.classify_rows
-                    || acc.len() >= crate::constants::MAX_READS
-                {
-                    break;
-                }
-            }
-
-            if !consumed_any {
-                return None;
-            }
-
-            let (query_idx, query_ids) = acc.drain();
-            Some((self.classify_fn)(query_idx, query_ids))
-        }
-    }
-
-    impl<F> Iterator for QueryIndexAccumulatingClassifier<F>
-    where
-        F: Fn(crate::QueryInvertedIndex, Vec<i64>) -> Result<RecordBatch, arrow::error::ArrowError>,
-    {
-        type Item = Result<RecordBatch, arrow::error::ArrowError>;
-
-        fn next(&mut self) -> Option<Self::Item> {
-            if self.input_done {
-                return None;
-            }
-
-            // Reached through the exported stream's `get_next` function pointer —
-            // same panic-safety reasoning as AccumulatingClassifier::next.
-            let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.next_group()));
-            match step {
-                Ok(item) => item,
-                Err(payload) => {
-                    self.input_done = true;
-                    Some(Err(panic_to_arrow_error(payload)))
-                }
-            }
-        }
-    }
-
-    // SAFETY: identical reasoning to AccumulatingClassifier above.
-    unsafe impl<F: Send> Send for QueryIndexAccumulatingClassifier<F> {}
-
-    impl<F> RecordBatchReader for QueryIndexAccumulatingClassifier<F>
-    where
-        F: Fn(crate::QueryInvertedIndex, Vec<i64>) -> Result<RecordBatch, arrow::error::ArrowError>
-            + Send,
-    {
-        fn schema(&self) -> SchemaRef {
-            self.output_schema.clone()
-        }
+        Ok(())
     }
 
     /// Creates a streaming FFI output stream backed by a
-    /// [`QueryIndexAccumulatingClassifier`].
+    /// [`GenericAccumulatingClassifier`] over `QueryIndexSink` (the plain
+    /// classify call shape).
     #[allow(clippy::too_many_arguments)]
     unsafe fn create_query_index_accumulating_output<F>(
         input_stream: *mut FFI_ArrowArrayStream,
@@ -2504,28 +2475,30 @@ mod arrow_ffi {
         classify_rows: usize,
     ) -> Result<(), String>
     where
-        F: Fn(crate::QueryInvertedIndex, Vec<i64>) -> Result<RecordBatch, arrow::error::ArrowError>
+        F: Fn(<QueryIndexSink as GroupSink>::Output) -> Result<RecordBatch, arrow::error::ArrowError>
             + Send
             + 'static,
     {
         let input_reader = ArrowArrayStreamReader::from_raw(input_stream)
             .map_err(|e| format!("Failed to create stream reader: {}", e))?;
 
-        let accumulating = QueryIndexAccumulatingClassifier::new(
-            input_reader,
-            output_schema,
-            classify_fn,
-            k,
-            w,
-            salt,
-            classify_rows,
-        );
+        let accumulating: GenericAccumulatingClassifier<QueryIndexSink, F> =
+            GenericAccumulatingClassifier::new(
+                input_reader,
+                output_schema,
+                classify_fn,
+                k,
+                w,
+                salt,
+                classify_rows,
+            );
 
         let export_stream = FFI_ArrowArrayStream::new(Box::new(accumulating));
         std::ptr::write(out_stream, export_stream);
 
         Ok(())
     }
+
 
     // -------------------------------------------------------------------------
     // Internal helper: Shared Arrow classification logic
@@ -2613,7 +2586,7 @@ mod arrow_ffi {
         let manifest = unsafe { &*index_ptr }.0.manifest();
         let (k, w, salt) = (manifest.k, manifest.w, manifest.salt);
 
-        let classify_fn = move |mut query_idx: crate::QueryInvertedIndex, query_ids: Vec<i64>| {
+        let classify_fn = move |(mut query_idx, query_ids): (crate::QueryInvertedIndex, Vec<i64>)| {
             let index = unsafe { index_send.get() };
 
             // Sharded negative filtering: drop query minimizers that hit the
@@ -3314,7 +3287,7 @@ mod arrow_ffi {
         let num_send = SendRypeIndexPtr::new(numerator);
         let denom_send = SendRypeIndexPtr::new(denominator);
 
-        let classify_fn = move |extracted: ExtractedMinimizers, input_ids: Vec<i64>| {
+        let classify_fn = move |(extracted, input_ids): (ExtractedMinimizers, Vec<i64>)| {
             let num_idx = unsafe { num_send.get() };
             let denom_idx = unsafe { denom_send.get() };
 
