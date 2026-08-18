@@ -462,10 +462,19 @@ fn load_filtered_coo_pairs(
     let chunk_size = (matching_row_groups.len() + num_chunks - 1) / num_chunks;
     let chunks: Vec<&[(usize, u64, u64)]> = matching_row_groups.chunks(chunk_size).collect();
 
-    // Estimate pairs per row group for pre-allocation, scaled per chunk by
-    // how many row groups it covers. Conservative estimate: 10% selectivity.
-    // (This mirrors the existing shard_reservation memory budget in
-    // memory.rs, which uses the same 10% figure — see SHARD_SELECTIVITY_ESTIMATE.)
+    // Estimate pairs for pre-allocation: one row group's worth at a
+    // conservative 10% selectivity, *not* scaled by how many row groups a
+    // chunk covers. Real selectivity is often 1-5% (see the module-level
+    // SHARD_SELECTIVITY_ESTIMATE discussion in memory.rs), and a chunk can
+    // cover 100+ row groups at high oversubscription — scaling this
+    // estimate by chunk.len() would over-reserve by that same factor for
+    // every chunk's result Vec, and since chunk_results below buffers every
+    // chunk's completed Vec (with whatever capacity it was given) until the
+    // final concat loop runs, all of them are resident at once by the time
+    // this function returns. Reserving for one row group and letting `pairs`
+    // grow via ordinary amortized doubling for the rest of the chunk keeps
+    // the initial (and typically dominant, at low real selectivity)
+    // allocation bounded independent of chunk size.
     let estimated_pairs_per_rg = DEFAULT_ROW_GROUP_SIZE / 10;
 
     // Instrumentation: split shard_load_total into "decode" (opening the file,
@@ -501,7 +510,7 @@ fn load_filtered_coo_pairs(
                 ParquetRecordBatchReaderBuilder::new_with_metadata(file, arrow_metadata.clone());
             let mut reader = builder.with_row_groups(rg_indices).build()?;
 
-            let mut pairs = Vec::with_capacity(estimated_pairs_per_rg * chunk.len());
+            let mut pairs = Vec::with_capacity(estimated_pairs_per_rg);
 
             // Two-pointer sorted intersection: `bounded` (query minimizers, unique,
             // ascending) against this chunk's minimizer column, streamed across

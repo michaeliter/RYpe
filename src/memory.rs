@@ -1280,7 +1280,12 @@ fn binary_search_batch_size_with_io(
 ///   `DECODE_OVERHEAD_MULTIPLIER`.
 /// - **Filtered CSR**: After filtering to query minimizers, the CSR output is
 ///   typically ~10% of the shard (`SHARD_SELECTIVITY_ESTIMATE`). We use
-///   `CSR_CONCAT_MULTIPLIER` for the concat spike during assembly.
+///   `CSR_CONCAT_MULTIPLIER` for the concat spike during assembly — this
+///   also covers `load_filtered_coo_pairs`'s per-chunk result buffers
+///   (`query_loading.rs`), which are bounded to roughly one row group's
+///   initial capacity each (growing from there via ordinary amortized
+///   reallocation) specifically so their sum stays in this term's ballpark
+///   rather than scaling with how many row groups a chunk happens to cover.
 ///
 /// Returns 0 if `largest_shard_entries` is 0 (no shards).
 ///
