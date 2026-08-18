@@ -6209,3 +6209,158 @@ files = [{}]
 
     Ok(())
 }
+
+/// Regression: a run that needs N>1 classification passes must actually
+/// perform N index scans, not collapse to one scan per input batch.
+///
+/// This is the failure mode of the `QueryAccumulator` flush-degeneration
+/// bug: `approx_bytes()`/`projected_pass_bytes()` measured buffer
+/// *capacity*, and `drain()` re-reserved that same capacity, so
+/// `should_flush()` came back true against an empty, just-drained
+/// accumulator. Every pass after the first then collapsed to exactly one
+/// input batch's worth of reads — silently reintroducing the
+/// one-scan-per-input-batch behavior issue #21 exists to eliminate, for
+/// every multi-pass, byte-budget-driven run.
+///
+/// This is deliberately a *library*-level test, not a CLI subprocess test:
+/// the CLI's `--batch-size` sets `classify_byte_budget` to `usize::MAX` and
+/// drives flushing purely off `max_reads` (see `batch_config.rs`), which
+/// never touches `approx_bytes()` and so cannot exercise this bug at all —
+/// an earlier version of this test used `--batch-size` and passed
+/// unconditionally regardless of the bug's presence, which is worse than no
+/// test. Driving `QueryAccumulator` directly with an explicit small
+/// `byte_budget` reproduces the reviewer's actual failure scenario (a small
+/// `--max-memory` forcing multiple passes) with an exact, deterministic
+/// expected pass count, instead of depending on the CLI's memory-auto-sizing
+/// model.
+#[test]
+fn test_multi_pass_byte_budget_run_yields_expected_pass_count() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let index_path = dir.path().join("test.ryxdi");
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let sharded = rype::ShardedInvertedIndex::open(&index_path)?;
+    let manifest = sharded.manifest();
+    let (k, w, salt) = (manifest.k, manifest.w, manifest.salt);
+
+    // Six identical 5-read batches, simulating six input batches arriving
+    // over the course of a run. Content is irrelevant beyond being long
+    // enough (> k) to produce minimizers; identical sequences make every
+    // batch's accumulated byte size identical.
+    //
+    // The budget is sized to exactly *three* batches, so the correct
+    // behavior is two passes of 15 reads each (flush after batch 3, flush
+    // after batch 6). The bug this guards against manifests only once a
+    // drain() has happened with a nonzero *prior* capacity larger than a
+    // single batch needs: after pass 1's drain (which reserved ~3 batches'
+    // capacity), pushing just one more batch already satisfies a
+    // capacity-based approx_bytes() without needing to grow — so on buggy
+    // code, batch 4 alone immediately re-triggers should_flush(), and each
+    // of batches 4/5/6 becomes its own degenerate 5-read pass (pass_count=4
+    // instead of 2). A budget sized to exactly one batch (as an earlier,
+    // wrong version of this test used) can't expose this, because equal-size
+    // batches never need the capacity to shrink between passes.
+    const READS_PER_BATCH: usize = 5;
+    const BATCHES_PER_PASS: usize = 3;
+    const NUM_BATCHES: usize = 6;
+    const EXPECTED_PASSES: usize = NUM_BATCHES / BATCHES_PER_PASS;
+    let seq: Vec<u8> = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT"
+        .to_vec();
+    let make_batch = |start_id: i64| -> Vec<rype::QueryRecord<'static>> {
+        // Leak so the &[u8] borrows are 'static — fine for a short-lived test.
+        (0..READS_PER_BATCH)
+            .map(|i| {
+                let leaked: &'static [u8] = Box::leak(seq.clone().into_boxed_slice());
+                (start_id + i as i64, leaked, None)
+            })
+            .collect()
+    };
+
+    // Measure three batches' accumulated byte size in isolation, then set
+    // the real accumulator's budget to exactly that.
+    let mut probe_acc: rype::QueryAccumulator<i64> = rype::QueryAccumulator::with_budget(usize::MAX);
+    for batch_idx in 0..BATCHES_PER_PASS {
+        let start_id = (batch_idx * READS_PER_BATCH) as i64;
+        let batch = make_batch(start_id);
+        let ids: Vec<i64> = (start_id..start_id + READS_PER_BATCH as i64).collect();
+        let extracted = rype::extract_batch_minimizers(k, w, salt, None, &batch);
+        probe_acc.extend_extracted(ids, extracted);
+    }
+    let three_batch_bytes = probe_acc.approx_bytes();
+    assert!(three_batch_bytes > 0, "test setup: batches should produce nonzero entries");
+
+    let mut acc: rype::QueryAccumulator<i64> = rype::QueryAccumulator::with_budget(three_batch_bytes);
+    let mut pass_count = 0usize;
+    let mut total_reads_classified = 0usize;
+
+    for batch_idx in 0..NUM_BATCHES {
+        let start_id = (batch_idx * READS_PER_BATCH) as i64;
+        let batch = make_batch(start_id);
+        let ids: Vec<i64> = (start_id..start_id + READS_PER_BATCH as i64).collect();
+        let extracted = rype::extract_batch_minimizers(k, w, salt, None, &batch);
+        acc.extend_extracted(ids, extracted);
+
+        if acc.should_flush() {
+            pass_count += 1;
+            let (query_idx, drained_ids) = acc.drain();
+            total_reads_classified += drained_ids.len();
+            // Exercise the real shard-scan path, not just bookkeeping.
+            let _ = rype::classify_from_query_index(&sharded, &query_idx, &drained_ids, 0.0, None)?;
+        }
+    }
+    if !acc.is_empty() {
+        pass_count += 1;
+        let (query_idx, drained_ids) = acc.drain();
+        total_reads_classified += drained_ids.len();
+        let _ = rype::classify_from_query_index(&sharded, &query_idx, &drained_ids, 0.0, None)?;
+    }
+
+    assert_eq!(
+        total_reads_classified,
+        NUM_BATCHES * READS_PER_BATCH,
+        "every pushed read must be classified exactly once"
+    );
+    assert_eq!(
+        pass_count, EXPECTED_PASSES,
+        "expected exactly {} passes (one per {}-batch, {}-read group, budget sized to \
+         {} batches), got {}. A higher pass count means should_flush() is triggering on \
+         stale post-drain capacity rather than newly accumulated data (the \
+         flush-degeneration bug), collapsing later passes to far fewer reads each than \
+         the budget allows — i.e. one shard scan per input batch again, issue #21.",
+        EXPECTED_PASSES,
+        BATCHES_PER_PASS,
+        BATCHES_PER_PASS * READS_PER_BATCH,
+        BATCHES_PER_PASS,
+        pass_count
+    );
+
+    Ok(())
+}

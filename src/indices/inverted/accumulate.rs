@@ -84,13 +84,19 @@ impl<M> QueryAccumulator<M> {
 
     /// Approximate heap bytes used by buffered COO entries and counts.
     ///
+    /// Measures `len()`, not `capacity()`: `drain()` does not retain the
+    /// buffers' allocated capacity (see its doc comment), so a capacity-based
+    /// estimate would keep reporting the full pre-drain size against an
+    /// empty accumulator and make `should_flush()` permanently true after
+    /// the first flush.
+    ///
     /// Does not include `meta`'s own heap allocations (e.g. `String` header
     /// bytes) — callers that need that precision should add it themselves, as
     /// `DeferredDenomBuffer::approx_bytes` does for its `header` field.
     pub fn approx_bytes(&self) -> usize {
-        self.entries.capacity() * std::mem::size_of::<(u64, u32)>()
-            + self.fwd_counts.capacity() * std::mem::size_of::<u32>()
-            + self.rc_counts.capacity() * std::mem::size_of::<u32>()
+        self.entries.len() * std::mem::size_of::<(u64, u32)>()
+            + self.fwd_counts.len() * std::mem::size_of::<u32>()
+            + self.rc_counts.len() * std::mem::size_of::<u32>()
     }
 
     /// `approx_bytes()` plus the projected cost of the classification-pass
@@ -168,8 +174,13 @@ impl<M> QueryAccumulator<M> {
     }
 
     /// Drain all buffered data into a sorted `QueryInvertedIndex` and its
-    /// per-read metadata, in push order. Preserves allocated capacity for the
-    /// next fill cycle.
+    /// per-read metadata, in push order.
+    ///
+    /// Does *not* preserve allocated capacity for the next fill cycle: the
+    /// drained `entries` are moved into the returned `QueryInvertedIndex`,
+    /// which stays alive for the whole classification pass, so re-reserving
+    /// the same capacity here would leave two full-size buffers resident at
+    /// once. The next fill cycle re-grows from empty instead.
     ///
     /// Sorts in parallel via rayon — at accumulator scale (hundreds of millions
     /// of entries) a single-threaded sort is a real cost, unlike
@@ -177,15 +188,10 @@ impl<M> QueryAccumulator<M> {
     pub fn drain(&mut self) -> (QueryInvertedIndex, Vec<M>) {
         use rayon::slice::ParallelSliceMut;
 
-        let entry_cap = self.entries.capacity();
-        let fwd_cap = self.fwd_counts.capacity();
-        let rc_cap = self.rc_counts.capacity();
-        let meta_cap = self.meta.capacity();
-
-        let mut entries = std::mem::replace(&mut self.entries, Vec::with_capacity(entry_cap));
-        let fwd_counts = std::mem::replace(&mut self.fwd_counts, Vec::with_capacity(fwd_cap));
-        let rc_counts = std::mem::replace(&mut self.rc_counts, Vec::with_capacity(rc_cap));
-        let meta = std::mem::replace(&mut self.meta, Vec::with_capacity(meta_cap));
+        let mut entries = std::mem::take(&mut self.entries);
+        let fwd_counts = std::mem::take(&mut self.fwd_counts);
+        let rc_counts = std::mem::take(&mut self.rc_counts);
+        let meta = std::mem::take(&mut self.meta);
 
         entries.par_sort_unstable_by_key(|&(m, _)| m);
 
@@ -256,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn test_drain_preserves_capacity_and_resets() {
+    fn test_drain_resets_and_is_reusable() {
         let mut acc = QueryAccumulator::with_budget(usize::MAX);
         acc.push("r0", vec![100, 200], vec![300]);
         acc.push("r1", vec![400], vec![500, 600]);
@@ -274,6 +280,37 @@ mod tests {
         let (idx2, metas2) = acc.drain();
         assert_eq!(idx2.num_reads(), 1);
         assert_eq!(metas2, vec!["r2"]);
+    }
+
+    /// Regression for the flush-degeneration bug: `approx_bytes()` must
+    /// reflect the accumulator's actual (post-drain: empty) contents, not
+    /// the capacity it happened to hold right before the drain. Before the
+    /// fix, `drain()` re-reserved each buffer's pre-drain capacity and
+    /// `approx_bytes()` measured `capacity()`, so `should_flush()` came back
+    /// true immediately after a drain with zero reads buffered — every pass
+    /// after the first would collapse to exactly one input batch, silently
+    /// reintroducing the one-scan-per-batch behavior this type exists to
+    /// eliminate (issue #21).
+    #[test]
+    fn test_should_flush_false_immediately_after_drain() {
+        // Budget sized so a handful of pushes trips it, matching how a real
+        // caller's byte_budget relates to per-batch push volume.
+        let mut acc = QueryAccumulator::with_budget(200);
+        for i in 0..20 {
+            acc.push(format!("r{i}"), vec![i as u64, i as u64 + 1], vec![]);
+            if acc.should_flush() {
+                break;
+            }
+        }
+        assert!(acc.should_flush(), "test setup: should have tripped the budget");
+
+        acc.drain();
+
+        assert_eq!(acc.approx_bytes(), 0, "drained accumulator must report zero bytes");
+        assert!(
+            !acc.should_flush(),
+            "should_flush() must be false immediately after drain with nothing re-pushed"
+        );
     }
 
     #[test]
