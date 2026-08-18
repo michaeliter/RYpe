@@ -467,22 +467,26 @@ num_entries = 3
     // =========================================================================
     // Regression tests for batch sizing with real sharded indices.
     //
-    // These tests use the perf-assessment data (real 8-shard index with 160
-    // buckets, ~485M total entries; real long-read Parquet queries).
+    // These tests use the perf-assessment data (real 11-shard index with 97
+    // buckets, ~10.5B total entries; real long-read Parquet queries).
     // They are #[ignore]d because the data is local-only (not in git).
     //
     // Run with: cargo test batch_config -- --ignored --nocapture
     // =========================================================================
 
     /// Regression: with real sharded index and real query data, batch sizing
-    /// should produce a reasonable batch size (not crippled by over-reservation).
+    /// should produce a reasonable classification byte budget (not crippled
+    /// by over-reservation).
     ///
     /// Before fix: batch_count=num_threads reserved ~8x too much memory,
-    /// producing batch sizes ~4-8x smaller than necessary.
+    /// producing batch sizes ~4-8x smaller than necessary. `batch_size` now
+    /// only bounds input (sequence-byte) residency (see `QueryAccumulator`),
+    /// so this regression check moved to `classify_byte_budget`, the field
+    /// that now drives classification pass count.
     #[test]
     #[ignore]
     fn test_real_sharded_index_batch_size_is_reasonable() {
-        let index_path = std::path::Path::new("perf-assessment/parquet-index/n100-w200.ryxdi");
+        let index_path = std::path::Path::new("perf-assessment/parquet-index/n97-w50.ryxdi");
         let query_path = std::path::Path::new("perf-assessment/query-files/long_read.parquet");
 
         if !index_path.exists() || !query_path.exists() {
@@ -506,34 +510,36 @@ num_entries = 3
         let result = compute_effective_batch_size(&config).unwrap();
 
         eprintln!(
-            "Real index: batch_size={}, peak_memory={:.2}GB, shard_reservation={:.2}MB",
+            "Real index: batch_size={}, peak_memory={:.2}GB, shard_reservation={:.2}MB, classify_byte_budget={:.2}GB",
             result.batch_size,
             result.peak_memory as f64 / (1024.0 * 1024.0 * 1024.0),
-            result.shard_reservation as f64 / (1024.0 * 1024.0)
+            result.shard_reservation as f64 / (1024.0 * 1024.0),
+            result.classify_byte_budget as f64 / (1024.0 * 1024.0 * 1024.0)
         );
 
-        // With batch_count=1 fix, batch_size should be well above 1M for 64GB
+        // With batch_count=1 fix, classify_byte_budget should be the large
+        // majority of max_memory, not crippled by shard-count over-reservation.
         assert!(
-            result.batch_size > 1_000_000,
-            "batch_size should be > 1M for 64GB with sequential batches, got {}",
-            result.batch_size
+            result.classify_byte_budget > 32 * 1024 * 1024 * 1024,
+            "classify_byte_budget should be > 32GB for a 64GB max-memory run, got {} bytes",
+            result.classify_byte_budget
         );
     }
 
     /// Regression: shard reservation must be nonzero for a sharded index.
     ///
-    /// The 8-shard index has largest shard ~62M entries. Loading a shard
+    /// The 11-shard index has largest shard ~989M entries. Loading a shard
     /// involves concurrent row-group decoding + filtered CSR output.
     /// This memory must be accounted for.
     ///
     /// We verify: load_index_metadata populates largest_shard_entries,
     /// and estimate_shard_reservation returns a nonzero value that feeds
-    /// into the batch sizing. The shard reservation for the 8-shard index
-    /// (largest shard ≈ 62M entries) should be substantial (>100MB).
+    /// into the batch sizing. The shard reservation for the 11-shard index
+    /// (largest shard ≈ 989M entries) should be substantial (>100MB).
     #[test]
     #[ignore]
     fn test_real_index_shard_reservation_affects_batch_size() {
-        let sharded_index = std::path::Path::new("perf-assessment/parquet-index/n100-w200.ryxdi");
+        let sharded_index = std::path::Path::new("perf-assessment/parquet-index/n97-w50.ryxdi");
 
         if !sharded_index.exists() {
             eprintln!("Skipping: perf-assessment data not available");
@@ -542,11 +548,11 @@ num_entries = 3
 
         let metadata = load_index_metadata(sharded_index).unwrap();
 
-        // The 8-shard index has shards with ~60-62M entries each
+        // The 11-shard index has shards with ~865-989M entries each
         eprintln!("largest_shard_entries: {}", metadata.largest_shard_entries);
         assert!(
             metadata.largest_shard_entries > 50_000_000,
-            "8-shard index should have largest shard > 50M entries, got {}",
+            "11-shard index should have largest shard > 50M entries, got {}",
             metadata.largest_shard_entries
         );
 
