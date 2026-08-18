@@ -929,17 +929,26 @@ const ARROW_BUILDER_OVERHEAD: f64 = 1.5;
 /// `classify::sharded::classify_shard_loop`/`_parallel_rg` allocate for a
 /// pass over an index with `num_buckets` buckets.
 ///
-/// Mirrors `classify::sharded::use_dense_accumulator`'s threshold exactly, so
-/// batch/pass sizing agrees with what actually gets allocated: dense
-/// (`num_buckets <= DENSE_ACCUMULATOR_MAX_BUCKETS`) is a flat `Vec<(u32,u32)>`
-/// of `(num_buckets + 1)` slots per read at 8 bytes each — for a 160-bucket
-/// index that's ~1.3 KB/read, allocated whether or not the bucket is ever
-/// hit. Sparse is a per-read `HashMap<u32, (u32,u32)>` holding only buckets
-/// actually seen, estimated at ~4 buckets/read on average.
+/// Mirrors `classify::sharded::use_dense_accumulator`'s threshold exactly
+/// *if* `num_buckets` is `max_bucket_id + 1` — that's what
+/// `use_dense_accumulator` actually keys on (`max_bucket_id_from_manifest`),
+/// not a bucket count. For contiguously numbered bucket ids the two agree
+/// (a caller can pass either), but for non-contiguous ids they diverge:
+/// e.g. ids `1..=250` plus a stray `5000` has count 251 (looks dense) but
+/// `max_bucket_id + 1` = 5001 (actually sparse). Callers whose accumulator
+/// cost must agree with what `use_dense_accumulator` will actually pick
+/// (e.g. `QueryAccumulator::with_accumulator_cost_per_read`'s budget) should
+/// pass `max_bucket_id + 1`, not a count — see the caller in
+/// `commands/classify.rs`. Callers only estimating an approximate ceiling
+/// (e.g. `estimate_batch_memory`, which already documents this same
+/// count-vs-max_id caveat) can use a count.
 ///
-/// `num_buckets` is a count while the dense stride is `max_bucket_id + 1`;
-/// these agree for contiguously numbered buckets, which is what the index
-/// builders produce. An index with sparse bucket ids uses more than this.
+/// dense (`num_buckets <= DENSE_ACCUMULATOR_MAX_BUCKETS`) is a flat
+/// `Vec<(u32,u32)>` of `num_buckets` slots per read at 8 bytes each — for a
+/// 160-bucket index that's ~1.3 KB/read, allocated whether or not the
+/// bucket is ever hit. Sparse is a per-read `HashMap<u32, (u32,u32)>`
+/// holding only buckets actually seen, estimated at ~4 buckets/read on
+/// average.
 ///
 /// Returns `None` on arithmetic overflow (only reachable with a pathological
 /// `num_buckets` near `usize::MAX`).
@@ -1308,6 +1317,42 @@ pub fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: `estimate_accumulator_bytes_per_read` must give different
+    /// answers for a bucket *count* vs. `max_bucket_id + 1` on a
+    /// non-contiguous bucket-id index, pinning the exact scenario callers
+    /// binding to `classify::sharded::use_dense_accumulator` must avoid.
+    ///
+    /// Bucket ids `1..=250` plus a stray `5000`: count is 251 (looks dense,
+    /// <= DENSE_ACCUMULATOR_MAX_BUCKETS), but the real dense stride
+    /// `use_dense_accumulator` would pick is keyed on max_bucket_id + 1 =
+    /// 5001 (sparse). A caller passing the count instead of max_id + 1 (as
+    /// `commands/classify.rs` used to) would under-estimate the per-read
+    /// accumulator cost by roughly the sparse/dense cost ratio, letting
+    /// `QueryAccumulator::should_flush()` admit a pass whose real
+    /// `HitAccumulator` allocation doesn't match this estimate at all.
+    #[test]
+    fn test_accumulator_bytes_per_read_diverges_on_non_contiguous_bucket_ids() {
+        let bucket_count = 251usize; // 250 contiguous ids + one stray id
+        let max_bucket_id_plus_one = 5001usize; // real dense/sparse threshold input
+
+        let by_count = estimate_accumulator_bytes_per_read(bucket_count).unwrap();
+        let by_max_id = estimate_accumulator_bytes_per_read(max_bucket_id_plus_one).unwrap();
+
+        assert!(
+            bucket_count <= DENSE_ACCUMULATOR_MAX_BUCKETS,
+            "test setup: count should fall in the dense range"
+        );
+        assert!(
+            max_bucket_id_plus_one > DENSE_ACCUMULATOR_MAX_BUCKETS,
+            "test setup: max_bucket_id + 1 should fall in the sparse range"
+        );
+        assert_ne!(
+            by_count, by_max_id,
+            "count-based and max-id-based estimates must diverge for non-contiguous \
+             bucket ids — a caller using the wrong one silently mis-sizes the budget"
+        );
+    }
 
     // === Byte suffix parsing tests ===
 

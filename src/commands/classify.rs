@@ -228,8 +228,17 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
     // against a many-bucket index can exceed its budget in accumulator
     // allocation even while entries stay small. Reserve per-read headroom for
     // it so should_flush() catches that case too.
+    //
+    // estimate_accumulator_bytes_per_read's dense/sparse threshold must
+    // match classify::sharded::use_dense_accumulator's, which keys on the
+    // manifest's *max bucket id*, not the bucket *count* — these diverge
+    // for non-contiguous bucket ids (e.g. ids 1..=250 plus a stray 5000:
+    // count=251 looks dense, max_id=5000 is actually sparse). Passing
+    // bucket_names.len() here would under-estimate in that case and let
+    // should_flush() admit a pass the real accumulator doesn't fit.
+    let max_bucket_id = metadata.bucket_names.keys().max().copied().unwrap_or(0);
     let accumulator_bytes_per_read =
-        rype::memory::estimate_accumulator_bytes_per_read(metadata.bucket_names.len())
+        rype::memory::estimate_accumulator_bytes_per_read(max_bucket_id as usize + 1)
             .unwrap_or(0);
 
     let mut acc: rype::QueryAccumulator<String> =
