@@ -456,7 +456,10 @@ fn load_filtered_coo_pairs(
     let num_chunks = (num_threads * CHUNK_OVERSUBSCRIPTION_FACTOR)
         .min(matching_row_groups.len())
         .max(1);
-    let chunk_size = matching_row_groups.len().div_ceil(num_chunks);
+    // matching_row_groups.len().div_ceil(num_chunks) would be simpler but
+    // div_ceil on usize was stabilized in Rust 1.73, above this crate's
+    // declared MSRV (1.70) — see the same workaround in c_api.rs.
+    let chunk_size = (matching_row_groups.len() + num_chunks - 1) / num_chunks;
     let chunks: Vec<&[(usize, u64, u64)]> = matching_row_groups.chunks(chunk_size).collect();
 
     // Estimate pairs per row group for pre-allocation, scaled per chunk by

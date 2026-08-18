@@ -852,7 +852,11 @@ fn gallop_join_csr_parallel<A: HitAccumulator>(
         ref_idx.minimizers.len()
     };
 
-    let chunk_size = smaller_len.div_ceil(num_threads);
+    // smaller_len.div_ceil(num_threads) would be simpler but div_ceil on
+    // usize was stabilized in Rust 1.73, above this crate's declared MSRV
+    // (1.70) — see the same workaround in c_api.rs. num_threads is always
+    // >= 1 (rayon::current_num_threads()), so no division by zero.
+    let chunk_size = (smaller_len + num_threads - 1) / num_threads;
     if chunk_size == 0 {
         gallop_join_csr(query_idx, ref_idx, accumulator, unique_mins, query_smaller);
         return;
