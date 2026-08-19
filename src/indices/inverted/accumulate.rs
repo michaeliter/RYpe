@@ -131,15 +131,25 @@ impl<M: MetaHeapBytes> QueryAccumulator<M> {
     /// wide-window index can have more header bytes than minimizer entry
     /// bytes), not a rounding error to leave out.
     ///
-    /// Measures `entries`/`fwd_counts`/`rc_counts` by `len()`, not
-    /// `capacity()`: `drain()` does not retain the buffers' allocated
-    /// capacity (see its doc comment), so a capacity-based estimate would
-    /// keep reporting the full pre-drain size against an empty accumulator
-    /// and make `should_flush()` permanently true after the first flush.
+    /// Measures `entries`/`fwd_counts`/`rc_counts` by `capacity()`, not
+    /// `len()`: `push()` grows these buffers incrementally (one read's worth
+    /// of `reserve()` at a time for `entries`; ordinary amortized-doubling
+    /// `push()` for `fwd_counts`/`rc_counts`), so real allocated capacity can
+    /// run up to ~2x live length by the time a pass flushes — for long reads
+    /// (thousands of minimizers/read), that gap is multiple GB, not noise,
+    /// and was a real contributor to `classify_byte_budget` overshooting on
+    /// long-read passes. `len()` was used for a period after the original
+    /// Finding 1 fix specifically because `drain()` used to re-reserve each
+    /// buffer's pre-drain capacity into the next (empty) fill cycle, which
+    /// made a capacity-based estimate permanently overshoot after every
+    /// flush. `drain()` now releases via `std::mem::take` — real capacity
+    /// after a drain is genuinely 0, not merely emptied `len()` — so that
+    /// trap no longer applies and this can go back to the more accurate
+    /// (and more conservative) measurement.
     pub fn approx_bytes(&self) -> usize {
-        self.entries.len() * std::mem::size_of::<(u64, u32)>()
-            + self.fwd_counts.len() * std::mem::size_of::<u32>()
-            + self.rc_counts.len() * std::mem::size_of::<u32>()
+        self.entries.capacity() * std::mem::size_of::<(u64, u32)>()
+            + self.fwd_counts.capacity() * std::mem::size_of::<u32>()
+            + self.rc_counts.capacity() * std::mem::size_of::<u32>()
             + self.meta_heap_bytes
     }
 
@@ -447,6 +457,57 @@ mod tests {
             acc.approx_bytes(),
             0,
             "meta_heap_bytes must reset to 0 on drain, same as entries/counts"
+        );
+    }
+
+    /// Regression: `approx_bytes()` must reflect real allocated capacity,
+    /// not just live length — many small incremental pushes (as happens
+    /// across a real multi-read accumulation, one `reserve()` call per read
+    /// rather than one for the whole pass) leave `entries` holding
+    /// meaningfully more capacity than its length, and a `len()`-based
+    /// estimate silently under-counts that gap. This was a real contributor
+    /// to `classify_byte_budget` overshooting on long-read passes (many
+    /// minimizers/read compounds the per-push growth), not just a
+    /// theoretical rounding difference — see the caller-side accounting in
+    /// `commands/helpers/batch_config.rs`.
+    #[test]
+    fn test_approx_bytes_reflects_capacity_not_just_length() {
+        let mut acc: QueryAccumulator<String> = QueryAccumulator::with_budget(usize::MAX);
+        // Many small pushes, each triggering `entries.reserve(..)` for just
+        // that read's minimizers — the incremental-growth pattern real
+        // accumulation follows, unlike a single bulk reservation.
+        for i in 0..2000u64 {
+            acc.push(format!("r{i}"), vec![i, i + 1], vec![]);
+        }
+
+        // What a `len()`-based `approx_bytes()` would have reported —
+        // computed independently here (not by calling `approx_bytes()`
+        // itself) so this test discriminates the actual implementation
+        // rather than trivially restating whatever it does. `meta_heap_bytes`
+        // is shared by both implementations, so it's excluded from the
+        // comparison entirely rather than risk it swamping a real but small
+        // capacity/length delta.
+        let len_based_entries_counts_bytes = acc.entries.len() * std::mem::size_of::<(u64, u32)>()
+            + acc.fwd_counts.len() * std::mem::size_of::<u32>()
+            + acc.rc_counts.len() * std::mem::size_of::<u32>();
+        let cap_based_entries_counts_bytes = acc.entries.capacity()
+            * std::mem::size_of::<(u64, u32)>()
+            + acc.fwd_counts.capacity() * std::mem::size_of::<u32>()
+            + acc.rc_counts.capacity() * std::mem::size_of::<u32>();
+
+        assert!(
+            cap_based_entries_counts_bytes > len_based_entries_counts_bytes,
+            "test setup: incremental per-read growth should leave spare capacity \
+             (cap_bytes={cap_based_entries_counts_bytes}, len_bytes={len_based_entries_counts_bytes})"
+        );
+
+        let approx_bytes_entries_counts_only = acc.approx_bytes() - acc.meta_heap_bytes;
+        assert_eq!(
+            approx_bytes_entries_counts_only, cap_based_entries_counts_bytes,
+            "approx_bytes() (minus meta_heap_bytes: {}) should equal the entries/counts \
+             buffers' real allocated capacity ({cap_based_entries_counts_bytes}), not \
+             their length ({len_based_entries_counts_bytes})",
+            acc.meta_heap_bytes
         );
     }
 
