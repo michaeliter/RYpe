@@ -977,9 +977,25 @@ pub fn estimate_accumulator_bytes_per_read(num_buckets: usize) -> Option<usize> 
 /// as the conservative choice; it costs a somewhat smaller pass than
 /// strictly necessary once a pass exceeds `FOLD_REDUCE_MAX_READS` (where
 /// the sparse-hit-collection fallback applies instead and this multiplier
-/// is moot), rather than risking the actual OOM this finding describes.
+/// is moot) — pair with `fold_reduce_max_reads()` and
+/// `QueryAccumulator::with_tiered_accumulator_cost` to apply this multiplier
+/// only up to that threshold, rather than unconditionally: applied flatly
+/// to every read regardless of eventual pass size, it shrinks passes for
+/// workloads that will obviously clear the threshold long before hitting a
+/// byte-budget wall (e.g. many short reads against a many-bucket index) by
+/// this same factor for no reason, since those passes were never going to
+/// take the risky fold-reduce path in the first place.
 pub fn fold_reduce_accumulator_fanout(num_threads: usize) -> usize {
     (2 * num_threads).max(1)
+}
+
+/// The `FOLD_REDUCE_MAX_READS` threshold (see that constant's doc in
+/// `constants.rs`), exposed for callers outside the library crate (e.g. the
+/// CLI) sizing a tiered accumulator-cost reservation via
+/// `QueryAccumulator::with_tiered_accumulator_cost` — pair with
+/// `fold_reduce_accumulator_fanout`.
+pub fn fold_reduce_max_reads() -> usize {
+    crate::constants::FOLD_REDUCE_MAX_READS
 }
 
 /// Estimate what's actually resident during input reading on the

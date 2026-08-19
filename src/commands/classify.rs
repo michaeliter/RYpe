@@ -237,19 +237,8 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
     // bucket_names.len() here would under-estimate in that case and let
     // should_flush() admit a pass the real accumulator doesn't fit.
     let max_bucket_id = metadata.bucket_names.keys().max().copied().unwrap_or(0);
-    // Parallel CSR merge-join (classify::merge_join) allocates up to ~2x
-    // num_threads full-size HitAccumulators when a pass's read count lands
-    // at or under FOLD_REDUCE_MAX_READS (per-chunk accumulators plus
-    // rayon's reduce identities) — see fold_reduce_accumulator_fanout's
-    // doc. Scale the per-read reservation by that factor so should_flush()
-    // accounts for the real worst case, not just one accumulator.
-    let merge_join_bytes_per_read = rype::memory::estimate_accumulator_bytes_per_read(
-        max_bucket_id as usize + 1,
-    )
-    .unwrap_or(0)
-    .saturating_mul(rype::memory::fold_reduce_accumulator_fanout(
-        rayon::current_num_threads(),
-    ));
+    let single_accumulator_bytes_per_read =
+        rype::memory::estimate_accumulator_bytes_per_read(max_bucket_id as usize + 1).unwrap_or(0);
 
     // --wide additionally builds a HashMap<i64, HashMap<u32, f64>> grouping
     // structure plus a Vec::with_capacity(headers.len() * (num_buckets*8+32))
@@ -257,18 +246,35 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
     // (not one input batch, now that a pass spans the whole corpus) — not
     // modeled anywhere else, so a run classify_byte_budget says fits could
     // still OOM at format time, after the expensive shard scan already
-    // completed. Fold a conservative per-read estimate into the same
-    // per-read reservation: the output line (num_buckets*8+32 bytes) plus
-    // up to num_buckets HashMap<u32, f64> entries (~48 bytes/entry,
-    // hashbrown's per-entry overhead) for a read that scored in every bucket.
+    // completed. Fold a conservative per-read estimate into the per-read
+    // reservation: the output line (num_buckets*8+32 bytes) plus up to
+    // num_buckets HashMap<u32, f64> entries (~48 bytes/entry, hashbrown's
+    // per-entry overhead) for a read that scored in every bucket.
     let wide_format_bytes_per_read = wide_bucket_ids
         .as_deref()
         .map(|bucket_ids| estimate_wide_format_bytes_per_read(bucket_ids.len()))
         .unwrap_or(0);
 
     let accumulator_bytes_per_read =
-        merge_join_bytes_per_read.saturating_add(wide_format_bytes_per_read);
+        single_accumulator_bytes_per_read.saturating_add(wide_format_bytes_per_read);
 
+    // Note on the parallel CSR merge-join's per-thread accumulator fan-out
+    // (classify::merge_join, up to ~2x num_threads full-size
+    // HitAccumulators when a pass's final read count lands at or under
+    // FOLD_REDUCE_MAX_READS): that risk is covered by a one-time deduction
+    // from batch_result.classify_byte_budget itself (see
+    // compute_effective_batch_size / fold_reduce_accumulator_fanout), not a
+    // per-read multiplier here. A per-read multiplier was tried first and
+    // reverted: scaling every read's reservation by the fan-out factor
+    // creates a self-reinforcing trap for large short-read passes — the
+    // inflated per-read cost forces should_flush() to flush well under
+    // FOLD_REDUCE_MAX_READS reads, which "confirms" the pass is still in
+    // the risky zone, so the inflated rate keeps applying and the pass
+    // never gets the chance to grow past the threshold into the safe
+    // sparse-hit-collection regime it would naturally reach with a
+    // realistic per-read rate. A one-time budget deduction avoids that:
+    // it's paid once regardless of how the corpus's natural pass size
+    // shakes out, instead of compounding per read.
     let mut acc: rype::QueryAccumulator<String> =
         rype::QueryAccumulator::with_budget(batch_result.classify_byte_budget)
             .with_max_reads(batch_result.classify_max_reads)

@@ -145,8 +145,8 @@ impl<M: MetaHeapBytes> QueryAccumulator<M> {
 
     /// `approx_bytes()` plus the projected cost of the classification-pass
     /// accumulator over the reads buffered so far (see
-    /// `with_accumulator_cost_per_read`). This, not `approx_bytes()`, is what
-    /// `should_flush()` compares against the byte budget.
+    /// `with_accumulator_cost_per_read`). This, not `approx_bytes()`, is
+    /// what `should_flush()` compares against the byte budget.
     pub fn projected_pass_bytes(&self) -> usize {
         self.approx_bytes()
             .saturating_add(self.accumulator_bytes_per_read.saturating_mul(self.meta.len()))

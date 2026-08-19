@@ -88,6 +88,49 @@ fn determine_input_format(config: &BatchSizeConfig, is_paired: bool) -> InputFor
 /// # Arguments
 /// * `config` - Batch size configuration parameters
 ///
+/// One-time deduction from `classify_byte_budget` covering the parallel CSR
+/// merge-join's per-thread accumulator fan-out (`classify::merge_join`, up
+/// to ~2x `num_threads` full-size `HitAccumulator`s instead of one), which
+/// is only live while a pass's final read count could still land at or
+/// under `FOLD_REDUCE_MAX_READS`.
+///
+/// A one-time deduction, not a per-read multiplier: a per-read multiplier
+/// was tried first and reverted (see the note at the
+/// `QueryAccumulator::with_accumulator_cost_per_read` call site in
+/// `commands/classify.rs`) because it creates a self-reinforcing trap —
+/// scaling every read's reservation by the fan-out factor forces
+/// `should_flush()` to flush well under `FOLD_REDUCE_MAX_READS` reads,
+/// which "confirms" the pass is still in the risky zone, so the inflated
+/// rate keeps applying and the pass never gets the chance to grow past the
+/// threshold into the safe sparse-hit-collection regime it would naturally
+/// reach with a realistic per-read rate. Measured to turn a real 1-pass,
+/// ~15s run on a 97-bucket index into 12+ passes and 170s+.
+///
+/// Sized for the worst case that could ever land in the risky zone
+/// (`FOLD_REDUCE_MAX_READS` reads, each costing up to `fanout - 1` extra
+/// accumulator-sized allocations beyond the one the per-read rate already
+/// covers), capped to at most 1/8 of `mem_limit` — the uncapped figure can
+/// itself reach the multi-GB range on a many-bucket index, consuming most
+/// or all of a modest `--max-memory` budget on its own (measured: zeroed
+/// `classify_byte_budget` entirely on a 16 GB run against a 97-bucket
+/// index). This cap is deliberately not a tight bound on the real risk — a
+/// long-read/many-bucket pass small enough to hit the fold-reduce path
+/// could still, in principle, exceed 1/8 of the budget in real per-thread
+/// accumulator allocation — it trades some of that protection for
+/// guaranteeing this term alone can never zero out the budget for every
+/// other workload.
+fn fold_reduce_budget_reserve(
+    mem_limit: usize,
+    single_accumulator_bytes_per_read: usize,
+    num_threads: usize,
+) -> usize {
+    let fanout = rype::memory::fold_reduce_accumulator_fanout(num_threads);
+    rype::memory::fold_reduce_max_reads()
+        .saturating_mul(single_accumulator_bytes_per_read)
+        .saturating_mul(fanout.saturating_sub(1))
+        .min(mem_limit / 8)
+}
+
 /// # Returns
 /// A `BatchSizeResult` containing the computed batch size and metadata for logging.
 pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSizeResult> {
@@ -227,18 +270,29 @@ pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSiz
     )
     .unwrap_or(0);
 
+    let max_bucket_id = metadata.bucket_names.keys().max().copied().unwrap_or(0);
+    let single_accumulator_bytes_per_read =
+        rype::memory::estimate_accumulator_bytes_per_read(max_bucket_id as usize + 1).unwrap_or(0);
+    let fold_reduce_reserve = fold_reduce_budget_reserve(
+        mem_limit,
+        single_accumulator_bytes_per_read,
+        rayon::current_num_threads(),
+    );
+
     // Classification-pass budget: what's left of max_memory after everything
     // else concurrently resident during a pass — the shard reservation
     // (index residency during a shard scan), the safety margin, the
-    // reference index itself, and one input batch's worth of raw records —
-    // available for the QueryAccumulator's flat COO entries. This is
-    // independent of `batch_size`, which now only bounds input-batch
-    // (sequence-byte) residency ahead of extraction.
+    // reference index itself, one input batch's worth of raw records, and
+    // the parallel-merge-join fan-out reserve above — available for the
+    // QueryAccumulator's flat COO entries. This is independent of
+    // `batch_size`, which now only bounds input-batch (sequence-byte)
+    // residency ahead of extraction.
     let classify_byte_budget = mem_limit
         .saturating_sub(shard_reservation)
         .saturating_sub(safety_margin_bytes(mem_limit))
         .saturating_sub(estimated_index_mem)
-        .saturating_sub(input_batch_residency);
+        .saturating_sub(input_batch_residency)
+        .saturating_sub(fold_reduce_reserve);
 
     Ok(BatchSizeResult {
         batch_size: batch_config.batch_size,
@@ -389,6 +443,28 @@ num_entries = 3
 
         let result = compute_effective_batch_size(&config).unwrap();
         assert_eq!(result.batch_size, 5000);
+    }
+
+    /// Regression: `fold_reduce_budget_reserve` must never consume more
+    /// than 1/8 of `mem_limit`, even when the uncapped worst-case figure
+    /// (FOLD_REDUCE_MAX_READS reads x per-read accumulator cost x fan-out)
+    /// would exceed the entire budget on its own. Before this cap existed,
+    /// a many-bucket index at a modest --max-memory zeroed
+    /// classify_byte_budget completely — verified on a real 97-bucket
+    /// index at 16 GB, where the uncapped reserve alone exceeded 9 GB.
+    #[test]
+    fn test_fold_reduce_budget_reserve_capped_at_one_eighth_of_mem_limit() {
+        let mem_limit = 16 * 1024 * 1024 * 1024; // 16GB
+        // A large per-read accumulator cost (many buckets) and many threads
+        // — deliberately sized so the uncapped product would exceed mem_limit
+        // entirely: FOLD_REDUCE_MAX_READS (500_000) * 1000 * 23 ~= 11.5 TB.
+        let reserve = fold_reduce_budget_reserve(mem_limit, 1000, 12);
+        assert_eq!(
+            reserve,
+            mem_limit / 8,
+            "reserve should be capped at mem_limit/8 when the uncapped figure would exceed it"
+        );
+        assert!(reserve < mem_limit, "capped reserve must leave room for everything else");
     }
 
     #[test]
