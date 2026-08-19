@@ -212,10 +212,17 @@ impl<M: MetaHeapBytes> QueryAccumulator<M> {
     /// Returns true once accumulated data has reached the byte budget, the
     /// optional `max_reads` cap, or the read count is one push away from
     /// `MAX_READS`.
+    ///
+    /// Never true on an empty accumulator, regardless of budget: a pass
+    /// containing zero reads is never useful work, it's a full index scan
+    /// for nothing, and a byte budget of 0 (which callers must otherwise
+    /// guard against — see `classify_byte_budget`'s floor) would otherwise
+    /// make this true immediately after every drain.
     pub fn should_flush(&self) -> bool {
-        self.projected_pass_bytes() >= self.byte_budget
-            || self.max_reads.is_some_and(|mr| self.meta.len() >= mr)
-            || self.meta.len() >= QueryInvertedIndex::MAX_READS
+        !self.meta.is_empty()
+            && (self.projected_pass_bytes() >= self.byte_budget
+                || self.max_reads.is_some_and(|mr| self.meta.len() >= mr)
+                || self.meta.len() >= QueryInvertedIndex::MAX_READS)
     }
 
     /// Drain all buffered data into a sorted `QueryInvertedIndex` and its
@@ -356,6 +363,22 @@ mod tests {
         assert!(
             !acc.should_flush(),
             "should_flush() must be false immediately after drain with nothing re-pushed"
+        );
+    }
+
+    /// A byte budget of 0 (e.g. a caller-computed `classify_byte_budget` that
+    /// collapsed to 0 before a floor was applied — see the re-review's
+    /// Finding A) must not make `should_flush()` true on an accumulator that
+    /// has nothing pushed to it: that's Finding 1's failure mode again, one
+    /// index scan per input batch, just reached via a zero budget instead of
+    /// a stale-capacity read. Before the fix, `0 >= 0` was true regardless of
+    /// whether anything had been pushed.
+    #[test]
+    fn test_should_flush_false_on_empty_accumulator_even_at_zero_budget() {
+        let acc = QueryAccumulator::<String>::with_budget(0);
+        assert!(
+            !acc.should_flush(),
+            "an empty accumulator must never report should_flush(), even at a zero budget"
         );
     }
 

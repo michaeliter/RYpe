@@ -229,16 +229,18 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
     // allocation even while entries stay small. Reserve per-read headroom for
     // it so should_flush() catches that case too.
     //
-    // estimate_accumulator_bytes_per_read's dense/sparse threshold must
-    // match classify::sharded::use_dense_accumulator's, which keys on the
-    // manifest's *max bucket id*, not the bucket *count* — these diverge
-    // for non-contiguous bucket ids (e.g. ids 1..=250 plus a stray 5000:
-    // count=251 looks dense, max_id=5000 is actually sparse). Passing
-    // bucket_names.len() here would under-estimate in that case and let
-    // should_flush() admit a pass the real accumulator doesn't fit.
+    // estimate_accumulator_bytes_per_read takes max_bucket_id directly (not
+    // bucket_names.len() and not max_bucket_id + 1 — both would land on the
+    // wrong side of its dense/sparse predicate at the DENSE_ACCUMULATOR_MAX_BUCKETS
+    // boundary) so it can never disagree with
+    // classify::sharded::use_dense_accumulator, which keys on the
+    // manifest's *max bucket id* too. Passing bucket_names.len() would also
+    // under-estimate for non-contiguous bucket ids (e.g. ids 1..=250 plus a
+    // stray 5000: count=251 looks dense, max_id=5000 is actually sparse),
+    // letting should_flush() admit a pass the real accumulator doesn't fit.
     let max_bucket_id = metadata.bucket_names.keys().max().copied().unwrap_or(0);
     let single_accumulator_bytes_per_read =
-        rype::memory::estimate_accumulator_bytes_per_read(max_bucket_id as usize + 1).unwrap_or(0);
+        rype::memory::estimate_accumulator_bytes_per_read(max_bucket_id as usize).unwrap_or(0);
 
     // --wide additionally builds a HashMap<i64, HashMap<u32, f64>> grouping
     // structure plus a Vec::with_capacity(headers.len() * (num_buckets*8+32))
@@ -530,12 +532,23 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
 
 /// Estimate the per-read cost `format_results_wide` adds for a pass: one
 /// output line (`num_buckets * 8 + 32` bytes, matching its own
-/// `Vec::with_capacity` sizing) plus up to `num_buckets` entries in its
-/// `HashMap<u32, f64>` grouping structure (~48 bytes/entry, hashbrown's
-/// approximate per-entry overhead) for a read that scored in every bucket.
+/// `Vec::with_capacity` sizing — genuinely a worst case, since that line is
+/// emitted for every read regardless of how many buckets it scored in) plus
+/// `ESTIMATED_BUCKETS_PER_READ` entries in its `HashMap<u32, f64>` grouping
+/// structure (~48 bytes/entry, hashbrown's approximate per-entry overhead).
 /// `0` when `--wide` isn't in use.
+///
+/// The HashMap term used to be `num_buckets * 48` — worst case for a read
+/// that scored in *every* bucket. At 97 buckets that's 5,464 B/read total,
+/// ~7x the accumulator's own per-read term, and turned a 1-pass run into
+/// ~3 on this crate's own perf fixture. `memory::estimate_accumulator_bytes_per_read`'s
+/// sparse branch already assumes `ESTIMATED_BUCKETS_PER_READ` (4) as the
+/// realistic average for a HashMap keyed the same way (bucket id -> per-read
+/// score); this reuses that same assumption instead of a second, much
+/// larger one.
 fn estimate_wide_format_bytes_per_read(num_buckets: usize) -> usize {
-    (num_buckets * 8 + 32) + num_buckets * 48
+    let hashmap_buckets = rype::memory::estimated_buckets_per_read().min(num_buckets);
+    (num_buckets * 8 + 32) + hashmap_buckets * 48
 }
 
 /// Drain `acc` into a `QueryInvertedIndex` and run one classification pass
@@ -1447,6 +1460,37 @@ mod tests {
             large > small,
             "cost should grow with bucket count: 160-bucket ({large}) should exceed \
              10-bucket ({small})"
+        );
+    }
+
+    /// Regression: the HashMap-grouping term must scale with
+    /// `ESTIMATED_BUCKETS_PER_READ`, not `num_buckets` — a worst case
+    /// applied unconditionally turned a 1-pass run against this crate's own
+    /// 97-bucket perf fixture into ~3 (see the re-review's Finding E). The
+    /// output-line term (`num_buckets * 8 + 32`) is deliberately still
+    /// worst-case, since it's genuinely emitted for every read.
+    #[test]
+    fn test_estimate_wide_format_bytes_per_read_hashmap_term_bounded_by_estimated_buckets() {
+        let num_buckets = 97;
+        let cost = estimate_wide_format_bytes_per_read(num_buckets);
+
+        let line_term = num_buckets * 8 + 32;
+        let old_unconditional_hashmap_term = num_buckets * 48; // pre-fix: 4,656 B
+        let new_hashmap_term = cost - line_term;
+
+        assert!(
+            new_hashmap_term < old_unconditional_hashmap_term,
+            "HashMap term ({new_hashmap_term}) should be well below the old worst-case \
+             ({old_unconditional_hashmap_term})"
+        );
+        assert_eq!(
+            new_hashmap_term,
+            rype::memory::estimated_buckets_per_read() * 48,
+            "HashMap term should scale with ESTIMATED_BUCKETS_PER_READ, not num_buckets"
+        );
+        assert!(
+            cost < 5464,
+            "97-bucket cost ({cost}) should be well under the old worst-case (5,464 B/read)"
         );
     }
 

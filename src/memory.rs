@@ -927,36 +927,46 @@ const ARROW_BUILDER_OVERHEAD: f64 = 1.5;
 
 /// Estimate the per-read cost of the `HitAccumulator` that
 /// `classify::sharded::classify_shard_loop`/`_parallel_rg` allocate for a
-/// pass over an index with `num_buckets` buckets.
+/// pass over an index whose largest bucket id is `max_bucket_id`.
 ///
-/// Mirrors `classify::sharded::use_dense_accumulator`'s threshold exactly
-/// *if* `num_buckets` is `max_bucket_id + 1` — that's what
-/// `use_dense_accumulator` actually keys on (`max_bucket_id_from_manifest`),
-/// not a bucket count. For contiguously numbered bucket ids the two agree
-/// (a caller can pass either), but for non-contiguous ids they diverge:
-/// e.g. ids `1..=250` plus a stray `5000` has count 251 (looks dense) but
-/// `max_bucket_id + 1` = 5001 (actually sparse). Callers whose accumulator
-/// cost must agree with what `use_dense_accumulator` will actually pick
-/// (e.g. `QueryAccumulator::with_accumulator_cost_per_read`'s budget) should
-/// pass `max_bucket_id + 1`, not a count — see the caller in
-/// `commands/classify.rs`. Callers only estimating an approximate ceiling
-/// (e.g. `estimate_batch_memory`, which already documents this same
-/// count-vs-max_id caveat) can use a count.
+/// Takes `max_bucket_id`, not a bucket count, and mirrors
+/// `classify::sharded::use_dense_accumulator`'s predicate literally
+/// (`max_bucket_id > 0 && max_bucket_id <= DENSE_ACCUMULATOR_MAX_BUCKETS`)
+/// so the two can never disagree — including at the boundary
+/// `max_bucket_id == DENSE_ACCUMULATOR_MAX_BUCKETS`, where a caller-adjusted
+/// count (this function's previous signature) landed on the wrong side of
+/// the predicate whenever the adjustment was off by one, silently
+/// mismatching `use_dense_accumulator`'s real choice.
 ///
-/// dense (`num_buckets <= DENSE_ACCUMULATOR_MAX_BUCKETS`) is a flat
-/// `Vec<(u32,u32)>` of `num_buckets` slots per read at 8 bytes each — for a
+/// Taking a count and requiring the caller to pre-adjust it (previously
+/// `max_bucket_id + 1`) invited exactly that class of bug rather than
+/// preventing it — see `commands/classify.rs`'s caller, which now passes
+/// `max_bucket_id` directly. `estimate_batch_memory`'s caller only has a
+/// bucket *count* to offer (an approximate ceiling, not tied to any real
+/// manifest's max id); it converts via `num_buckets.saturating_sub(1)`,
+/// i.e. treats the buckets as if contiguously numbered `0..num_buckets`,
+/// which is the same assumption its existing count-vs-max_id doc caveat
+/// already relies on.
+///
+/// dense (`max_bucket_id <= DENSE_ACCUMULATOR_MAX_BUCKETS`) is a flat
+/// `Vec<(u32,u32)>` of `max_bucket_id + 1` slots per read at 8 bytes each —
+/// matching `DenseAccumulator::new`'s real `stride` exactly — for a
 /// 160-bucket index that's ~1.3 KB/read, allocated whether or not the
 /// bucket is ever hit. Sparse is a per-read `HashMap<u32, (u32,u32)>`
-/// holding only buckets actually seen, estimated at ~4 buckets/read on
-/// average.
+/// holding only buckets actually seen, estimated at
+/// `ESTIMATED_BUCKETS_PER_READ` buckets/read on average (capped at
+/// `max_bucket_id + 1`, since a read can't hit more distinct buckets than
+/// exist).
 ///
 /// Returns `None` on arithmetic overflow (only reachable with a pathological
-/// `num_buckets` near `usize::MAX`).
-pub fn estimate_accumulator_bytes_per_read(num_buckets: usize) -> Option<usize> {
-    if num_buckets > 0 && num_buckets <= DENSE_ACCUMULATOR_MAX_BUCKETS {
-        num_buckets.checked_add(1)?.checked_mul(8)
+/// `max_bucket_id` near `usize::MAX`).
+pub fn estimate_accumulator_bytes_per_read(max_bucket_id: usize) -> Option<usize> {
+    if max_bucket_id > 0 && max_bucket_id <= DENSE_ACCUMULATOR_MAX_BUCKETS {
+        max_bucket_id.checked_add(1)?.checked_mul(8)
     } else {
-        4.min(num_buckets).checked_mul(24) // HashMap entry overhead
+        crate::constants::ESTIMATED_BUCKETS_PER_READ
+            .min(max_bucket_id.saturating_add(1))
+            .checked_mul(24) // HashMap entry overhead
     }
 }
 
@@ -996,6 +1006,15 @@ pub fn fold_reduce_accumulator_fanout(num_threads: usize) -> usize {
 /// `fold_reduce_accumulator_fanout`.
 pub fn fold_reduce_max_reads() -> usize {
     crate::constants::FOLD_REDUCE_MAX_READS
+}
+
+/// The `ESTIMATED_BUCKETS_PER_READ` constant (see its doc in
+/// `constants.rs`), exposed for callers outside the library crate (e.g. the
+/// CLI's `--wide` per-read reservation, which needs the same average this
+/// module's own sparse-accumulator branch already assumes rather than a
+/// worst case of every read hitting every bucket).
+pub fn estimated_buckets_per_read() -> usize {
+    crate::constants::ESTIMATED_BUCKETS_PER_READ
 }
 
 /// Estimate what's actually resident during input reading on the
@@ -1083,10 +1102,14 @@ pub fn estimate_batch_memory(
     // - Sparse (more buckets than that): per-read HashMap<u32, (u32, u32)>,
     //   holding only buckets actually hit, ~4 per read on average.
     //
-    // `num_buckets` is a count while the dense stride is max_bucket_id + 1.
-    // These agree for contiguously numbered buckets, which is what the index
-    // builders produce; an index with sparse bucket ids uses more than this.
-    let accumulators = batch_size.checked_mul(estimate_accumulator_bytes_per_read(num_buckets)?)?;
+    // `num_buckets` is a count, but `estimate_accumulator_bytes_per_read`
+    // takes `max_bucket_id`; convert via `num_buckets - 1`, i.e. treat the
+    // buckets as if contiguously numbered `0..num_buckets`. This agrees with
+    // the real dense stride for contiguously numbered buckets, which is what
+    // the index builders produce; an index with sparse bucket ids uses more
+    // than this estimate.
+    let accumulators = batch_size
+        .checked_mul(estimate_accumulator_bytes_per_read(num_buckets.saturating_sub(1))?)?;
 
     // Sum components with overflow checking
     let mut base_estimate = input_records
@@ -1399,39 +1422,58 @@ pub fn format_bytes(bytes: u64) -> String {
 mod tests {
     use super::*;
 
-    /// Regression: `estimate_accumulator_bytes_per_read` must give different
-    /// answers for a bucket *count* vs. `max_bucket_id + 1` on a
-    /// non-contiguous bucket-id index, pinning the exact scenario callers
-    /// binding to `classify::sharded::use_dense_accumulator` must avoid.
-    ///
-    /// Bucket ids `1..=250` plus a stray `5000`: count is 251 (looks dense,
-    /// <= DENSE_ACCUMULATOR_MAX_BUCKETS), but the real dense stride
-    /// `use_dense_accumulator` would pick is keyed on max_bucket_id + 1 =
-    /// 5001 (sparse). A caller passing the count instead of max_id + 1 (as
-    /// `commands/classify.rs` used to) would under-estimate the per-read
-    /// accumulator cost by roughly the sparse/dense cost ratio, letting
-    /// `QueryAccumulator::should_flush()` admit a pass whose real
-    /// `HitAccumulator` allocation doesn't match this estimate at all.
+    /// Regression: `estimate_accumulator_bytes_per_read` must pick the same
+    /// side of the dense/sparse boundary as
+    /// `classify::sharded::use_dense_accumulator` at every point around
+    /// `DENSE_ACCUMULATOR_MAX_BUCKETS`, including exactly at it — the case
+    /// a prior signature (taking a caller-adjusted count) got wrong: at
+    /// `max_bucket_id == DENSE_ACCUMULATOR_MAX_BUCKETS` (256),
+    /// `use_dense_accumulator` picks dense (stride 257, 2,056 B/read) but
+    /// the old count-based estimator, given the caller's `max_id + 1` = 257,
+    /// took the sparse branch (96 B/read) — a 21x under-estimate landing
+    /// exactly at the boundary this test pins.
     #[test]
-    fn test_accumulator_bytes_per_read_diverges_on_non_contiguous_bucket_ids() {
-        let bucket_count = 251usize; // 250 contiguous ids + one stray id
-        let max_bucket_id_plus_one = 5001usize; // real dense/sparse threshold input
+    fn test_accumulator_bytes_per_read_matches_use_dense_accumulator_threshold() {
+        // Mirrors classify::sharded::use_dense_accumulator's predicate
+        // directly, so this test would catch either function drifting from
+        // the other independent of this module's own implementation.
+        fn real_use_dense_accumulator(max_bucket_id: usize) -> bool {
+            max_bucket_id > 0 && max_bucket_id <= DENSE_ACCUMULATOR_MAX_BUCKETS
+        }
 
-        let by_count = estimate_accumulator_bytes_per_read(bucket_count).unwrap();
-        let by_max_id = estimate_accumulator_bytes_per_read(max_bucket_id_plus_one).unwrap();
+        for max_bucket_id in [
+            0,
+            1,
+            DENSE_ACCUMULATOR_MAX_BUCKETS - 1,
+            DENSE_ACCUMULATOR_MAX_BUCKETS,
+            DENSE_ACCUMULATOR_MAX_BUCKETS + 1,
+        ] {
+            let cost = estimate_accumulator_bytes_per_read(max_bucket_id).unwrap();
+            let expect_dense = real_use_dense_accumulator(max_bucket_id);
+            let is_dense_cost = cost == (max_bucket_id + 1) * 8;
 
-        assert!(
-            bucket_count <= DENSE_ACCUMULATOR_MAX_BUCKETS,
-            "test setup: count should fall in the dense range"
-        );
-        assert!(
-            max_bucket_id_plus_one > DENSE_ACCUMULATOR_MAX_BUCKETS,
-            "test setup: max_bucket_id + 1 should fall in the sparse range"
-        );
-        assert_ne!(
-            by_count, by_max_id,
-            "count-based and max-id-based estimates must diverge for non-contiguous \
-             bucket ids — a caller using the wrong one silently mis-sizes the budget"
+            assert_eq!(
+                is_dense_cost, expect_dense,
+                "max_bucket_id={max_bucket_id}: estimator picked {} but \
+                 use_dense_accumulator picks {} (cost was {cost} bytes/read)",
+                if is_dense_cost { "dense" } else { "sparse" },
+                if expect_dense { "dense" } else { "sparse" },
+            );
+        }
+    }
+
+    /// The real `DenseAccumulator::new` stride is `max_bucket_id + 1`
+    /// exactly — this pins that the estimate doesn't reserve one slot more
+    /// (as a prior version did, from a caller-side `+ 1` adjustment leaking
+    /// into what was, even then, already a `+ 1` inside this function).
+    #[test]
+    fn test_accumulator_bytes_per_read_dense_stride_matches_dense_accumulator() {
+        let max_bucket_id = 97usize;
+        let cost = estimate_accumulator_bytes_per_read(max_bucket_id).unwrap();
+        assert_eq!(
+            cost,
+            (max_bucket_id + 1) * 8,
+            "dense cost must equal DenseAccumulator's real stride (max_bucket_id + 1) * 8"
         );
     }
 
@@ -1613,9 +1655,14 @@ mod tests {
         );
 
         // Above the dense threshold the sparse model applies and the per-read
-        // cost stops growing with bucket count.
+        // cost stops growing with bucket count. `estimate_batch_memory`
+        // converts its `num_buckets` count to `max_bucket_id` via `- 1`
+        // (contiguous `0..num_buckets` ids), so `num_buckets` up to
+        // `DENSE_ACCUMULATOR_MAX_BUCKETS + 1` (max_bucket_id up to
+        // DENSE_ACCUMULATOR_MAX_BUCKETS) is still dense; the first
+        // definitely-sparse count is one more than that.
         let sparse_a =
-            estimate_batch_memory(batch, &profile, DENSE_ACCUMULATOR_MAX_BUCKETS + 1, false)
+            estimate_batch_memory(batch, &profile, DENSE_ACCUMULATOR_MAX_BUCKETS + 2, false)
                 .unwrap();
         let sparse_b = estimate_batch_memory(batch, &profile, 100_000, false).unwrap();
         assert_eq!(

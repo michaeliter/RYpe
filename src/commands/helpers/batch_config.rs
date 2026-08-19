@@ -119,6 +119,29 @@ fn determine_input_format(config: &BatchSizeConfig, is_paired: bool) -> InputFor
 /// accumulator allocation — it trades some of that protection for
 /// guaranteeing this term alone can never zero out the budget for every
 /// other workload.
+/// Floor `uncapped_budget` at `mem_limit / 8` (the same fraction used to cap
+/// `fold_reduce_budget_reserve`, chosen for consistency rather than
+/// independent tuning). Logs a warning when the floor binds, since a
+/// silently-floored budget is otherwise indistinguishable in the logs from
+/// a run that fit comfortably — see the caller for why zero is reachable
+/// and what it does to `should_flush()`.
+fn floor_classify_byte_budget(uncapped_budget: usize, mem_limit: usize) -> usize {
+    let budget_floor = mem_limit / 8;
+    if uncapped_budget < budget_floor {
+        log::warn!(
+            "Classification pass budget computed to {} (of {} max-memory), which is \
+             below the {} floor — flooring it. Peak memory for this run may exceed \
+             --max-memory; consider raising --max-memory for this index.",
+            format_bytes(uncapped_budget as u64),
+            format_bytes(mem_limit as u64),
+            format_bytes(budget_floor as u64),
+        );
+        budget_floor
+    } else {
+        uncapped_budget
+    }
+}
+
 fn fold_reduce_budget_reserve(
     mem_limit: usize,
     single_accumulator_bytes_per_read: usize,
@@ -272,7 +295,7 @@ pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSiz
 
     let max_bucket_id = metadata.bucket_names.keys().max().copied().unwrap_or(0);
     let single_accumulator_bytes_per_read =
-        rype::memory::estimate_accumulator_bytes_per_read(max_bucket_id as usize + 1).unwrap_or(0);
+        rype::memory::estimate_accumulator_bytes_per_read(max_bucket_id as usize).unwrap_or(0);
     let fold_reduce_reserve = fold_reduce_budget_reserve(
         mem_limit,
         single_accumulator_bytes_per_read,
@@ -281,18 +304,40 @@ pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSiz
 
     // Classification-pass budget: what's left of max_memory after everything
     // else concurrently resident during a pass — the shard reservation
-    // (index residency during a shard scan), the safety margin, the
-    // reference index itself, one input batch's worth of raw records, and
-    // the parallel-merge-join fan-out reserve above — available for the
-    // QueryAccumulator's flat COO entries. This is independent of
-    // `batch_size`, which now only bounds input-batch (sequence-byte)
-    // residency ahead of extraction.
-    let classify_byte_budget = mem_limit
+    // (index residency during a shard scan), the safety margin, one input
+    // batch's worth of raw records, and the parallel-merge-join fan-out
+    // reserve above — available for the QueryAccumulator's flat COO entries.
+    // This is independent of `batch_size`, which now only bounds input-batch
+    // (sequence-byte) residency ahead of extraction.
+    //
+    // Deliberately does NOT subtract `estimated_index_mem`: for a sharded
+    // index the full index is never resident at once — shards stream one at
+    // a time, which `shard_reservation` above already covers. Subtracting
+    // total index size would double-count the part that's resident and
+    // count a great deal that never is. (It was also a no-op in practice —
+    // `load_index_metadata` returns an empty `bucket_minimizer_counts` for
+    // every `.ryxdi`, the only format this path accepts — so removing it
+    // changes nothing about what real runs computed.) If a real index-
+    // residency cost is identified later, it needs its own accounting, not
+    // a revival of this term.
+    let uncapped_budget = mem_limit
         .saturating_sub(shard_reservation)
         .saturating_sub(safety_margin_bytes(mem_limit))
-        .saturating_sub(estimated_index_mem)
         .saturating_sub(input_batch_residency)
         .saturating_sub(fold_reduce_reserve);
+
+    // Floor: the five reservations above are each individually bounded, but
+    // nothing bounds their sum, and for a large sharded index at a modest
+    // `--max-memory` (e.g. this crate's own n97-w50 fixture at 2-4G) they
+    // can consume the entire budget, driving it to exactly 0. At 0,
+    // `should_flush()` is true against an *empty* accumulator, so every
+    // input batch becomes its own classification pass — this is Finding 1's
+    // flush-degeneration failure mode reached by a different route. Floor
+    // at mem_limit/8 (the same fraction already used to cap
+    // `fold_reduce_budget_reserve`) so a pass always has room to hold a
+    // meaningful number of reads; this may mean actual peak RSS exceeds
+    // `--max-memory` on undersized budgets, which is why it's logged.
+    let classify_byte_budget = floor_classify_byte_budget(uncapped_budget, mem_limit);
 
     Ok(BatchSizeResult {
         batch_size: batch_config.batch_size,
@@ -465,6 +510,87 @@ num_entries = 3
             "reserve should be capped at mem_limit/8 when the uncapped figure would exceed it"
         );
         assert!(reserve < mem_limit, "capped reserve must leave room for everything else");
+    }
+
+    /// Direct check on the floor helper: below the floor, clamps up to it;
+    /// at or above, passes through unchanged.
+    #[test]
+    fn test_floor_classify_byte_budget_clamps_below_floor() {
+        let mem_limit = 4 * 1024 * 1024 * 1024; // 4GB -> floor = 512MB
+        assert_eq!(floor_classify_byte_budget(0, mem_limit), mem_limit / 8);
+        assert_eq!(
+            floor_classify_byte_budget(mem_limit / 8 - 1, mem_limit),
+            mem_limit / 8
+        );
+        assert_eq!(
+            floor_classify_byte_budget(mem_limit / 8, mem_limit),
+            mem_limit / 8,
+            "exactly at the floor should pass through, not be treated as below it"
+        );
+        assert_eq!(
+            floor_classify_byte_budget(mem_limit, mem_limit),
+            mem_limit,
+            "well above the floor should pass through unchanged"
+        );
+    }
+
+    /// Reproduces the re-review's reported collapse: `classify_byte_budget`
+    /// reaching exactly 0 for realistic `(max_memory, largest_shard_entries)`
+    /// combinations, including this crate's own `n97-w50` fixture at
+    /// `--max-memory` values CLAUDE.md itself uses as a worked example.
+    /// Exercises the real budget-arithmetic functions directly (as the
+    /// review did) rather than driving a multi-gigabyte synthetic index
+    /// through `compute_effective_batch_size`. `input_batch_residency` is
+    /// omitted, matching the review's own reproduction — including it only
+    /// shrinks the uncapped budget further, so this is the conservative
+    /// (largest-uncapped-budget) case for each row.
+    ///
+    /// Before the fix (no floor on `classify_byte_budget`'s sum), several of
+    /// these rows compute to exactly 0.
+    #[test]
+    fn test_classify_byte_budget_floor_holds_across_reported_collapse_scenarios() {
+        let num_threads = 12;
+        // (max_memory, largest_shard_entries, max_bucket_id) — the three
+        // combinations the review reported, using this PR's own n97-w50
+        // shape (97 buckets) as the bucket count for all rows.
+        let scenarios: &[(usize, u64, u32)] = &[
+            (2 * 1024 * 1024 * 1024, 989_000_000, 97),
+            (3 * 1024 * 1024 * 1024, 989_000_000, 97),
+            (4 * 1024 * 1024 * 1024, 989_000_000, 97),
+            (8 * 1024 * 1024 * 1024, 989_000_000, 97),
+            (4 * 1024 * 1024 * 1024, 1_500_000_000, 97),
+            (8 * 1024 * 1024 * 1024, 2_500_000_000, 97),
+        ];
+
+        for &(mem_limit, largest_shard_entries, max_bucket_id) in scenarios {
+            let shard_reservation = estimate_shard_reservation(largest_shard_entries, num_threads);
+            let single_accumulator_bytes_per_read =
+                rype::memory::estimate_accumulator_bytes_per_read(max_bucket_id as usize)
+                    .unwrap_or(0);
+            let fold_reduce_reserve = fold_reduce_budget_reserve(
+                mem_limit,
+                single_accumulator_bytes_per_read,
+                num_threads,
+            );
+            let uncapped_budget = mem_limit
+                .saturating_sub(shard_reservation)
+                .saturating_sub(safety_margin_bytes(mem_limit))
+                .saturating_sub(fold_reduce_reserve);
+            let budget = floor_classify_byte_budget(uncapped_budget, mem_limit);
+
+            assert!(
+                budget >= mem_limit / 8,
+                "max_memory={mem_limit}, largest_shard_entries={largest_shard_entries}: \
+                 budget {budget} fell below the mem_limit/8 floor (uncapped was \
+                 {uncapped_budget})"
+            );
+            assert!(
+                budget > 0,
+                "max_memory={mem_limit}, largest_shard_entries={largest_shard_entries}: \
+                 budget must never be 0 — that reintroduces Finding 1's one-scan-per-batch \
+                 failure via an empty accumulator"
+            );
+        }
     }
 
     #[test]

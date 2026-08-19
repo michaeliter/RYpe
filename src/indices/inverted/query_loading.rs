@@ -520,6 +520,40 @@ fn load_filtered_coo_pairs(
             // since the whole chunk is one continuous sorted range.
             let mut qi = 0usize;
 
+            // Guards the invariant the two-pointer merge below depends on:
+            // each row group's minimizer column is ascending, AND row groups
+            // within a chunk concatenate into one ascending stream (both
+            // established at write time — `ShardAccumulator::flush_shard`
+            // sorts before writing, `stream_to_parquet_shards` k-way-merges).
+            // This is why a boundary-only check (comparing only each chunk's
+            // first/last pair, as the check below this closure does) is
+            // insufficient: the two-pointer only ever pushes on `qv == rv`
+            // with `qi` advancing monotonically, so its *output* is sorted
+            // by construction regardless of whether the input was — an
+            // interior violation doesn't produce unsorted output for that
+            // check to catch, it silently drops the matches that fell
+            // behind `qi`.
+            //
+            // Checking only *batch* edges (previous batch's last value vs.
+            // this batch's first) is ALSO insufficient, despite looking like
+            // an O(num_batches) version of the same idea: `with_row_groups`
+            // does not guarantee a batch never spans two row groups —
+            // verified directly (see the regression test below): row groups
+            // smaller than the reader's internal batch size get coalesced
+            // into one shared Arrow batch, so a violation between two row
+            // groups can land *inside* a single batch's own `mins` array,
+            // not at its edge. So this checks each batch's own values for
+            // monotonicity too, not just against the previous batch.
+            //
+            // This is O(total rows read), not O(num_batches) — the same
+            // order as the single-threaded `all_pairs.windows(2)` scan this
+            // function replaced overall, but done here per-chunk, inline
+            // with decode, inside the already-parallel `par_iter` this
+            // closure runs under (the same rows the two-pointer below
+            // already touches), rather than as a second single-threaded
+            // pass over the whole concatenated result.
+            let mut prev_batch_last_min: Option<u64> = None;
+
             loop {
                 if qi >= bounded.len() {
                     break;
@@ -553,6 +587,35 @@ fn load_filtered_coo_pairs(
 
                 let mins: &[u64] = min_col.values();
                 let bids: &[u32] = bid_col.values();
+
+                if let (Some(&first_min), Some(prev_last)) = (mins.first(), prev_batch_last_min) {
+                    if prev_last > first_min {
+                        return Err(RypeError::format(
+                            &path,
+                            format!(
+                                "non-monotonic minimizer column within a row-group chunk: \
+                                 batch starting at {first_min} follows a batch ending at \
+                                 {prev_last} (row groups {:?})",
+                                chunk.iter().map(|&(idx, _, _)| idx).collect::<Vec<_>>(),
+                            ),
+                        ));
+                    }
+                }
+                if let Some(pos) = mins.windows(2).position(|w| w[0] > w[1]) {
+                    return Err(RypeError::format(
+                        &path,
+                        format!(
+                            "non-monotonic minimizer column within a row-group chunk: \
+                             {} follows {} within one batch (row groups {:?})",
+                            mins[pos + 1],
+                            mins[pos],
+                            chunk.iter().map(|&(idx, _, _)| idx).collect::<Vec<_>>(),
+                        ),
+                    ));
+                }
+                if let Some(&last_min) = mins.last() {
+                    prev_batch_last_min = Some(last_min);
+                }
 
                 let t_filter = Instant::now();
                 let mut ri = 0usize;
@@ -598,21 +661,32 @@ fn load_filtered_coo_pairs(
         .sum();
     let mut all_pairs: Vec<(u64, u32)> = Vec::with_capacity(total_len);
 
-    // Each chunk's own pairs are already sorted internally (built by a
-    // single sorted two-pointer pass per chunk, above); the only place
-    // concatenation could introduce a break is at a chunk boundary. Checking
-    // just those boundaries is O(num_chunks), not O(total_len), so it's
-    // cheap enough to run unconditionally in release builds — unlike the
-    // full `all_pairs.windows(2)` scan this replaces, which is exactly the
-    // per-entry cost the batching in this function exists to avoid.
+    // Each chunk's own `pairs` come out ascending by construction — not
+    // because its input was valid, but because the two-pointer above only
+    // pushes on `qv == rv` with `qi` advancing monotonically across the
+    // whole chunk, so the output can never regress regardless of what the
+    // underlying row groups actually contained. That's why this boundary
+    // check exists *alongside* the per-batch check inside the chunk closure
+    // above, not instead of it: an interior (within-chunk) ordering
+    // violation doesn't produce unsorted `pairs` for a boundary check to
+    // catch here — it silently drops the matches that `qi` had already
+    // advanced past, which the per-batch check catches at the point of
+    // decode instead. This check covers only the boundary *between* chunks,
+    // which the per-batch check (scoped to one chunk's own reader) cannot
+    // see. Checking just those boundaries is O(num_chunks), not
+    // O(total_len), so it's cheap enough to run unconditionally in release
+    // builds — unlike the full `all_pairs.windows(2)` scan this replaces,
+    // which is exactly the per-entry cost the batching in this function
+    // exists to avoid.
     //
-    // This guards a real invariant, not a hypothetical one: it holds for
-    // every shard this repo's writers produce (`ShardAccumulator::flush_shard`
-    // sorts before writing, `stream_to_parquet_shards` k-way-merges), but an
-    // externally produced or future `.ryxdi` that violates it would
-    // otherwise corrupt every downstream binary_search/partition_point/
-    // gallop_for_each silently, with no error and no way to detect it from
-    // the output — so violations are a hard error, not a debug-only assert.
+    // Both checks guard a real invariant, not a hypothetical one: it holds
+    // for every shard this repo's writers produce
+    // (`ShardAccumulator::flush_shard` sorts before writing,
+    // `stream_to_parquet_shards` k-way-merges), but an externally produced
+    // or future `.ryxdi` that violates it would otherwise corrupt every
+    // downstream binary_search/partition_point/gallop_for_each silently,
+    // with no error and no way to detect it from the output — so violations
+    // are a hard error, not a debug-only assert.
     let mut prev_chunk_last_min: Option<u64> = None;
     for (chunk_idx, result) in chunk_results.into_iter().enumerate() {
         let pairs = result.map_err(|e| {
@@ -1190,6 +1264,92 @@ mod tests {
         assert!(
             result.is_err(),
             "non-monotonic row-group concatenation must be rejected, not silently accepted"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("non-monotonic") || err_msg.contains("sorted"),
+            "error should describe the sortedness violation: {}",
+            err_msg
+        );
+
+        Ok(())
+    }
+
+    /// Reproduces the re-review's Finding C: the chunk-boundary check above
+    /// can only see a violation *between* chunks, because the two-pointer
+    /// merge's output is sorted by construction (it only pushes on
+    /// `qv == rv` with `qi` advancing monotonically) regardless of whether
+    /// its input was — an ordering violation *interior* to a chunk (between
+    /// two row groups that land in the same chunk) doesn't produce unsorted
+    /// output for the boundary check to catch; it silently drops the
+    /// matches `qi` had already advanced past.
+    ///
+    /// The prior version of this test (2 row groups) passed only because
+    /// `num_chunks = min(num_threads * 8, matching_row_groups.len())` made
+    /// `chunk_size == 1` at that size, so the violation always landed
+    /// exactly on a chunk boundary — the case that check *does* cover, not
+    /// the interior case it doesn't. This test sizes the row-group count
+    /// from the live thread count so the first chunk always contains at
+    /// least 3 row groups (`chunk_size >= 3`) regardless of machine core
+    /// count, and swaps the first two row groups' values so the violation
+    /// is interior to that chunk.
+    #[test]
+    fn test_load_filtered_coo_pairs_rejects_non_monotonic_row_groups_interior_to_a_chunk(
+    ) -> Result<()> {
+        use arrow::array::{ArrayRef, UInt32Array, UInt64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        use std::sync::Arc;
+
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("adversarial_interior.parquet");
+
+        // `num_chunks = min(num_threads * 8, num_row_groups)`. Sizing
+        // `num_row_groups` to exactly `num_threads * 8 * 3` makes
+        // `chunk_size == 3` regardless of the live thread count, so the
+        // first chunk always spans row groups 0, 1, and 2.
+        let num_threads = rayon::current_num_threads().max(1);
+        let num_row_groups = num_threads * 8 * 3;
+
+        // Row group i holds one minimizer, i * 1000 — globally ascending by
+        // row-group index — except row groups 0 and 1 are swapped (1000,
+        // then 0), which is interior to the first chunk (row groups 0..3)
+        // rather than at a chunk boundary.
+        let mut mins: Vec<u64> = (0..num_row_groups as u64).map(|i| i * 1000).collect();
+        mins.swap(0, 1);
+        let bucket_ids: Vec<u32> = vec![1u32; mins.len()];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("minimizer", DataType::UInt64, false),
+            Field::new("bucket_id", DataType::UInt32, false),
+        ]));
+        // One row per row group, so each element of `mins` becomes its own
+        // row group in file order.
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1))
+            .build();
+        let file = std::fs::File::create(&path)?;
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
+        let min_array: ArrayRef = Arc::new(UInt64Array::from(mins.clone()));
+        let bid_array: ArrayRef = Arc::new(UInt32Array::from(bucket_ids));
+        let batch = RecordBatch::try_new(schema, vec![min_array, bid_array])?;
+        writer.write(&batch)?;
+        writer.close()?;
+
+        // Query every real value so every row group's [min, max] (a single
+        // value each) overlaps the query set and gets selected as matching.
+        let mut query_minimizers = mins.clone();
+        query_minimizers.sort_unstable();
+        query_minimizers.dedup();
+
+        let result = load_filtered_coo_pairs(&path, 64, &query_minimizers, None);
+
+        assert!(
+            result.is_err(),
+            "a non-monotonic pair interior to a chunk must be rejected, not silently \
+             dropped (num_row_groups={num_row_groups}, num_threads={num_threads})"
         );
         let err_msg = result.unwrap_err().to_string();
         assert!(
