@@ -49,7 +49,3 @@ default = ["fastx"]
 fastx = ["dep:needletail"]
 arrow-ffi = ["arrow/ffi"]
 
-[profile.release]
-lto = "fat"
-codegen-units = 1
-
