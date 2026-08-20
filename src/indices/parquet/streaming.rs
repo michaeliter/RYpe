@@ -13,7 +13,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::constants::{MIN_ENTRIES_PER_PARALLEL_PARTITION, PARQUET_BATCH_SIZE};
 
@@ -28,7 +28,8 @@ use super::{files, FORMAT_MAGIC, FORMAT_VERSION};
 /// K-way merge heap entry: (Reverse((minimizer, bucket_id)), bucket_index, position)
 type MergeHeapEntry = (Reverse<(u64, u32)>, usize, usize);
 
-/// Dedicated rayon pool for the flush-buffer sort, distinct from the global pool.
+/// Build the dedicated rayon pool for a `ShardAccumulator`'s flush-buffer sort,
+/// distinct from the global pool.
 ///
 /// `flush_shard` can be driven from a consumer thread that is coupled to a producer
 /// `par_iter` running on the GLOBAL rayon pool by a bounded channel (the CLI
@@ -37,15 +38,20 @@ type MergeHeapEntry = (Reverse<(u64, u32)>, usize, usize);
 /// full channel, and the consumer's `par_sort_unstable` waits for a worker that never
 /// frees. Running the sort on a separate pool cannot be starved by the producer, so the
 /// consumer always drains the channel and the producer makes progress — while keeping
-/// the parallel sort. Built once, on first flush.
-fn flush_sort_pool() -> &'static rayon::ThreadPool {
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .thread_name(|i| format!("rype-flush-sort-{i}"))
-            .build()
-            .expect("failed to build flush-sort thread pool")
-    })
+/// the parallel sort.
+///
+/// Built per-accumulator (see [`ShardAccumulator::sort_pool`]), not as a process-lifetime
+/// static: a build with many buckets creates and drops one `ShardAccumulator` per bucket,
+/// and a pool's per-thread work-stealing deques grow (via amortized doubling) but never
+/// shrink. A static pool shared across every bucket for the whole run's lifetime measured
+/// several hundred MB of retained memory across a few dozen small flushes; scoping the
+/// pool to the accumulator bounds that growth to one bucket's worth of flushes, and frees
+/// it when the bucket's build finishes.
+fn build_flush_sort_pool() -> rayon::ThreadPool {
+    rayon::ThreadPoolBuilder::new()
+        .thread_name(|i| format!("rype-flush-sort-{i}"))
+        .build()
+        .expect("failed to build flush-sort thread pool")
 }
 
 /// Create a Parquet inverted index directly from bucket data.
@@ -652,6 +658,9 @@ pub struct ShardAccumulator {
     seen_frozen: bool,
     /// Count of entries dropped by the `seen` filter at flush (diagnostics).
     filtered_count: u64,
+    /// Dedicated sort pool for large flushes, built lazily on first use (see
+    /// [`build_flush_sort_pool`]) and dropped with this accumulator.
+    sort_pool: Option<rayon::ThreadPool>,
 }
 
 /// Minimum allowed value for max_shard_bytes to prevent pathological behavior.
@@ -708,6 +717,7 @@ impl ShardAccumulator {
             seen_budget_entries: 0,
             seen_frozen: false,
             filtered_count: 0,
+            sort_pool: None,
         }
     }
 
@@ -743,6 +753,7 @@ impl ShardAccumulator {
             seen_budget_entries: 0,
             seen_frozen: false,
             filtered_count: 0,
+            sort_pool: None,
         }
     }
 
@@ -783,6 +794,7 @@ impl ShardAccumulator {
             seen_budget_entries: 0,
             seen_frozen: false,
             filtered_count: 0,
+            sort_pool: None,
         }
     }
 
@@ -811,9 +823,9 @@ impl ShardAccumulator {
     /// real-world gap between `--max-memory` and measured peak RSS
     /// (benchmarked at ~2.7GB actual vs. a ~256MB shard budget on real WoL2
     /// genome data, even at `effective_concurrency = 1`). The dominant cause
-    /// turned out to be [`flush_shard`](Self::flush_shard)'s unconditional use
-    /// of the parallel [`flush_sort_pool`] — see its `PARALLEL_SORT_THRESHOLD`
-    /// comment.
+    /// turned out to be [`flush_shard`](Self::flush_shard)'s prior
+    /// unconditional use of a process-lifetime parallel sort pool — see the
+    /// `sort_pool` field and [`build_flush_sort_pool`].
     pub fn current_size_bytes(&self) -> usize {
         self.entries.len() * Self::BYTES_PER_ENTRY
     }
@@ -936,23 +948,23 @@ impl ShardAccumulator {
         // buffer holds up to ~max_shard_bytes/16 entries (≈1B at a 30 GiB build), and
         // the sort runs on the serial flush path between parallel extraction bursts, so
         // it is one of the build's larger single-threaded costs for a genuinely large
-        // flush. par_sort_unstable parallelizes that case on a dedicated pool
-        // ([`flush_sort_pool`]) rather than the global one, to avoid deadlocking against
-        // a concurrent global-pool producer in the CLI streaming build.
+        // flush. par_sort_unstable parallelizes that case on a dedicated pool (see
+        // [`build_flush_sort_pool`]) rather than the global one, to avoid deadlocking
+        // against a concurrent global-pool producer in the CLI streaming build.
         //
-        // Below `PARALLEL_SORT_THRESHOLD`, sort sequentially instead: a many-small-buckets
-        // build (e.g. thousands of buckets each flushing a few million entries) calls
-        // flush_shard once per bucket, and `flush_sort_pool`'s worker threads are a
-        // process-lifetime static whose work-stealing deques grow (and never shrink)
-        // across repeated use — measured to add several hundred MB of resident memory
-        // over a few dozen small flushes. A plain sequential sort touches no rayon pool
-        // at all, so it carries none of that cost and sidesteps the deadlock risk
-        // entirely (nothing to deadlock against). The ordering — and therefore the
-        // subsequent dedup — is identical either way.
-        const PARALLEL_SORT_THRESHOLD: usize = 10_000_000;
-        if self.entries.len() >= PARALLEL_SORT_THRESHOLD {
+        // Same crossover rule as `stream_to_shards`'s `use_parallel` check: below
+        // MIN_ENTRIES_PER_PARALLEL_PARTITION per core, there isn't enough work to
+        // justify going parallel at all, so sort sequentially and skip the pool
+        // entirely — it is never built for buckets that never cross this line (the
+        // common case for a many-small-buckets build), and the ordering — and
+        // therefore the subsequent dedup — is identical either way.
+        let num_cpus = rayon::current_num_threads();
+        let use_parallel_sort =
+            self.entries.len() > MIN_ENTRIES_PER_PARALLEL_PARTITION * num_cpus && num_cpus > 1;
+        if use_parallel_sort {
+            let pool = self.sort_pool.get_or_insert_with(build_flush_sort_pool);
             let entries = &mut self.entries;
-            flush_sort_pool().install(move || entries.par_sort_unstable());
+            pool.install(move || entries.par_sort_unstable());
         } else {
             self.entries.sort_unstable();
         }
