@@ -6209,3 +6209,256 @@ files = [{}]
 
     Ok(())
 }
+
+/// Regression: a run that needs N>1 classification passes must actually
+/// perform N index scans, not collapse to one scan per input batch.
+///
+/// This is the failure mode of the `QueryAccumulator` flush-degeneration
+/// bug: `approx_bytes()`/`projected_pass_bytes()` measured buffer
+/// *capacity*, and `drain()` re-reserved that same capacity, so
+/// `should_flush()` came back true against an empty, just-drained
+/// accumulator. Every pass after the first then collapsed to exactly one
+/// input batch's worth of reads — silently reintroducing the
+/// one-scan-per-input-batch behavior issue #21 exists to eliminate, for
+/// every multi-pass, byte-budget-driven run.
+///
+/// This is deliberately a *library*-level test, not a CLI subprocess test:
+/// the CLI's `--batch-size` sets `classify_byte_budget` to `usize::MAX` and
+/// drives flushing purely off `max_reads` (see `batch_config.rs`), which
+/// never touches `approx_bytes()` and so cannot exercise this bug at all —
+/// an earlier version of this test used `--batch-size` and passed
+/// unconditionally regardless of the bug's presence, which is worse than no
+/// test. Driving `QueryAccumulator` directly with an explicit small
+/// `byte_budget` reproduces the reviewer's actual failure scenario (a small
+/// `--max-memory` forcing multiple passes) with an exact, deterministic
+/// expected pass count, instead of depending on the CLI's memory-auto-sizing
+/// model.
+#[test]
+fn test_multi_pass_byte_budget_run_yields_expected_pass_count() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let index_path = dir.path().join("test.ryxdi");
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let sharded = rype::ShardedInvertedIndex::open(&index_path)?;
+    let manifest = sharded.manifest();
+    let (k, w, salt) = (manifest.k, manifest.w, manifest.salt);
+
+    // Six identical 5-read batches, simulating six input batches arriving
+    // over the course of a run. Content is irrelevant beyond being long
+    // enough (> k) to produce minimizers; identical sequences make every
+    // batch's accumulated byte size identical.
+    //
+    // The budget is sized to roughly *three* batches, so multiple passes
+    // occur (not one big pass, and not one pass per batch). This can't
+    // pin an *exact* pass count once `approx_bytes()` is capacity-based
+    // (see `QueryAccumulator::approx_bytes`'s doc): `Vec`'s amortized
+    // doubling growth means the capacity plateau covering N batches can be
+    // reached anywhere from batch N-1 onward depending on where a
+    // reallocation happens to land — a real, measured effect, not test
+    // flakiness (an isolated probe measuring "exactly 3 batches" of
+    // capacity in one accumulator can differ from where a live,
+    // checked-after-every-batch accumulator actually crosses that same
+    // capacity plateau). So this test asserts the two things that actually
+    // matter and are robust to that:
+    //
+    // 1. should_flush() is never true immediately after a drain with
+    //    nothing pushed since — the literal flush-degeneration bug
+    //    (stale post-drain capacity/state making should_flush() true
+    //    against an empty accumulator, collapsing every later pass to
+    //    whatever the next single input batch happens to be).
+    // 2. The run doesn't degenerate to one pass per input batch (pass_count
+    //    stays well below NUM_BATCHES) — the observable symptom of that bug
+    //    reintroducing issue #21.
+    const READS_PER_BATCH: usize = 5;
+    const BATCHES_PER_PASS: usize = 3;
+    const NUM_BATCHES: usize = 6;
+    let seq: Vec<u8> = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT"
+        .to_vec();
+    let make_batch = |start_id: i64| -> Vec<rype::QueryRecord<'static>> {
+        // Leak so the &[u8] borrows are 'static — fine for a short-lived test.
+        (0..READS_PER_BATCH)
+            .map(|i| {
+                let leaked: &'static [u8] = Box::leak(seq.clone().into_boxed_slice());
+                (start_id + i as i64, leaked, None)
+            })
+            .collect()
+    };
+
+    // Measure three batches' accumulated byte size in isolation, then set
+    // the real accumulator's budget to exactly that.
+    let mut probe_acc: rype::QueryAccumulator<i64> = rype::QueryAccumulator::with_budget(usize::MAX);
+    for batch_idx in 0..BATCHES_PER_PASS {
+        let start_id = (batch_idx * READS_PER_BATCH) as i64;
+        let batch = make_batch(start_id);
+        let ids: Vec<i64> = (start_id..start_id + READS_PER_BATCH as i64).collect();
+        let extracted = rype::extract_batch_minimizers(k, w, salt, None, &batch);
+        probe_acc.extend_extracted(ids, extracted);
+    }
+    let three_batch_bytes = probe_acc.approx_bytes();
+    assert!(three_batch_bytes > 0, "test setup: batches should produce nonzero entries");
+
+    let mut acc: rype::QueryAccumulator<i64> = rype::QueryAccumulator::with_budget(three_batch_bytes);
+    let mut pass_count = 0usize;
+    let mut total_reads_classified = 0usize;
+
+    for batch_idx in 0..NUM_BATCHES {
+        let start_id = (batch_idx * READS_PER_BATCH) as i64;
+        let batch = make_batch(start_id);
+        let ids: Vec<i64> = (start_id..start_id + READS_PER_BATCH as i64).collect();
+        let extracted = rype::extract_batch_minimizers(k, w, salt, None, &batch);
+        acc.extend_extracted(ids, extracted);
+
+        if acc.should_flush() {
+            pass_count += 1;
+            let (query_idx, drained_ids) = acc.drain();
+            total_reads_classified += drained_ids.len();
+            assert!(
+                !acc.should_flush(),
+                "should_flush() must be false immediately after drain() with nothing \
+                 pushed since — this is the flush-degeneration bug directly (batch {batch_idx})"
+            );
+            // Exercise the real shard-scan path, not just bookkeeping.
+            let _ = rype::classify_from_query_index(&sharded, &query_idx, &drained_ids, 0.0, None)?;
+        }
+    }
+    if !acc.is_empty() {
+        pass_count += 1;
+        let (query_idx, drained_ids) = acc.drain();
+        total_reads_classified += drained_ids.len();
+        let _ = rype::classify_from_query_index(&sharded, &query_idx, &drained_ids, 0.0, None)?;
+    }
+
+    assert_eq!(
+        total_reads_classified,
+        NUM_BATCHES * READS_PER_BATCH,
+        "every pushed read must be classified exactly once"
+    );
+    assert!(
+        pass_count > 1 && pass_count < NUM_BATCHES,
+        "expected multiple passes but not one pass per batch (got {pass_count} passes \
+         for {NUM_BATCHES} batches) — a budget sized to ~{BATCHES_PER_PASS} batches \
+         should group several batches per pass. pass_count == NUM_BATCHES would mean \
+         should_flush() is triggering on stale post-drain state rather than newly \
+         accumulated data (the flush-degeneration bug), collapsing every pass to a \
+         single input batch — i.e. one shard scan per input batch again, issue #21."
+    );
+
+    Ok(())
+}
+
+/// Regression: `--negative-index` runs must report a nonzero pass count.
+///
+/// `pass_num` was only incremented inside the `QueryAccumulator` flush path;
+/// the negative-index branch of `process_batch` classifies immediately per
+/// input batch (it can't use the accumulator — see the comment above
+/// `process_batch` in `commands/classify.rs`) but never touched `pass_num`.
+/// So a `--negative-index` run always logged "processed in 0 passes" despite
+/// doing one full index scan per input batch — in a PR whose stated
+/// deliverable is pass-count visibility, the one configuration that still
+/// does the most scanning is the one that claimed to do none.
+#[test]
+fn test_negative_index_run_reports_nonzero_passes() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let pos_index_path = dir.path().join("pos.ryxdi");
+    let neg_index_path = dir.path().join("neg.ryxdi");
+
+    for out in [&pos_index_path, &neg_index_path] {
+        let output = Command::new(&binary)
+            .args([
+                "index",
+                "create",
+                "-o",
+                out.to_str().unwrap(),
+                "-r",
+                phix_path.to_str().unwrap(),
+                "-k",
+                "32",
+                "-w",
+                "10",
+            ])
+            .output()?;
+        assert!(
+            output.status.success(),
+            "Index creation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        "@q0\nGAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )?;
+
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            pos_index_path.to_str().unwrap(),
+            "-N",
+            neg_index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "-t",
+            "0.0",
+            "--verbose",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Classification failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let summary_line = stderr
+        .lines()
+        .find(|l| l.contains("Classification complete"))
+        .unwrap_or_else(|| panic!("no 'Classification complete' line in stderr:\n{stderr}"));
+
+    assert!(
+        !summary_line.contains("in 0 passes"),
+        "negative-index run reported 0 passes despite scanning the index at least \
+         once per input batch: {summary_line}"
+    );
+
+    Ok(())
+}

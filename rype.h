@@ -552,6 +552,31 @@ RypeBatchConfig rype_calculate_batch_config(
     int is_large_binary);
 
 /**
+ * Estimate how many classification passes a corpus will take
+ *
+ * Each pass performs one full scan of the index's Parquet shards - dominant
+ * on large indices, where shard load can be 90%+ of wall time - so this is
+ * the primary cost driver for a classify run and worth checking before
+ * paying for it. rype_recommend_batch_size()'s documentation has always
+ * warned that a batch size too small relative to the index makes shard I/O
+ * dominate; this makes the resulting pass count visible ahead of time rather
+ * than only in --timing output after the fact.
+ *
+ * @param total_reads  Number of reads in the corpus (the caller already
+ *                      knows this, e.g. from a row count).
+ * @param batch_size   classify_batch_rows as passed to
+ *                      rype_classify_arrow_ex()/_best_hit_ex()/_log_ratio_ex(),
+ *                      or batch_size from rype_calculate_batch_config()/
+ *                      rype_recommend_batch_size() for the equivalent effect
+ *                      on the non-_ex entry points' one-pass-per-input-batch
+ *                      behavior - pass count there is total_reads divided by
+ *                      the size of each input RecordBatch, which the caller
+ *                      controls directly.
+ * @return              ceil(total_reads / batch_size), or 0 if batch_size is 0
+ */
+size_t rype_estimate_pass_count(size_t total_reads, size_t batch_size);
+
+/**
  * Get the name of a bucket by ID
  *
  * @param index      Non-NULL RypeIndex pointer
@@ -990,6 +1015,30 @@ void rype_log_ratio_results_free(RypeLogRatioResultArray* results);
  * Thread-safe (returns thread-local error).
  */
 const char* rype_get_last_error(void);
+
+/**
+ * Enable or disable [TIMING] diagnostics on stderr
+ *
+ * The classification hot path already logs per-phase timing -
+ * shard_load_total, merge_join_total, scoring, and a per-pass
+ * build_query_index/extraction breakdown - the same lines the CLI's
+ * --timing flag prints. That instrumentation runs unconditionally; only the
+ * switch to enable it was previously CLI-only. This is that switch: once
+ * enabled, C API callers (including classification driven through
+ * rype_classify_arrow()/_ex() and friends) see identical output on stderr -
+ * in particular one shard_load_total line per classification pass, which is
+ * the direct way to observe pass count during a run rather than only
+ * estimating it beforehand with rype_estimate_pass_count().
+ *
+ * @param enabled  Non-zero to enable, zero to disable
+ *
+ * ## Thread Safety
+ *
+ * Global and process-wide, not scoped to one index or stream - matches
+ * --timing's behavior in the CLI. Safe to call at any time, including
+ * concurrently with classification in progress.
+ */
+void rype_enable_timing(int enabled);
 
 // ============================================================================
 // MINIMIZER EXTRACTION API

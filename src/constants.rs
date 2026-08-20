@@ -48,15 +48,6 @@ pub(crate) const ESTIMATED_MINIMIZERS_PER_SEQUENCE: usize = 32;
 // Classification Tuning
 // ============================================================================
 
-/// Threshold for switching to HashSet-based lookup in filtered loading.
-/// Above this many query minimizers, use HashSet instead of binary search.
-pub(crate) const QUERY_HASHSET_THRESHOLD: usize = 1000;
-
-/// Threshold for using HashSet vs binary search for bounded query filtering
-/// during row group loading. When the bounded query slice exceeds this size,
-/// build a local HashSet for O(1) lookups instead of O(log n) binary search.
-pub(crate) const BOUNDED_QUERY_HASHSET_THRESHOLD: usize = 100;
-
 /// Estimated buckets per read for HashMap pre-allocation.
 pub(crate) const ESTIMATED_BUCKETS_PER_READ: usize = 4;
 
@@ -88,6 +79,36 @@ pub(crate) const COO_MERGE_JOIN_MAX_BUCKETS: usize = 10;
 /// At 10K pairs with 8 threads, each chunk gets ~1.25K pairs — enough work to
 /// amortize rayon overhead (~10μs per task) against merge-join cost (~1μs per pair).
 pub(crate) const MIN_PARALLEL_SHARD_SIZE: usize = 10_000;
+
+/// Maximum `num_reads` for using per-thread dense-accumulator fold/reduce in a
+/// parallel merge-join. Above this, per-chunk accumulators are sized
+/// `num_reads × stride × 8 bytes` each — with millions of reads, N threads'
+/// worth of full-size accumulators can reach tens of GB. Above the threshold,
+/// use sparse-hit collection (bounded by actual match count, not read count)
+/// plus a single-threaded merge instead.
+///
+/// At DENSE_ACCUMULATOR_MAX_BUCKETS=256 and 8 bytes per bucket:
+/// 256 × 8 × num_reads bytes per accumulator × num_threads.
+/// At 8 threads and 640K reads: 256 × 8 × 640K × 8 ≈ 10 GB — too much.
+/// 500K is a conservative threshold (~80% of theoretical 640K) to stay
+/// well within memory bounds across varying thread counts.
+pub(crate) const FOLD_REDUCE_MAX_READS: usize = 500_000;
+
+/// Maximum number of `(shard_path, row_group_index)` work items processed
+/// per collect+merge chunk in `classify::sharded::parallel_rg_inner`'s
+/// large-`num_reads` branch (see `FOLD_REDUCE_MAX_READS`'s doc for why that
+/// branch can't use per-thread dense accumulators instead).
+///
+/// A row group holds up to `DEFAULT_ROW_GROUP_SIZE` (100K) entries; at a
+/// generous 100% match rate that's 100K `SparseHit`s (16 bytes each) per
+/// row group. Bounding a chunk to 4096 row groups caps that chunk's
+/// `Vec<Vec<SparseHit>>` at roughly 4096 × 100K × 16B ≈ 6.4 GB worst case
+/// (far less at realistic selectivity, ~10% per the same assumption used
+/// elsewhere — see `SHARD_SELECTIVITY_ESTIMATE` in `memory.rs`), instead of
+/// scaling unboundedly with however many row groups a pass's minimizer
+/// range touches. Large enough relative to typical thread counts (tens to
+/// low hundreds) that rayon still load-balances well within a chunk.
+pub(crate) const PARALLEL_RG_COLLECT_CHUNK_SIZE: usize = 4096;
 
 // ============================================================================
 // Delimiters

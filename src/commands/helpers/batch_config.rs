@@ -9,7 +9,7 @@ use anyhow::Result;
 
 use rype::memory::{
     calculate_batch_config, detect_available_memory, estimate_shard_reservation, format_bytes,
-    InputFormat, MemoryConfig, MemorySource, ReadMemoryProfile,
+    safety_margin_bytes, InputFormat, MemoryConfig, MemorySource, ReadMemoryProfile,
 };
 
 use super::load_index_metadata;
@@ -49,6 +49,15 @@ pub struct BatchSizeResult {
     pub input_format: InputFormat,
     /// Memory reserved for shard loading (for logging)
     pub shard_reservation: usize,
+    /// Byte budget for the `QueryAccumulator` that drives classification pass
+    /// count — independent of `batch_size`, which now only bounds input
+    /// (sequence-byte) residency. `usize::MAX` when unconstrained (a caller
+    /// gave an explicit `batch_size_override`; see `classify_max_reads`).
+    pub classify_byte_budget: usize,
+    /// When set, the accumulator must also flush after this many reads,
+    /// regardless of byte budget. Set only when the caller passed an explicit
+    /// `batch_size_override`, to preserve read-count semantics for that case.
+    pub classify_max_reads: Option<usize>,
 }
 
 /// Determine the correct `InputFormat` for memory estimation.
@@ -79,6 +88,72 @@ fn determine_input_format(config: &BatchSizeConfig, is_paired: bool) -> InputFor
 /// # Arguments
 /// * `config` - Batch size configuration parameters
 ///
+/// One-time deduction from `classify_byte_budget` covering the parallel CSR
+/// merge-join's per-thread accumulator fan-out (`classify::merge_join`, up
+/// to ~2x `num_threads` full-size `HitAccumulator`s instead of one), which
+/// is only live while a pass's final read count could still land at or
+/// under `FOLD_REDUCE_MAX_READS`.
+///
+/// A one-time deduction, not a per-read multiplier: a per-read multiplier
+/// was tried first and reverted (see the note at the
+/// `QueryAccumulator::with_accumulator_cost_per_read` call site in
+/// `commands/classify.rs`) because it creates a self-reinforcing trap —
+/// scaling every read's reservation by the fan-out factor forces
+/// `should_flush()` to flush well under `FOLD_REDUCE_MAX_READS` reads,
+/// which "confirms" the pass is still in the risky zone, so the inflated
+/// rate keeps applying and the pass never gets the chance to grow past the
+/// threshold into the safe sparse-hit-collection regime it would naturally
+/// reach with a realistic per-read rate. Measured to turn a real 1-pass,
+/// ~15s run on a 97-bucket index into 12+ passes and 170s+.
+///
+/// Sized for the worst case that could ever land in the risky zone
+/// (`FOLD_REDUCE_MAX_READS` reads, each costing up to `fanout - 1` extra
+/// accumulator-sized allocations beyond the one the per-read rate already
+/// covers), capped to at most 1/8 of `mem_limit` — the uncapped figure can
+/// itself reach the multi-GB range on a many-bucket index, consuming most
+/// or all of a modest `--max-memory` budget on its own (measured: zeroed
+/// `classify_byte_budget` entirely on a 16 GB run against a 97-bucket
+/// index). This cap is deliberately not a tight bound on the real risk — a
+/// long-read/many-bucket pass small enough to hit the fold-reduce path
+/// could still, in principle, exceed 1/8 of the budget in real per-thread
+/// accumulator allocation — it trades some of that protection for
+/// guaranteeing this term alone can never zero out the budget for every
+/// other workload.
+/// Floor `uncapped_budget` at `mem_limit / 8` (the same fraction used to cap
+/// `fold_reduce_budget_reserve`, chosen for consistency rather than
+/// independent tuning). Logs a warning when the floor binds, since a
+/// silently-floored budget is otherwise indistinguishable in the logs from
+/// a run that fit comfortably — see the caller for why zero is reachable
+/// and what it does to `should_flush()`.
+fn floor_classify_byte_budget(uncapped_budget: usize, mem_limit: usize) -> usize {
+    let budget_floor = mem_limit / 8;
+    if uncapped_budget < budget_floor {
+        log::warn!(
+            "Classification pass budget computed to {} (of {} max-memory), which is \
+             below the {} floor — flooring it. Peak memory for this run may exceed \
+             --max-memory; consider raising --max-memory for this index.",
+            format_bytes(uncapped_budget as u64),
+            format_bytes(mem_limit as u64),
+            format_bytes(budget_floor as u64),
+        );
+        budget_floor
+    } else {
+        uncapped_budget
+    }
+}
+
+fn fold_reduce_budget_reserve(
+    mem_limit: usize,
+    single_accumulator_bytes_per_read: usize,
+    num_threads: usize,
+) -> usize {
+    let fanout = rype::memory::fold_reduce_accumulator_fanout(num_threads);
+    rype::memory::fold_reduce_max_reads()
+        .saturating_mul(single_accumulator_bytes_per_read)
+        .saturating_mul(fanout.saturating_sub(1))
+        .min(mem_limit / 8)
+}
+
 /// # Returns
 /// A `BatchSizeResult` containing the computed batch size and metadata for logging.
 pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSizeResult> {
@@ -96,6 +171,11 @@ pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSiz
             peak_memory: 0, // Unknown for user-specified
             input_format,
             shard_reservation: 0, // Unknown for user-specified
+            // An explicit batch size is a read-count request, not a memory
+            // budget: preserve it as a read-count flush trigger rather than
+            // guessing at a byte budget with no read-length sample.
+            classify_byte_budget: usize::MAX,
+            classify_max_reads: Some(bs),
         });
     }
 
@@ -201,11 +281,71 @@ pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSiz
 
     let batch_config = calculate_batch_config(&mem_config);
 
+    // What's actually resident, concurrently with the accumulator, while
+    // reading and extracting one input batch (raw records + I/O prefetch
+    // buffers — not the CSR/accumulator terms `calculate_batch_config`'s own
+    // `peak_memory` still models, which no longer materialize per batch on
+    // this path; see `estimate_accumulator_path_input_residency`'s doc).
+    let input_batch_residency = rype::memory::estimate_accumulator_path_input_residency(
+        batch_config.batch_size,
+        &mem_config.read_profile,
+        &mem_config,
+    )
+    .unwrap_or(0);
+
+    let max_bucket_id = metadata.bucket_names.keys().max().copied().unwrap_or(0);
+    let single_accumulator_bytes_per_read =
+        rype::memory::estimate_accumulator_bytes_per_read(max_bucket_id as usize).unwrap_or(0);
+    let fold_reduce_reserve = fold_reduce_budget_reserve(
+        mem_limit,
+        single_accumulator_bytes_per_read,
+        rayon::current_num_threads(),
+    );
+
+    // Classification-pass budget: what's left of max_memory after everything
+    // else concurrently resident during a pass — the shard reservation
+    // (index residency during a shard scan), the safety margin, one input
+    // batch's worth of raw records, and the parallel-merge-join fan-out
+    // reserve above — available for the QueryAccumulator's flat COO entries.
+    // This is independent of `batch_size`, which now only bounds input-batch
+    // (sequence-byte) residency ahead of extraction.
+    //
+    // Deliberately does NOT subtract `estimated_index_mem`: for a sharded
+    // index the full index is never resident at once — shards stream one at
+    // a time, which `shard_reservation` above already covers. Subtracting
+    // total index size would double-count the part that's resident and
+    // count a great deal that never is. (It was also a no-op in practice —
+    // `load_index_metadata` returns an empty `bucket_minimizer_counts` for
+    // every `.ryxdi`, the only format this path accepts — so removing it
+    // changes nothing about what real runs computed.) If a real index-
+    // residency cost is identified later, it needs its own accounting, not
+    // a revival of this term.
+    let uncapped_budget = mem_limit
+        .saturating_sub(shard_reservation)
+        .saturating_sub(safety_margin_bytes(mem_limit))
+        .saturating_sub(input_batch_residency)
+        .saturating_sub(fold_reduce_reserve);
+
+    // Floor: the five reservations above are each individually bounded, but
+    // nothing bounds their sum, and for a large sharded index at a modest
+    // `--max-memory` (e.g. this crate's own n97-w50 fixture at 2-4G) they
+    // can consume the entire budget, driving it to exactly 0. At 0,
+    // `should_flush()` is true against an *empty* accumulator, so every
+    // input batch becomes its own classification pass — this is Finding 1's
+    // flush-degeneration failure mode reached by a different route. Floor
+    // at mem_limit/8 (the same fraction already used to cap
+    // `fold_reduce_budget_reserve`) so a pass always has room to hold a
+    // meaningful number of reads; this may mean actual peak RSS exceeds
+    // `--max-memory` on undersized budgets, which is why it's logged.
+    let classify_byte_budget = floor_classify_byte_budget(uncapped_budget, mem_limit);
+
     Ok(BatchSizeResult {
         batch_size: batch_config.batch_size,
         peak_memory: batch_config.peak_memory,
         input_format,
         shard_reservation,
+        classify_byte_budget,
+        classify_max_reads: None,
     })
 }
 
@@ -350,6 +490,109 @@ num_entries = 3
         assert_eq!(result.batch_size, 5000);
     }
 
+    /// Regression: `fold_reduce_budget_reserve` must never consume more
+    /// than 1/8 of `mem_limit`, even when the uncapped worst-case figure
+    /// (FOLD_REDUCE_MAX_READS reads x per-read accumulator cost x fan-out)
+    /// would exceed the entire budget on its own. Before this cap existed,
+    /// a many-bucket index at a modest --max-memory zeroed
+    /// classify_byte_budget completely — verified on a real 97-bucket
+    /// index at 16 GB, where the uncapped reserve alone exceeded 9 GB.
+    #[test]
+    fn test_fold_reduce_budget_reserve_capped_at_one_eighth_of_mem_limit() {
+        let mem_limit = 16 * 1024 * 1024 * 1024; // 16GB
+        // A large per-read accumulator cost (many buckets) and many threads
+        // — deliberately sized so the uncapped product would exceed mem_limit
+        // entirely: FOLD_REDUCE_MAX_READS (500_000) * 1000 * 23 ~= 11.5 TB.
+        let reserve = fold_reduce_budget_reserve(mem_limit, 1000, 12);
+        assert_eq!(
+            reserve,
+            mem_limit / 8,
+            "reserve should be capped at mem_limit/8 when the uncapped figure would exceed it"
+        );
+        assert!(reserve < mem_limit, "capped reserve must leave room for everything else");
+    }
+
+    /// Direct check on the floor helper: below the floor, clamps up to it;
+    /// at or above, passes through unchanged.
+    #[test]
+    fn test_floor_classify_byte_budget_clamps_below_floor() {
+        let mem_limit = 4 * 1024 * 1024 * 1024; // 4GB -> floor = 512MB
+        assert_eq!(floor_classify_byte_budget(0, mem_limit), mem_limit / 8);
+        assert_eq!(
+            floor_classify_byte_budget(mem_limit / 8 - 1, mem_limit),
+            mem_limit / 8
+        );
+        assert_eq!(
+            floor_classify_byte_budget(mem_limit / 8, mem_limit),
+            mem_limit / 8,
+            "exactly at the floor should pass through, not be treated as below it"
+        );
+        assert_eq!(
+            floor_classify_byte_budget(mem_limit, mem_limit),
+            mem_limit,
+            "well above the floor should pass through unchanged"
+        );
+    }
+
+    /// Reproduces the re-review's reported collapse: `classify_byte_budget`
+    /// reaching exactly 0 for realistic `(max_memory, largest_shard_entries)`
+    /// combinations, including this crate's own `n97-w50` fixture at
+    /// `--max-memory` values CLAUDE.md itself uses as a worked example.
+    /// Exercises the real budget-arithmetic functions directly (as the
+    /// review did) rather than driving a multi-gigabyte synthetic index
+    /// through `compute_effective_batch_size`. `input_batch_residency` is
+    /// omitted, matching the review's own reproduction — including it only
+    /// shrinks the uncapped budget further, so this is the conservative
+    /// (largest-uncapped-budget) case for each row.
+    ///
+    /// Before the fix (no floor on `classify_byte_budget`'s sum), several of
+    /// these rows compute to exactly 0.
+    #[test]
+    fn test_classify_byte_budget_floor_holds_across_reported_collapse_scenarios() {
+        let num_threads = 12;
+        // (max_memory, largest_shard_entries, max_bucket_id) — the three
+        // combinations the review reported, using this PR's own n97-w50
+        // shape (97 buckets) as the bucket count for all rows.
+        let scenarios: &[(usize, u64, u32)] = &[
+            (2 * 1024 * 1024 * 1024, 989_000_000, 97),
+            (3 * 1024 * 1024 * 1024, 989_000_000, 97),
+            (4 * 1024 * 1024 * 1024, 989_000_000, 97),
+            (8 * 1024 * 1024 * 1024, 989_000_000, 97),
+            (4 * 1024 * 1024 * 1024, 1_500_000_000, 97),
+            (8 * 1024 * 1024 * 1024, 2_500_000_000, 97),
+        ];
+
+        for &(mem_limit, largest_shard_entries, max_bucket_id) in scenarios {
+            let shard_reservation = estimate_shard_reservation(largest_shard_entries, num_threads);
+            let single_accumulator_bytes_per_read =
+                rype::memory::estimate_accumulator_bytes_per_read(max_bucket_id as usize)
+                    .unwrap_or(0);
+            let fold_reduce_reserve = fold_reduce_budget_reserve(
+                mem_limit,
+                single_accumulator_bytes_per_read,
+                num_threads,
+            );
+            let uncapped_budget = mem_limit
+                .saturating_sub(shard_reservation)
+                .saturating_sub(safety_margin_bytes(mem_limit))
+                .saturating_sub(fold_reduce_reserve);
+            let budget = floor_classify_byte_budget(uncapped_budget, mem_limit);
+
+            assert!(
+                budget >= mem_limit / 8,
+                "max_memory={mem_limit}, largest_shard_entries={largest_shard_entries}: \
+                 budget {budget} fell below the mem_limit/8 floor (uncapped was \
+                 {uncapped_budget})"
+            );
+            assert!(
+                budget > 0,
+                "max_memory={mem_limit}, largest_shard_entries={largest_shard_entries}: \
+                 budget must never be 0 — that reintroduces Finding 1's one-scan-per-batch \
+                 failure via an empty accumulator"
+            );
+        }
+    }
+
     #[test]
     fn test_auto_batch_size_returns_reasonable_value() {
         let index_dir = create_test_index();
@@ -442,26 +685,46 @@ num_entries = 3
     // =========================================================================
     // Regression tests for batch sizing with real sharded indices.
     //
-    // These tests use the perf-assessment data (real 8-shard index with 160
-    // buckets, ~485M total entries; real long-read Parquet queries).
-    // They are #[ignore]d because the data is local-only (not in git).
+    // These tests use the perf-assessment data documented in CLAUDE.md's
+    // "Local-Only Performance Test Data" section: `n100-w200.ryxdi` (8-shard,
+    // 160-bucket, ~486M minimizers) and `n97-w50.ryxdi` (11-shard, 97-bucket,
+    // ~10.5B minimizers). Both are covered here — different contributors have
+    // whichever one they built locally, and running against both gives real
+    // coverage from whichever is present rather than silently skipping for
+    // anyone who only has the other. They are #[ignore]d because this data
+    // is local-only (not in git).
     //
     // Run with: cargo test batch_config -- --ignored --nocapture
     // =========================================================================
 
-    /// Regression: with real sharded index and real query data, batch sizing
-    /// should produce a reasonable batch size (not crippled by over-reservation).
+    /// Regression: with a real sharded index and real query data, batch
+    /// sizing should produce a reasonable classification byte budget (not
+    /// crippled by over-reservation).
     ///
     /// Before fix: batch_count=num_threads reserved ~8x too much memory,
-    /// producing batch sizes ~4-8x smaller than necessary.
-    #[test]
-    #[ignore]
-    fn test_real_sharded_index_batch_size_is_reasonable() {
-        let index_path = std::path::Path::new("perf-assessment/parquet-index/n100-w200.ryxdi");
+    /// producing batch sizes ~4-8x smaller than necessary. `batch_size` now
+    /// only bounds input (sequence-byte) residency (see `QueryAccumulator`),
+    /// so this regression check moved to `classify_byte_budget`, the field
+    /// that now drives classification pass count.
+    ///
+    /// The threshold is a fraction of `max_memory`, not an absolute GB
+    /// figure: `classify_byte_budget` now honestly subtracts the reference
+    /// index, the shard reservation, and one input batch's real raw-record
+    /// residency (see `estimate_accumulator_path_input_residency`) — for a
+    /// query file of very long reads, that last term alone can be tens of
+    /// GB, so a fixed "> 32GB of a 64GB budget" assumption doesn't hold
+    /// across read-length regimes. A generous 10% floor still catches the
+    /// actual bug this test guards against (the shard-count over-reservation
+    /// crippling the budget to near-zero) without depending on how large the
+    /// query reads happen to be.
+    fn check_real_sharded_index_batch_size_is_reasonable(index_path: &std::path::Path) {
         let query_path = std::path::Path::new("perf-assessment/query-files/long_read.parquet");
 
         if !index_path.exists() || !query_path.exists() {
-            eprintln!("Skipping: perf-assessment data not available");
+            eprintln!(
+                "Skipping: perf-assessment data not available at {}",
+                index_path.display()
+            );
             return;
         }
 
@@ -481,59 +744,108 @@ num_entries = 3
         let result = compute_effective_batch_size(&config).unwrap();
 
         eprintln!(
-            "Real index: batch_size={}, peak_memory={:.2}GB, shard_reservation={:.2}MB",
+            "{}: batch_size={}, peak_memory={:.2}GB, shard_reservation={:.2}MB, classify_byte_budget={:.2}GB",
+            index_path.display(),
             result.batch_size,
             result.peak_memory as f64 / (1024.0 * 1024.0 * 1024.0),
-            result.shard_reservation as f64 / (1024.0 * 1024.0)
+            result.shard_reservation as f64 / (1024.0 * 1024.0),
+            result.classify_byte_budget as f64 / (1024.0 * 1024.0 * 1024.0)
         );
 
-        // With batch_count=1 fix, batch_size should be well above 1M for 64GB
+        // With batch_count=1 fix, classify_byte_budget should be a healthy
+        // fraction of max_memory, not crippled by shard-count
+        // over-reservation. A 10% floor (not the honest-accounting fraction
+        // itself, which varies with read length — see the doc comment
+        // above) still catches that specific regression.
+        let min_expected = config.max_memory / 10;
         assert!(
-            result.batch_size > 1_000_000,
-            "batch_size should be > 1M for 64GB with sequential batches, got {}",
-            result.batch_size
+            result.classify_byte_budget > min_expected,
+            "{}: classify_byte_budget should be > 10% of max_memory ({} bytes) for a {}GB \
+             max-memory run, got {} bytes",
+            index_path.display(),
+            min_expected,
+            config.max_memory / (1024 * 1024 * 1024),
+            result.classify_byte_budget
         );
+    }
+
+    #[test]
+    #[ignore]
+    fn test_real_sharded_index_batch_size_is_reasonable_n100_w200() {
+        check_real_sharded_index_batch_size_is_reasonable(std::path::Path::new(
+            "perf-assessment/parquet-index/n100-w200.ryxdi",
+        ));
+    }
+
+    #[test]
+    #[ignore]
+    fn test_real_sharded_index_batch_size_is_reasonable_n97_w50() {
+        check_real_sharded_index_batch_size_is_reasonable(std::path::Path::new(
+            "perf-assessment/parquet-index/n97-w50.ryxdi",
+        ));
     }
 
     /// Regression: shard reservation must be nonzero for a sharded index.
     ///
-    /// The 8-shard index has largest shard ~62M entries. Loading a shard
-    /// involves concurrent row-group decoding + filtered CSR output.
-    /// This memory must be accounted for.
-    ///
-    /// We verify: load_index_metadata populates largest_shard_entries,
-    /// and estimate_shard_reservation returns a nonzero value that feeds
-    /// into the batch sizing. The shard reservation for the 8-shard index
-    /// (largest shard ≈ 62M entries) should be substantial (>100MB).
-    #[test]
-    #[ignore]
-    fn test_real_index_shard_reservation_affects_batch_size() {
-        let sharded_index = std::path::Path::new("perf-assessment/parquet-index/n100-w200.ryxdi");
-
+    /// Loading a shard involves concurrent row-group decoding + filtered CSR
+    /// output; this memory must be accounted for. We verify:
+    /// `load_index_metadata` populates `largest_shard_entries`, and
+    /// `estimate_shard_reservation` returns a nonzero value that feeds into
+    /// batch sizing. Thresholds (>50M entries, >100MB reservation) are
+    /// scale-independent and hold for both fixtures: `n100-w200.ryxdi`'s
+    /// largest shard is ~62M entries; `n97-w50.ryxdi`'s is ~865-989M.
+    fn check_real_index_shard_reservation_affects_batch_size(sharded_index: &std::path::Path) {
         if !sharded_index.exists() {
-            eprintln!("Skipping: perf-assessment data not available");
+            eprintln!(
+                "Skipping: perf-assessment data not available at {}",
+                sharded_index.display()
+            );
             return;
         }
 
         let metadata = load_index_metadata(sharded_index).unwrap();
 
-        // The 8-shard index has shards with ~60-62M entries each
-        eprintln!("largest_shard_entries: {}", metadata.largest_shard_entries);
+        eprintln!(
+            "{}: largest_shard_entries: {}",
+            sharded_index.display(),
+            metadata.largest_shard_entries
+        );
         assert!(
             metadata.largest_shard_entries > 50_000_000,
-            "8-shard index should have largest shard > 50M entries, got {}",
+            "{}: largest shard should be > 50M entries, got {}",
+            sharded_index.display(),
             metadata.largest_shard_entries
         );
 
-        // Shard reservation should be substantial
         let reservation = estimate_shard_reservation(metadata.largest_shard_entries, 8);
         let reservation_mb = reservation / (1024 * 1024);
-        eprintln!("shard_reservation: {}MB", reservation_mb);
-        assert!(
-            reservation_mb > 100,
-            "Shard reservation should be > 100MB for 62M-entry shard, got {}MB",
+        eprintln!(
+            "{}: shard_reservation: {}MB",
+            sharded_index.display(),
             reservation_mb
         );
+        assert!(
+            reservation_mb > 100,
+            "{}: shard reservation should be > 100MB, got {}MB",
+            sharded_index.display(),
+            reservation_mb
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn test_real_index_shard_reservation_affects_batch_size_n100_w200() {
+        check_real_index_shard_reservation_affects_batch_size(std::path::Path::new(
+            "perf-assessment/parquet-index/n100-w200.ryxdi",
+        ));
+    }
+
+    #[test]
+    #[ignore]
+    fn test_real_index_shard_reservation_affects_batch_size_n97_w50() {
+        check_real_index_shard_reservation_affects_batch_size(std::path::Path::new(
+            "perf-assessment/parquet-index/n97-w50.ryxdi",
+        ));
     }
 
     /// Regression: with the test helper index (has shards with known entries),

@@ -899,6 +899,15 @@ pub const MAX_BATCH_SIZE: usize = 100_000_000;
 const SAFETY_MARGIN_PERCENT: f64 = 0.10;
 const SAFETY_MARGIN_MIN_BYTES: usize = 256 * 1024 * 1024;
 
+/// Safety margin held back from `max_memory`: `max(256MB, 10% of max_memory)`.
+///
+/// Exposed so callers outside this module (e.g. the CLI's classify-budget
+/// computation) can apply the same margin without duplicating the constants.
+pub fn safety_margin_bytes(max_memory: usize) -> usize {
+    let safety_margin = (max_memory as f64 * SAFETY_MARGIN_PERCENT).round() as usize;
+    safety_margin.max(SAFETY_MARGIN_MIN_BYTES)
+}
+
 /// Fudge factor for memory estimation (accounts for HashMap overhead, HitResults, etc.)
 ///
 /// This factor accounts for:
@@ -916,15 +925,146 @@ const MEMORY_FUDGE_FACTOR: f64 = 1.8;
 /// in the prefetch thread before the batch is handed to the main thread.
 const ARROW_BUILDER_OVERHEAD: f64 = 1.5;
 
+/// Estimate the per-read cost of the `HitAccumulator` that
+/// `classify::sharded::classify_shard_loop`/`_parallel_rg` allocate for a
+/// pass over an index whose largest bucket id is `max_bucket_id`.
+///
+/// Takes `max_bucket_id`, not a bucket count, and mirrors
+/// `classify::sharded::use_dense_accumulator`'s predicate literally
+/// (`max_bucket_id > 0 && max_bucket_id <= DENSE_ACCUMULATOR_MAX_BUCKETS`)
+/// so the two can never disagree — including at the boundary
+/// `max_bucket_id == DENSE_ACCUMULATOR_MAX_BUCKETS`, where a caller-adjusted
+/// count (this function's previous signature) landed on the wrong side of
+/// the predicate whenever the adjustment was off by one, silently
+/// mismatching `use_dense_accumulator`'s real choice.
+///
+/// Taking a count and requiring the caller to pre-adjust it (previously
+/// `max_bucket_id + 1`) invited exactly that class of bug rather than
+/// preventing it — see `commands/classify.rs`'s caller, which now passes
+/// `max_bucket_id` directly. `estimate_batch_memory`'s caller only has a
+/// bucket *count* to offer (an approximate ceiling, not tied to any real
+/// manifest's max id); it converts via `num_buckets.saturating_sub(1)`,
+/// i.e. treats the buckets as if contiguously numbered `0..num_buckets`,
+/// which is the same assumption its existing count-vs-max_id doc caveat
+/// already relies on.
+///
+/// dense (`max_bucket_id <= DENSE_ACCUMULATOR_MAX_BUCKETS`) is a flat
+/// `Vec<(u32,u32)>` of `max_bucket_id + 1` slots per read at 8 bytes each —
+/// matching `DenseAccumulator::new`'s real `stride` exactly — for a
+/// 160-bucket index that's ~1.3 KB/read, allocated whether or not the
+/// bucket is ever hit. Sparse is a per-read `HashMap<u32, (u32,u32)>`
+/// holding only buckets actually seen, estimated at
+/// `ESTIMATED_BUCKETS_PER_READ` buckets/read on average (capped at
+/// `max_bucket_id + 1`, since a read can't hit more distinct buckets than
+/// exist).
+///
+/// Returns `None` on arithmetic overflow (only reachable with a pathological
+/// `max_bucket_id` near `usize::MAX`).
+pub fn estimate_accumulator_bytes_per_read(max_bucket_id: usize) -> Option<usize> {
+    if max_bucket_id > 0 && max_bucket_id <= DENSE_ACCUMULATOR_MAX_BUCKETS {
+        max_bucket_id.checked_add(1)?.checked_mul(8)
+    } else {
+        crate::constants::ESTIMATED_BUCKETS_PER_READ
+            .min(max_bucket_id.saturating_add(1))
+            .checked_mul(24) // HashMap entry overhead
+    }
+}
+
+/// Worst-case concurrency multiplier for the parallel CSR merge-join's
+/// per-thread accumulator fan-out
+/// (`classify::merge_join::merge_join_csr_linear_parallel` /
+/// `gallop_join_csr_parallel`): whenever a pass's `num_reads` lands at or
+/// under `FOLD_REDUCE_MAX_READS`, each of `num_threads` chunks gets its own
+/// full-size `HitAccumulator` via `new_like()`, plus rayon's `reduce`
+/// identity closures — bounded by roughly the same degree of parallelism,
+/// so up to about `2 * num_threads` full-size accumulators can be live at
+/// once, not the one `estimate_accumulator_bytes_per_read` models.
+///
+/// A caller sizing `QueryAccumulator::with_accumulator_cost_per_read` for a
+/// whole pass doesn't know in advance whether that pass will land under
+/// `FOLD_REDUCE_MAX_READS` (that depends on how many reads accumulate
+/// before `should_flush()` fires) — so scale by this factor unconditionally
+/// as the conservative choice; it costs a somewhat smaller pass than
+/// strictly necessary once a pass exceeds `FOLD_REDUCE_MAX_READS` (where
+/// the sparse-hit-collection fallback applies instead and this multiplier
+/// is moot) — pair with `fold_reduce_max_reads()` and
+/// `QueryAccumulator::with_tiered_accumulator_cost` to apply this multiplier
+/// only up to that threshold, rather than unconditionally: applied flatly
+/// to every read regardless of eventual pass size, it shrinks passes for
+/// workloads that will obviously clear the threshold long before hitting a
+/// byte-budget wall (e.g. many short reads against a many-bucket index) by
+/// this same factor for no reason, since those passes were never going to
+/// take the risky fold-reduce path in the first place.
+pub fn fold_reduce_accumulator_fanout(num_threads: usize) -> usize {
+    (2 * num_threads).max(1)
+}
+
+/// The `FOLD_REDUCE_MAX_READS` threshold (see that constant's doc in
+/// `constants.rs`), exposed for callers outside the library crate (e.g. the
+/// CLI) sizing a tiered accumulator-cost reservation via
+/// `QueryAccumulator::with_tiered_accumulator_cost` — pair with
+/// `fold_reduce_accumulator_fanout`.
+pub fn fold_reduce_max_reads() -> usize {
+    crate::constants::FOLD_REDUCE_MAX_READS
+}
+
+/// The `ESTIMATED_BUCKETS_PER_READ` constant (see its doc in
+/// `constants.rs`), exposed for callers outside the library crate (e.g. the
+/// CLI's `--wide` per-read reservation, which needs the same average this
+/// module's own sparse-accumulator branch already assumes rather than a
+/// worst case of every read hitting every bucket).
+pub fn estimated_buckets_per_read() -> usize {
+    crate::constants::ESTIMATED_BUCKETS_PER_READ
+}
+
+/// Estimate what's actually resident during input reading on the
+/// `QueryAccumulator` path (`commands::classify::run_classify`'s
+/// non-negative-index branch): the raw input records for one input batch
+/// plus its I/O prefetch buffers.
+///
+/// Deliberately narrower than [`estimate_batch_memory`]: on this path,
+/// extraction pushes straight into the accumulator (see
+/// `indices::inverted::accumulate::QueryAccumulator`), so the CSR/minimizer-
+/// vector/per-read-accumulator terms `estimate_batch_memory` still models
+/// never materialize per input batch — that memory is accounted for
+/// separately, by the classification-pass byte budget
+/// (`commands::helpers::batch_config::compute_effective_batch_size`'s
+/// `classify_byte_budget`), which is what's concurrently resident with this.
+/// `estimate_batch_memory` remains correct and necessary for the
+/// negative-index path, which still classifies immediately per batch and
+/// does materialize the full CSR + accumulator every time — this function
+/// is not a replacement for it, only a second, narrower estimate for the
+/// other path.
+///
+/// Returns `None` on arithmetic overflow.
+pub fn estimate_accumulator_path_input_residency(
+    batch_size: usize,
+    profile: &ReadMemoryProfile,
+    config: &MemoryConfig,
+) -> Option<usize> {
+    let record_overhead: usize = 72; // OwnedFastxRecord overhead, mirrors estimate_batch_memory
+    let input_records =
+        batch_size.checked_mul(record_overhead.checked_add(profile.avg_query_length)?)?;
+    let io_buffer_memory = estimate_io_buffer_memory(batch_size, config)?;
+    input_records.checked_add(io_buffer_memory)
+}
+
 /// Estimate memory usage for a single batch.
 ///
 /// Memory components:
 /// - Input records: batch_size * (72 + avg_query_length) for OwnedFastxRecord
 /// - Minimizers: batch_size * minimizers_per_query * 16 bytes (`Vec<u64>` for fwd + rc)
-/// - QueryInvertedIndex CSR: batch_size * minimizers_per_query * 12 bytes
+/// - QueryInvertedIndex CSR: batch_size * minimizers_per_query * 16 bytes
+///   (`(u64, u32)` entries are padded to 16 bytes by `u64`'s 8-byte alignment)
 /// - Accumulators: dense `batch_size * (num_buckets + 1) * 8` when the index is
 ///   small enough for the dense accumulator, otherwise sparse
 ///   `batch_size * estimated_buckets_per_read * 24`
+///
+/// Note: this models the *negative-index* classify path, which still
+/// materializes a full CSR + accumulator per input batch. The accumulator
+/// path (see `estimate_accumulator_path_input_residency`) no longer holds
+/// these per batch, so `compute_effective_batch_size`'s `classify_byte_budget`
+/// accounts for them separately instead of via this function.
 ///
 /// Returns None if arithmetic overflow occurs.
 pub fn estimate_batch_memory(
@@ -943,11 +1083,12 @@ pub fn estimate_batch_memory(
         .checked_mul(profile.minimizers_per_query)?
         .checked_mul(16)?;
 
-    // QueryInvertedIndex CSR structure
-    // minimizers: Vec<u64>, offsets: Vec<u32>, read_ids: Vec<u32>
+    // QueryInvertedIndex CSR structure: (u64, u32) entries, padded to 16
+    // bytes by u64's 8-byte alignment (std::mem::size_of::<(u64, u32)>()
+    // == 16, not the unpadded 8 + 4 == 12).
     let query_index = batch_size
         .checked_mul(profile.minimizers_per_query)?
-        .checked_mul(12)?;
+        .checked_mul(16)?;
 
     // Per-read accumulators. Two implementations exist and the choice is made
     // per index by classify::sharded::use_dense_accumulator:
@@ -961,19 +1102,14 @@ pub fn estimate_batch_memory(
     // - Sparse (more buckets than that): per-read HashMap<u32, (u32, u32)>,
     //   holding only buckets actually hit, ~4 per read on average.
     //
-    // `num_buckets` is a count while the dense stride is max_bucket_id + 1.
-    // These agree for contiguously numbered buckets, which is what the index
-    // builders produce; an index with sparse bucket ids uses more than this.
-    let accumulators = if num_buckets > 0 && num_buckets <= DENSE_ACCUMULATOR_MAX_BUCKETS {
-        batch_size
-            .checked_mul(num_buckets.checked_add(1)?)?
-            .checked_mul(8)?
-    } else {
-        let estimated_buckets_per_read = 4.min(num_buckets);
-        batch_size
-            .checked_mul(estimated_buckets_per_read)?
-            .checked_mul(24)? // HashMap entry overhead
-    };
+    // `num_buckets` is a count, but `estimate_accumulator_bytes_per_read`
+    // takes `max_bucket_id`; convert via `num_buckets - 1`, i.e. treat the
+    // buckets as if contiguously numbered `0..num_buckets`. This agrees with
+    // the real dense stride for contiguously numbered buckets, which is what
+    // the index builders produce; an index with sparse bucket ids uses more
+    // than this estimate.
+    let accumulators = batch_size
+        .checked_mul(estimate_accumulator_bytes_per_read(num_buckets.saturating_sub(1))?)?;
 
     // Sum components with overflow checking
     let mut base_estimate = input_records
@@ -991,8 +1127,9 @@ pub fn estimate_batch_memory(
         let estimated_header_bytes: usize = 60;
         let per_read_overhead = meta_bytes.checked_add(estimated_header_bytes)?;
         // minimizers_per_query already includes both strands.
-        // Each minimizer stored as (u64, u32) = 12 bytes in COO entries.
-        let minimizer_cost = profile.minimizers_per_query.checked_mul(12)?;
+        // Each minimizer stored as (u64, u32) = 16 bytes in COO entries
+        // (padded by u64's 8-byte alignment, not the unpadded 12).
+        let minimizer_cost = profile.minimizers_per_query.checked_mul(16)?;
         // unique_minimizers() Vec: 8 bytes per minimizer (upper bound)
         let query_mins_cost = profile.minimizers_per_query.checked_mul(8)?;
         let deferred_memory = deferred_reads.checked_mul(
@@ -1079,8 +1216,7 @@ fn estimate_total_batch_memory(
 /// FASTX uses 2 slots, Parquet uses 4 slots.
 pub fn calculate_batch_config(config: &MemoryConfig) -> BatchConfig {
     // Calculate safety margin
-    let safety_margin = (config.max_memory as f64 * SAFETY_MARGIN_PERCENT).round() as usize;
-    let safety_margin = safety_margin.max(SAFETY_MARGIN_MIN_BYTES);
+    let safety_margin = safety_margin_bytes(config.max_memory);
 
     // Base reserved memory (not dependent on batch_size)
     let base_reserved = config
@@ -1205,7 +1341,12 @@ fn binary_search_batch_size_with_io(
 ///   `DECODE_OVERHEAD_MULTIPLIER`.
 /// - **Filtered CSR**: After filtering to query minimizers, the CSR output is
 ///   typically ~10% of the shard (`SHARD_SELECTIVITY_ESTIMATE`). We use
-///   `CSR_CONCAT_MULTIPLIER` for the concat spike during assembly.
+///   `CSR_CONCAT_MULTIPLIER` for the concat spike during assembly — this
+///   also covers `load_filtered_coo_pairs`'s per-chunk result buffers
+///   (`query_loading.rs`), which are bounded to roughly one row group's
+///   initial capacity each (growing from there via ordinary amortized
+///   reallocation) specifically so their sum stays in this term's ballpark
+///   rather than scaling with how many row groups a chunk happens to cover.
 ///
 /// Returns 0 if `largest_shard_entries` is 0 (no shards).
 ///
@@ -1232,7 +1373,9 @@ pub fn estimate_shard_reservation(largest_shard_entries: u64, num_threads: usize
         return 0;
     }
 
-    let bytes_per_entry: usize = 12; // u64 minimizer + u32 bucket_id
+    // (u64, u32) padded to 16 bytes by u64's 8-byte alignment — not the
+    // unpadded 8 + 4 == 12.
+    let bytes_per_entry: usize = 16;
     let rg_size = crate::constants::DEFAULT_ROW_GROUP_SIZE;
 
     // Parallel decode buffers: num_threads concurrent RG decodes with Arrow overhead
@@ -1278,6 +1421,79 @@ pub fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: `estimate_accumulator_bytes_per_read` must pick the same
+    /// side of the dense/sparse boundary as
+    /// `classify::sharded::use_dense_accumulator` at every point around
+    /// `DENSE_ACCUMULATOR_MAX_BUCKETS`, including exactly at it — the case
+    /// a prior signature (taking a caller-adjusted count) got wrong: at
+    /// `max_bucket_id == DENSE_ACCUMULATOR_MAX_BUCKETS` (256),
+    /// `use_dense_accumulator` picks dense (stride 257, 2,056 B/read) but
+    /// the old count-based estimator, given the caller's `max_id + 1` = 257,
+    /// took the sparse branch (96 B/read) — a 21x under-estimate landing
+    /// exactly at the boundary this test pins.
+    #[test]
+    fn test_accumulator_bytes_per_read_matches_use_dense_accumulator_threshold() {
+        // Mirrors classify::sharded::use_dense_accumulator's predicate
+        // directly, so this test would catch either function drifting from
+        // the other independent of this module's own implementation.
+        fn real_use_dense_accumulator(max_bucket_id: usize) -> bool {
+            max_bucket_id > 0 && max_bucket_id <= DENSE_ACCUMULATOR_MAX_BUCKETS
+        }
+
+        for max_bucket_id in [
+            0,
+            1,
+            DENSE_ACCUMULATOR_MAX_BUCKETS - 1,
+            DENSE_ACCUMULATOR_MAX_BUCKETS,
+            DENSE_ACCUMULATOR_MAX_BUCKETS + 1,
+        ] {
+            let cost = estimate_accumulator_bytes_per_read(max_bucket_id).unwrap();
+            let expect_dense = real_use_dense_accumulator(max_bucket_id);
+            let is_dense_cost = cost == (max_bucket_id + 1) * 8;
+
+            assert_eq!(
+                is_dense_cost, expect_dense,
+                "max_bucket_id={max_bucket_id}: estimator picked {} but \
+                 use_dense_accumulator picks {} (cost was {cost} bytes/read)",
+                if is_dense_cost { "dense" } else { "sparse" },
+                if expect_dense { "dense" } else { "sparse" },
+            );
+        }
+    }
+
+    /// The real `DenseAccumulator::new` stride is `max_bucket_id + 1`
+    /// exactly — this pins that the estimate doesn't reserve one slot more
+    /// (as a prior version did, from a caller-side `+ 1` adjustment leaking
+    /// into what was, even then, already a `+ 1` inside this function).
+    #[test]
+    fn test_accumulator_bytes_per_read_dense_stride_matches_dense_accumulator() {
+        let max_bucket_id = 97usize;
+        let cost = estimate_accumulator_bytes_per_read(max_bucket_id).unwrap();
+        assert_eq!(
+            cost,
+            (max_bucket_id + 1) * 8,
+            "dense cost must equal DenseAccumulator's real stride (max_bucket_id + 1) * 8"
+        );
+    }
+
+    /// Regression: the per-read accumulator reservation must scale with
+    /// thread count, matching the real worst-case fan-out of the parallel
+    /// CSR merge-join's per-chunk accumulators (see
+    /// `fold_reduce_accumulator_fanout`'s doc). Before this existed, a
+    /// caller reserving `estimate_accumulator_bytes_per_read(...)` alone
+    /// modeled exactly one accumulator regardless of thread count, while
+    /// `merge_join_csr_linear_parallel`/`gallop_join_csr_parallel` can
+    /// allocate on the order of `2 * num_threads` of them at once.
+    #[test]
+    fn test_fold_reduce_accumulator_fanout_scales_with_threads() {
+        assert_eq!(fold_reduce_accumulator_fanout(1), 2);
+        assert_eq!(fold_reduce_accumulator_fanout(8), 16);
+        assert_eq!(fold_reduce_accumulator_fanout(12), 24);
+        // Never zero, even in a pathological 0-thread input, so callers
+        // multiplying by this never accidentally zero out their reservation.
+        assert!(fold_reduce_accumulator_fanout(0) >= 1);
+    }
 
     // === Byte suffix parsing tests ===
 
@@ -1439,9 +1655,14 @@ mod tests {
         );
 
         // Above the dense threshold the sparse model applies and the per-read
-        // cost stops growing with bucket count.
+        // cost stops growing with bucket count. `estimate_batch_memory`
+        // converts its `num_buckets` count to `max_bucket_id` via `- 1`
+        // (contiguous `0..num_buckets` ids), so `num_buckets` up to
+        // `DENSE_ACCUMULATOR_MAX_BUCKETS + 1` (max_bucket_id up to
+        // DENSE_ACCUMULATOR_MAX_BUCKETS) is still dense; the first
+        // definitely-sparse count is one more than that.
         let sparse_a =
-            estimate_batch_memory(batch, &profile, DENSE_ACCUMULATOR_MAX_BUCKETS + 1, false)
+            estimate_batch_memory(batch, &profile, DENSE_ACCUMULATOR_MAX_BUCKETS + 2, false)
                 .unwrap();
         let sparse_b = estimate_batch_memory(batch, &profile, 100_000, false).unwrap();
         assert_eq!(
@@ -2523,10 +2744,10 @@ mod tests {
         // Real 8-shard index: largest shard = 62,443,845 entries, 8 threads
         let reservation = estimate_shard_reservation(62_443_845, 8);
 
-        // decode buffers: 8 * 100_000 * 12 * 3 (Arrow overhead) = 28,800,000 (~27.5MB)
-        // filtered CSR: 62_443_845 * 12 * 0.10 * 2 = 149,865,228 (~142.9MB)
-        // total ≈ 170MB
-        let expected_mb = 170;
+        // decode buffers: 8 * 100_000 * 16 * 3 (Arrow overhead) = 38,400,000 (~36.6MB)
+        // filtered CSR: 62_443_845 * 16 * 0.10 * 2 = 199,820,304 (~190.6MB)
+        // total ≈ 227MB (bytes_per_entry corrected from 12 to 16 — see Finding 9)
+        let expected_mb = 227;
         let actual_mb = reservation / (1024 * 1024);
         assert!(
             actual_mb >= expected_mb - 15 && actual_mb <= expected_mb + 15,
@@ -2674,10 +2895,10 @@ mod tests {
             is_log_ratio: false,
         };
 
-        // Realistic shard reservation for 62M-entry largest shard:
-        // decode buffers: 8 threads * 100K rows * 12 bytes = 9.6MB
-        // filtered CSR: 62M * 12 * 0.10 * 2 = 148.8MB
-        // total ≈ 158MB
+        // A representative shard reservation value (this test only checks
+        // that a larger reservation reduces batch_size, not this exact
+        // figure — see test_estimate_shard_reservation_realistic for the
+        // actual estimate_shard_reservation() arithmetic).
         let shard_reservation = 158 * 1024 * 1024;
         let config_with_reservation = MemoryConfig {
             shard_reservation,
