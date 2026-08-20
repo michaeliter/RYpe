@@ -1086,6 +1086,44 @@ fn write_shard_from_pairs(
     writer.finish()
 }
 
+/// Stream one v1 (COO) shard's pairs into a new v2 (CSR) shard file, without
+/// materializing the shard in memory — bounded to one `RecordBatch` at a
+/// time on the read side (`StreamingShardReader`) and `PARQUET_BATCH_SIZE`
+/// distinct minimizers at a time on the write side (`ShardWriter`). Used by
+/// `rype index migrate`.
+///
+/// The shard's minimizer set and bucket assignments are unchanged by this
+/// conversion — only the on-disk row layout changes — so `num_entries`,
+/// `min_minimizer`, and `max_minimizer` from the source manifest's
+/// `InvertedShardInfo` stay valid for the migrated shard; the caller does
+/// not need to recompute them.
+pub(crate) fn migrate_shard_v1_to_v2(
+    input_path: &Path,
+    output_path: &Path,
+    options: &ParquetWriteOptions,
+) -> Result<()> {
+    let mut reader = StreamingShardReader::open(input_path, ParquetShardFormat::Parquet)?;
+    let mut writer = ShardWriter::new(output_path, options)?;
+
+    let mut minimizers: Vec<u64> = Vec::with_capacity(PARQUET_BATCH_SIZE);
+    let mut bucket_ids: Vec<u32> = Vec::with_capacity(PARQUET_BATCH_SIZE);
+
+    while let Some((m, b)) = reader.next_pair()? {
+        minimizers.push(m);
+        bucket_ids.push(b);
+        if minimizers.len() >= PARQUET_BATCH_SIZE {
+            writer.write_batch(&minimizers, &bucket_ids)?;
+            minimizers.clear();
+            bucket_ids.clear();
+        }
+    }
+    if !minimizers.is_empty() {
+        writer.write_batch(&minimizers, &bucket_ids)?;
+    }
+
+    writer.finish()
+}
+
 /// Helper struct for writing a single Parquet shard in the v2 CSR layout: one
 /// row per distinct minimizer, buckets as a `List<UInt32>`. Cuts decoded
 /// minimizer-column values (the dominant shard-load decode cost — see
@@ -1230,25 +1268,30 @@ impl ShardWriter {
 /// Unlike `read_shard_pairs` which materializes the entire shard into a `Vec`,
 /// this reader holds at most one `RecordBatch` in memory
 /// (~`PARQUET_BATCH_SIZE × 12 B`). It is intended for streaming k-way merges
-/// where multiple shards are iterated in parallel.
-/// Reads pairs back out of a shard this same binary just wrote via
-/// `ShardWriter` (intermediate build-time shards for consolidation) — always
-/// v2 CSR, since `ShardWriter` no longer writes anything else. No v1
-/// dispatch needed here, unlike the query-path readers, which must still
-/// read shards from indices built by older binaries.
+/// where multiple shards are iterated in parallel, and for the v1→v2
+/// `migrate` command, which needs to stream an existing v1 shard's pairs
+/// without materializing it whole.
+///
+/// Format-aware (`shard_format`): every caller inside consolidation reads a
+/// shard this same binary just wrote via `ShardWriter` and always passes
+/// `ParquetShardFormat::Csr`; `migrate` passes whatever the source index's
+/// manifest says (v1, by construction — migrate's whole purpose is reading
+/// v1).
 struct StreamingShardReader {
     iter: parquet::arrow::arrow_reader::ParquetRecordBatchReader,
     current: Option<RecordBatch>,
     row_idx: usize,
-    /// Position within the current row's bucket_ids list.
+    /// Position within the current row's bucket_ids list (v2 only; always 0
+    /// for v1, where every row is exactly one pair).
     bucket_idx: usize,
+    shard_format: ParquetShardFormat,
     path: PathBuf,
     #[cfg(debug_assertions)]
     last_pair: Option<(u64, u32)>,
 }
 
 impl StreamingShardReader {
-    fn open(path: &Path) -> Result<Self> {
+    fn open(path: &Path, shard_format: ParquetShardFormat) -> Result<Self> {
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
         let file = std::fs::File::open(path)
@@ -1260,6 +1303,7 @@ impl StreamingShardReader {
             current: None,
             row_idx: 0,
             bucket_idx: 0,
+            shard_format,
             path: path.to_path_buf(),
             #[cfg(debug_assertions)]
             last_pair: None,
@@ -1282,7 +1326,7 @@ impl StreamingShardReader {
                             RypeError::validation("Expected UInt64Array for minimizer column")
                         })?;
                     let bucket_ids =
-                        BucketIdColumn::downcast(batch, ParquetShardFormat::Csr, &self.path)?;
+                        BucketIdColumn::downcast(batch, self.shard_format, &self.path)?;
                     let m = minimizers.value(self.row_idx);
 
                     let Some(b) = bucket_ids.bucket_at(self.row_idx, self.bucket_idx) else {
@@ -1432,7 +1476,7 @@ pub fn consolidate_shards_streaming(
     let mut heap: BinaryHeap<Reverse<(u64, u32, usize)>> = BinaryHeap::new();
     for (idx, info) in intermediate_shards.iter().enumerate() {
         let path = inverted_dir.join(files::inverted_shard(info.shard_id));
-        let mut reader = StreamingShardReader::open(&path)?;
+        let mut reader = StreamingShardReader::open(&path, ParquetShardFormat::Csr)?;
         if let Some((m, b)) = reader.next_pair()? {
             heap.push(Reverse((m, b, idx)));
         }
@@ -2274,7 +2318,7 @@ mod tests {
         ];
         write_shard_from_pairs(&path, &pairs, &opts).unwrap();
 
-        let mut reader = StreamingShardReader::open(&path).unwrap();
+        let mut reader = StreamingShardReader::open(&path, ParquetShardFormat::Csr).unwrap();
         let mut collected: Vec<(u64, u32)> = Vec::new();
         while let Some(pair) = reader.next_pair().unwrap() {
             collected.push(pair);
@@ -2300,7 +2344,7 @@ mod tests {
         let pairs: Vec<(u64, u32)> = vec![(10, 5), (10, 3), (10, 9), (20, 1)];
         write_shard_from_pairs(&path, &pairs, &opts).unwrap();
 
-        let mut reader = StreamingShardReader::open(&path).unwrap();
+        let mut reader = StreamingShardReader::open(&path, ParquetShardFormat::Csr).unwrap();
         let mut collected: Vec<(u64, u32)> = Vec::new();
         while let Some(pair) = reader.next_pair().unwrap() {
             collected.push(pair);
@@ -2317,7 +2361,7 @@ mod tests {
 
         write_shard_from_pairs(&path, &[], &opts).unwrap();
 
-        let mut reader = StreamingShardReader::open(&path).unwrap();
+        let mut reader = StreamingShardReader::open(&path, ParquetShardFormat::Csr).unwrap();
         assert!(reader.next_pair().unwrap().is_none());
         assert!(reader.next_pair().unwrap().is_none());
     }

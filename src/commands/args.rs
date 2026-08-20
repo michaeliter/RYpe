@@ -355,6 +355,48 @@ EXAMPLES:
         #[arg(long)]
         timing: bool,
     },
+
+    /// Convert a v1 (COO) index to the v2 (CSR) shard format for faster classification.
+    #[command(after_help = "EXAMPLES:
+  rype index migrate -i old.ryxdi -o new.ryxdi
+
+v2 shards store one row per distinct minimizer instead of one row per
+(minimizer, bucket_id) pair, cutting shard-load decode cost roughly by the
+average number of buckets sharing a minimizer. Migration is a single
+streaming pass over already-sorted data — no re-sort, no re-extraction from
+reference sequences — and preserves classification output exactly (same
+minimizers, same bucket assignments).
+
+An already-v2 index is rejected rather than silently no-op'd.")]
+    Migrate {
+        /// Path to the v1 index directory to migrate (.ryxdi)
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Output path for the migrated v2 index (.ryxdi directory will be created)
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Row group size (rows per group). Larger = better compression.
+        #[arg(long, default_value_t = 100_000)]
+        row_group_size: usize,
+
+        /// Use Zstd compression instead of Snappy for Parquet files.
+        #[arg(long)]
+        zstd: bool,
+
+        /// Enable bloom filters for faster lookups.
+        #[arg(long)]
+        bloom_filter: bool,
+
+        /// Bloom filter false positive probability (0.0-1.0).
+        #[arg(long, default_value = "0.05", value_parser = parse_bloom_fpp)]
+        bloom_fpp: f64,
+
+        /// Print timing diagnostics to stderr for performance analysis.
+        #[arg(long)]
+        timing: bool,
+    },
 }
 
 #[derive(Subcommand)]

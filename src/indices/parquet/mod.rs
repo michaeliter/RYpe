@@ -18,6 +18,7 @@ mod arrow_build;
 mod buckets;
 mod manifest;
 pub mod merge;
+pub mod migrate;
 mod options;
 pub(crate) mod shard_decode;
 mod streaming;

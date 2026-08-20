@@ -365,6 +365,57 @@ fn main() -> Result<()> {
                     }
                 }
             }
+
+            IndexCommands::Migrate {
+                input,
+                output,
+                row_group_size,
+                zstd,
+                bloom_filter,
+                bloom_fpp,
+                timing,
+            } => {
+                use rype::parquet_index::{migrate, ParquetCompression, ParquetWriteOptions};
+
+                if timing {
+                    ENABLE_TIMING.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                if !rype::is_parquet_index(&input) {
+                    return Err(anyhow!(
+                        "Input index not found or not in Parquet format: {}",
+                        input.display()
+                    ));
+                }
+
+                let write_options = ParquetWriteOptions {
+                    row_group_size,
+                    compression: if zstd {
+                        ParquetCompression::Zstd
+                    } else {
+                        ParquetCompression::Snappy
+                    },
+                    bloom_filter_enabled: bloom_filter,
+                    bloom_filter_fpp: bloom_fpp,
+                    write_page_statistics: true,
+                };
+
+                let output_path = output.with_extension("ryxdi");
+                let manifest = migrate::migrate_v1_to_v2(&input, &output_path, &write_options)?;
+
+                let inverted = manifest.inverted.as_ref();
+                println!("Migration complete:");
+                println!("  Output: {}", output_path.display());
+                println!("  Buckets: {}", manifest.num_buckets);
+                println!(
+                    "  Shards: {}",
+                    inverted.map(|i| i.num_shards).unwrap_or(0)
+                );
+                println!(
+                    "  Total minimizer entries: {}",
+                    inverted.map(|i| i.total_entries).unwrap_or(0)
+                );
+            }
         },
 
         Commands::Classify(classify_cmd) => match classify_cmd {
