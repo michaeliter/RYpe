@@ -307,7 +307,7 @@ fn build_index_from_arrow_inner(
         num_buckets,
         total_minimizers,
         inverted: Some(InvertedManifest {
-            format: ParquetShardFormat::Parquet,
+            format: ParquetShardFormat::Csr,
             num_shards,
             total_entries,
             has_overlapping_shards: false,

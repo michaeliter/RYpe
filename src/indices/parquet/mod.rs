@@ -19,6 +19,7 @@ mod buckets;
 mod manifest;
 pub mod merge;
 mod options;
+pub(crate) mod shard_decode;
 mod streaming;
 
 /// Format version for the Parquet-based index.

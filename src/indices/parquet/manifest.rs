@@ -48,12 +48,27 @@ pub struct ParquetManifest {
 }
 
 /// Shard format identifier stored in manifest.
+///
+/// This is the compatibility gate for shard-level (not manifest-level) format
+/// changes: a binary that doesn't know about a variant fails to deserialize the
+/// manifest at `ParquetManifest::load` (a clear "parse manifest" error) rather
+/// than misreading the Parquet schema. Adding a variant here is safe for old
+/// binaries reading new indices; it does not by itself require bumping
+/// `FORMAT_VERSION`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ParquetShardFormat {
-    /// Parquet format (the only format for ParquetManifest)
+    /// v1: one row per `(minimizer, bucket_id)` pair — `minimizer: UInt64`,
+    /// `bucket_id: UInt32`.
     #[default]
     Parquet,
+    /// v2: one row per distinct minimizer — `minimizer: UInt64`,
+    /// `bucket_ids: List<UInt32>` — cutting decoded minimizer-column values
+    /// (and therefore shard-load decode cost) by the average number of
+    /// buckets sharing a minimizer, ~4.2x on the reference perf index. See
+    /// `scratch/PHASE0-RESULTS.md` and the plan at
+    /// `~/.claude/plans/we-previously-suggested-improving-async-zebra.md`.
+    Csr,
 }
 
 /// Manifest section for inverted index shards.

@@ -1832,7 +1832,7 @@ pub fn build_parquet_index_from_config(
         num_buckets: 1,
         total_minimizers: result.total_minimizers,
         inverted: Some(InvertedManifest {
-            format: ParquetShardFormat::Parquet,
+            format: ParquetShardFormat::Csr,
             num_shards: result.shard_infos.len() as u32,
             total_entries,
             // Shards are non-overlapping after consolidate_shards merges and
@@ -2198,7 +2198,7 @@ pub fn build_parquet_index_from_config_streaming(
         num_buckets: bucket_names_map.len() as u32,
         total_minimizers,
         inverted: Some(InvertedManifest {
-            format: ParquetShardFormat::Parquet,
+            format: ParquetShardFormat::Csr,
             num_shards: shard_infos.len() as u32,
             total_entries,
             has_overlapping_shards: true,
@@ -4403,7 +4403,11 @@ files = ["short.fa", "long.fa"]
             let path = output_dir
                 .join("inverted")
                 .join(rype::parquet_index::files::inverted_shard(shard.shard_id));
-            let pairs = rype::parquet_index::merge::read_shard_pairs(&path).unwrap();
+            let pairs = rype::parquet_index::merge::read_shard_pairs(
+                &path,
+                rype::parquet_index::ParquetShardFormat::Csr,
+            )
+            .unwrap();
             for (m, _) in pairs {
                 all_minimizers.push(m);
             }
@@ -4766,7 +4770,7 @@ files = ["short.fa", "long.fa"]
             num_buckets: 1,
             total_minimizers: result.total_minimizers,
             inverted: Some(InvertedManifest {
-                format: ParquetShardFormat::Parquet,
+                format: ParquetShardFormat::Csr,
                 num_shards: result.shard_infos.len() as u32,
                 total_entries,
                 // Shards are non-overlapping after consolidation
@@ -5109,7 +5113,7 @@ files = ["short.fa", "long.fa"]
             let path = output_dir
                 .join("inverted")
                 .join(files::inverted_shard(s.shard_id));
-            let pairs = read_shard_pairs(&path).unwrap();
+            let pairs = read_shard_pairs(&path, manifest.shard_format).unwrap();
             total_entries += pairs.len() as u64;
             for (m, _) in &pairs {
                 assert!(

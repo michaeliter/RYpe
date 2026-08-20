@@ -140,7 +140,7 @@ pub fn create_parquet_inverted_index(
         num_buckets: bucket_names.len() as u32,
         total_minimizers,
         inverted: Some(InvertedManifest {
-            format: ParquetShardFormat::Parquet,
+            format: ParquetShardFormat::Csr,
             num_shards: shard_infos.len() as u32,
             total_entries,
             has_overlapping_shards,
@@ -1086,17 +1086,46 @@ fn write_shard_from_pairs(
     writer.finish()
 }
 
-/// Helper struct for writing a single Parquet shard.
+/// Helper struct for writing a single Parquet shard in the v2 CSR layout: one
+/// row per distinct minimizer, buckets as a `List<UInt32>`. Cuts decoded
+/// minimizer-column values (the dominant shard-load decode cost — see
+/// `scratch/PHASE0-RESULTS.md`) by the average number of buckets sharing a
+/// minimizer.
+///
+/// `write_batch` keeps the pre-v2 pair-shaped call signature
+/// (`(minimizers[i], bucket_ids[i])` parallel slices, sorted by
+/// `(minimizer, bucket_id)`) so none of its three call sites — the sequential
+/// k-way merge, the parallel range-partitioned merge, and
+/// `write_shard_from_pairs` — need to change: they can still cut a batch or a
+/// shard file at an arbitrary pair-count boundary, including mid-run. The
+/// run-grouping (converting a stream of pairs into CSR rows) happens
+/// entirely inside this struct via `pending`, which carries an incomplete
+/// trailing run across `write_batch` calls so a RecordBatch is never emitted
+/// with a partial run.
 struct ShardWriter {
     writer: ArrowWriter<File>,
     schema: Arc<Schema>,
+    /// Minimizer of the run in progress, and its bucket ids so far. `None`
+    /// when no run is in progress (only true before the first pair or right
+    /// after `finish`).
+    pending: Option<(u64, Vec<u32>)>,
+    /// Completed runs not yet flushed to the `ArrowWriter`.
+    out_minimizers: Vec<u64>,
+    /// CSR offsets into `out_bucket_values`, len == out_minimizers.len() + 1,
+    /// starts at [0].
+    out_offsets: Vec<u32>,
+    out_bucket_values: Vec<u32>,
 }
 
 impl ShardWriter {
     fn new(path: &Path, options: &ParquetWriteOptions) -> Result<Self> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("minimizer", DataType::UInt64, false),
-            Field::new("bucket_id", DataType::UInt32, false),
+            Field::new(
+                "bucket_ids",
+                DataType::List(Arc::new(Field::new("item", DataType::UInt32, false))),
+                false,
+            ),
         ]));
 
         // DRY: Use ParquetWriteOptions::to_writer_properties() as single source of truth
@@ -1106,27 +1135,90 @@ impl ShardWriter {
             File::create(path).map_err(|e| RypeError::io(path.to_path_buf(), "create shard", e))?;
         let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
 
-        Ok(Self { writer, schema })
+        Ok(Self {
+            writer,
+            schema,
+            pending: None,
+            out_minimizers: Vec::new(),
+            out_offsets: vec![0],
+            out_bucket_values: Vec::new(),
+        })
     }
 
     /// Return actual bytes written to the file so far.
+    ///
+    /// Reflects only flushed RecordBatches — an in-progress `pending` run
+    /// (bounded by one minimizer's bucket count, negligible next to
+    /// `max_shard_bytes`) isn't counted until it completes and flushes.
     fn bytes_written(&self) -> usize {
         self.writer.bytes_written()
     }
 
-    fn write_batch(&mut self, minimizers: &[u64], bucket_ids: &[u32]) -> Result<()> {
-        let minimizer_array: ArrayRef =
-            Arc::new(arrow::array::UInt64Array::from(minimizers.to_vec()));
-        let bucket_id_array: ArrayRef =
-            Arc::new(arrow::array::UInt32Array::from(bucket_ids.to_vec()));
+    /// Complete the current `pending` run (if any) into the `out_*` buffers.
+    fn flush_pending_into_out(&mut self) {
+        if let Some((minimizer, bucket_ids)) = self.pending.take() {
+            self.out_minimizers.push(minimizer);
+            self.out_bucket_values.extend(bucket_ids);
+            self.out_offsets.push(self.out_bucket_values.len() as u32);
+        }
+    }
 
-        let batch =
-            RecordBatch::try_new(self.schema.clone(), vec![minimizer_array, bucket_id_array])?;
+    /// Emit a RecordBatch from the completed runs in `out_*` and clear them.
+    /// Does not touch `pending` — an in-progress run stays in progress.
+    fn flush_out_batch(&mut self) -> Result<()> {
+        if self.out_minimizers.is_empty() {
+            return Ok(());
+        }
+        let minimizer_array: ArrayRef =
+            Arc::new(arrow::array::UInt64Array::from(std::mem::take(&mut self.out_minimizers)));
+        let offsets = arrow::buffer::OffsetBuffer::new(
+            std::mem::replace(&mut self.out_offsets, vec![0])
+                .into_iter()
+                .map(|o| o as i32)
+                .collect::<Vec<i32>>()
+                .into(),
+        );
+        let values: ArrayRef = Arc::new(arrow::array::UInt32Array::from(std::mem::take(
+            &mut self.out_bucket_values,
+        )));
+        let item_field = Arc::new(Field::new("item", DataType::UInt32, false));
+        let bucket_ids_array: ArrayRef =
+            Arc::new(arrow::array::ListArray::new(item_field, offsets, values, None));
+
+        let batch = RecordBatch::try_new(self.schema.clone(), vec![minimizer_array, bucket_ids_array])?;
         self.writer.write(&batch)?;
         Ok(())
     }
 
-    fn finish(self) -> Result<()> {
+    /// Accept sorted `(minimizer, bucket_id)` pairs, grouping consecutive
+    /// equal minimizers into CSR runs. May be called any number of times
+    /// with arbitrary-length slices, including ones that start or end
+    /// mid-run relative to the previous call.
+    fn write_batch(&mut self, minimizers: &[u64], bucket_ids: &[u32]) -> Result<()> {
+        debug_assert_eq!(minimizers.len(), bucket_ids.len());
+        for (&m, &b) in minimizers.iter().zip(bucket_ids.iter()) {
+            match &mut self.pending {
+                Some((pm, pbids)) if *pm == m => pbids.push(b),
+                Some(_) => {
+                    self.flush_pending_into_out();
+                    self.pending = Some((m, vec![b]));
+                }
+                None => self.pending = Some((m, vec![b])),
+            }
+        }
+        // Flush completed runs to a RecordBatch once enough have accumulated;
+        // the in-progress run (if any) is never included, so this never cuts
+        // mid-run regardless of how `minimizers`/`bucket_ids` were chunked by
+        // the caller.
+        if self.out_minimizers.len() >= PARQUET_BATCH_SIZE {
+            self.flush_out_batch()?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<()> {
+        self.flush_pending_into_out();
+        self.flush_out_batch()?;
         self.writer.close()?;
         Ok(())
     }
@@ -1139,10 +1231,18 @@ impl ShardWriter {
 /// this reader holds at most one `RecordBatch` in memory
 /// (~`PARQUET_BATCH_SIZE × 12 B`). It is intended for streaming k-way merges
 /// where multiple shards are iterated in parallel.
+/// Reads pairs back out of a shard this same binary just wrote via
+/// `ShardWriter` (intermediate build-time shards for consolidation) — always
+/// v2 CSR, since `ShardWriter` no longer writes anything else. No v1
+/// dispatch needed here, unlike the query-path readers, which must still
+/// read shards from indices built by older binaries.
 struct StreamingShardReader {
     iter: parquet::arrow::arrow_reader::ParquetRecordBatchReader,
     current: Option<RecordBatch>,
     row_idx: usize,
+    /// Position within the current row's bucket_ids list.
+    bucket_idx: usize,
+    path: PathBuf,
     #[cfg(debug_assertions)]
     last_pair: Option<(u64, u32)>,
 }
@@ -1159,13 +1259,17 @@ impl StreamingShardReader {
             iter,
             current: None,
             row_idx: 0,
+            bucket_idx: 0,
+            path: path.to_path_buf(),
             #[cfg(debug_assertions)]
             last_pair: None,
         })
     }
 
     fn next_pair(&mut self) -> Result<Option<(u64, u32)>> {
-        use arrow::array::{UInt32Array, UInt64Array};
+        use arrow::array::UInt64Array;
+
+        use super::shard_decode::BucketIdColumn;
 
         loop {
             if let Some(batch) = self.current.as_ref() {
@@ -1177,18 +1281,19 @@ impl StreamingShardReader {
                         .ok_or_else(|| {
                             RypeError::validation("Expected UInt64Array for minimizer column")
                         })?;
-                    let bucket_ids = batch
-                        .column(1)
-                        .as_any()
-                        .downcast_ref::<UInt32Array>()
-                        .ok_or_else(|| {
-                            RypeError::validation("Expected UInt32Array for bucket_id column")
-                        })?;
-                    let pair = (
-                        minimizers.value(self.row_idx),
-                        bucket_ids.value(self.row_idx),
-                    );
-                    self.row_idx += 1;
+                    let bucket_ids =
+                        BucketIdColumn::downcast(batch, ParquetShardFormat::Csr, &self.path)?;
+                    let m = minimizers.value(self.row_idx);
+
+                    let Some(b) = bucket_ids.bucket_at(self.row_idx, self.bucket_idx) else {
+                        // This row's bucket list is exhausted; advance to the
+                        // next row and retry.
+                        self.row_idx += 1;
+                        self.bucket_idx = 0;
+                        continue;
+                    };
+                    let pair = (m, b);
+                    self.bucket_idx += 1;
                     #[cfg(debug_assertions)]
                     {
                         // Sort order of a shard is on `minimizer` only; within a
@@ -1208,6 +1313,7 @@ impl StreamingShardReader {
                 // Current batch exhausted.
                 self.current = None;
                 self.row_idx = 0;
+                self.bucket_idx = 0;
             }
 
             match self.iter.next() {
@@ -1218,6 +1324,7 @@ impl StreamingShardReader {
                     }
                     self.current = Some(batch);
                     self.row_idx = 0;
+                    self.bucket_idx = 0;
                 }
                 None => return Ok(None),
             }
@@ -2116,9 +2223,15 @@ mod tests {
     }
 
     /// Helper to read (minimizer, bucket_id) pairs from a shard parquet file.
+    /// All callers in this module build their fixture via `write_shard_from_pairs`
+    /// (the real `ShardWriter`), which always emits v2 CSR — so this always
+    /// decodes CSR, unlike the public `merge::read_shard_pairs` which must
+    /// still handle v1 shards from older indices.
     fn read_shard_pairs(path: &Path) -> Result<Vec<(u64, u32)>> {
-        use arrow::array::{UInt32Array, UInt64Array};
+        use arrow::array::UInt64Array;
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        use super::super::shard_decode::BucketIdColumn;
 
         let file = std::fs::File::open(path)
             .map_err(|e| RypeError::io(path.to_path_buf(), "open shard", e))?;
@@ -2133,14 +2246,10 @@ mod tests {
                 .as_any()
                 .downcast_ref::<UInt64Array>()
                 .unwrap();
-            let bucket_ids = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .unwrap();
+            let bucket_ids = BucketIdColumn::downcast(&batch, ParquetShardFormat::Csr, path)?;
 
-            for i in 0..batch.num_rows() {
-                pairs.push((minimizers.value(i), bucket_ids.value(i)));
+            for i in 0..bucket_ids.len() {
+                bucket_ids.push_row(i, minimizers.value(i), &mut pairs);
             }
         }
         Ok(pairs)

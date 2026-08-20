@@ -121,8 +121,9 @@ impl InvertedIndex {
         source_hash: u64,
         query_minimizers: &[u64],
         options: Option<&super::super::parquet::ParquetReadOptions>,
+        shard_format: super::super::parquet::ParquetShardFormat,
     ) -> Result<Self> {
-        let all_pairs = load_filtered_coo_pairs(path, k, query_minimizers, options)?;
+        let all_pairs = load_filtered_coo_pairs(path, k, query_minimizers, options, shard_format)?;
 
         if all_pairs.is_empty() {
             return Ok(InvertedIndex {
@@ -187,8 +188,9 @@ impl InvertedIndex {
         k: usize,
         query_minimizers: &[u64],
         options: Option<&super::super::parquet::ParquetReadOptions>,
+        shard_format: super::super::parquet::ParquetShardFormat,
     ) -> Result<Vec<(u64, u32)>> {
-        load_filtered_coo_pairs(path, k, query_minimizers, options)
+        load_filtered_coo_pairs(path, k, query_minimizers, options, shard_format)
     }
 }
 
@@ -205,8 +207,9 @@ fn load_filtered_coo_pairs(
     k: usize,
     query_minimizers: &[u64],
     options: Option<&super::super::parquet::ParquetReadOptions>,
+    shard_format: super::super::parquet::ParquetShardFormat,
 ) -> Result<Vec<(u64, u32)>> {
-    use arrow::array::{Array, UInt32Array, UInt64Array};
+    use arrow::array::{Array, UInt64Array};
     use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
     use parquet::file::properties::ReaderProperties;
     use parquet::file::reader::FileReader;
@@ -214,6 +217,8 @@ fn load_filtered_coo_pairs(
     use parquet::file::statistics::Statistics;
     use rayon::prelude::*;
     use std::fs::File;
+
+    use super::super::parquet::shard_decode::BucketIdColumn;
 
     let use_bloom_filter = options.map(|o| o.use_bloom_filter).unwrap_or(false);
 
@@ -587,16 +592,9 @@ fn load_filtered_coo_pairs(
                         RypeError::format(&path, "Expected UInt64Array for minimizer column")
                     })?;
 
-                let bid_col = batch
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<UInt32Array>()
-                    .ok_or_else(|| {
-                        RypeError::format(&path, "Expected UInt32Array for bucket_id column")
-                    })?;
+                let bid_col = BucketIdColumn::downcast(&batch, shard_format, &path)?;
 
                 let mins: &[u64] = min_col.values();
-                let bids: &[u32] = bid_col.values();
 
                 if let (Some(&first_min), Some(prev_last)) = (mins.first(), prev_batch_last_min) {
                     if prev_last > first_min {
@@ -656,7 +654,7 @@ fn load_filtered_coo_pairs(
                     } else if qv > rv {
                         ri += 1;
                     } else {
-                        pairs.push((rv, bids[ri]));
+                        bid_col.push_row(ri, rv, &mut pairs);
                         ri += 1;
                     }
                 }
@@ -804,11 +802,14 @@ pub fn load_row_group_pairs(
     path: &std::path::Path,
     rg_idx: usize,
     query_minimizers: &[u64],
+    shard_format: super::super::parquet::ParquetShardFormat,
 ) -> Result<Vec<(u64, u32)>> {
-    use arrow::array::{Array, UInt32Array, UInt64Array};
+    use arrow::array::{Array, UInt64Array};
     use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
     use parquet::file::statistics::Statistics;
     use std::fs::File;
+
+    use super::super::parquet::shard_decode::BucketIdColumn;
 
     if query_minimizers.is_empty() {
         return Ok(Vec::new());
@@ -923,14 +924,9 @@ pub fn load_row_group_pairs(
             .downcast_ref::<UInt64Array>()
             .ok_or_else(|| RypeError::format(path, "Expected UInt64Array for minimizer column"))?;
 
-        let bid_col = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .ok_or_else(|| RypeError::format(path, "Expected UInt32Array for bucket_id column"))?;
+        let bid_col = BucketIdColumn::downcast(&batch, shard_format, path)?;
 
         let mins: &[u64] = min_col.values();
-        let bids: &[u32] = bid_col.values();
 
         let mut ri = 0usize;
         while qi < bounded_queries.len() && ri < mins.len() {
@@ -941,7 +937,7 @@ pub fn load_row_group_pairs(
             } else if qv > rv {
                 ri += 1;
             } else {
-                pairs.push((rv, bids[ri]));
+                bid_col.push_row(ri, rv, &mut pairs);
                 ri += 1;
             }
         }
@@ -1090,6 +1086,7 @@ mod tests {
             inverted.source_hash,
             &query_minimizers,
             None, // No bloom filter options for tests
+            crate::indices::parquet::ParquetShardFormat::Parquet,
         )?;
 
         // Verify we only got the queried minimizers
@@ -1125,6 +1122,7 @@ mod tests {
             inverted.source_hash,
             &[],  // empty query
             None, // No bloom filter options
+            crate::indices::parquet::ParquetShardFormat::Parquet,
         )?;
 
         assert_eq!(loaded.minimizers().len(), 0);
@@ -1152,6 +1150,7 @@ mod tests {
             inverted.source_hash,
             &query_minimizers,
             None, // No bloom filter options for tests
+            crate::indices::parquet::ParquetShardFormat::Parquet,
         )?;
 
         assert_eq!(loaded.minimizers().len(), 0);
@@ -1203,6 +1202,7 @@ mod tests {
             inverted.source_hash,
             &query_minimizers,
             None, // No bloom filter options for tests
+            crate::indices::parquet::ParquetShardFormat::Parquet,
         )?;
 
         // Should find all queried minimizers
@@ -1239,6 +1239,7 @@ mod tests {
             inverted.source_hash,
             &unsorted_query,
             None,
+            crate::indices::parquet::ParquetShardFormat::Parquet,
         );
 
         assert!(result.is_err());
@@ -1305,7 +1306,13 @@ mod tests {
 
         // Query spans both row groups so both get selected for reading.
         let query_minimizers = vec![5u64, 100_005u64];
-        let result = load_filtered_coo_pairs(&path, 64, &query_minimizers, None);
+        let result = load_filtered_coo_pairs(
+            &path,
+            64,
+            &query_minimizers,
+            None,
+            crate::indices::parquet::ParquetShardFormat::Parquet,
+        );
 
         assert!(
             result.is_err(),
@@ -1390,7 +1397,13 @@ mod tests {
         query_minimizers.sort_unstable();
         query_minimizers.dedup();
 
-        let result = load_filtered_coo_pairs(&path, 64, &query_minimizers, None);
+        let result = load_filtered_coo_pairs(
+            &path,
+            64,
+            &query_minimizers,
+            None,
+            crate::indices::parquet::ParquetShardFormat::Parquet,
+        );
 
         assert!(
             result.is_err(),
@@ -1427,6 +1440,7 @@ mod tests {
             inverted.source_hash,
             &query_minimizers,
             None, // No bloom filter options for tests
+            crate::indices::parquet::ParquetShardFormat::Parquet,
         )?;
 
         // Should find all 2000 queried minimizers
@@ -1465,6 +1479,7 @@ mod tests {
             inverted.source_hash,
             &query_minimizers,
             None, // No bloom filter options for tests
+            crate::indices::parquet::ParquetShardFormat::Parquet,
         )?;
 
         // Should find both boundary minimizers
@@ -1482,7 +1497,8 @@ mod tests {
             inverted.source_hash,
             &query_outside,
             None,
-        )?;
+        crate::indices::parquet::ParquetShardFormat::Parquet,
+    )?;
 
         // Should find nothing (99 < min, 1001 > max)
         assert_eq!(loaded_outside.minimizers().len(), 0);
@@ -1543,7 +1559,8 @@ mod tests {
             inverted.source_hash,
             &high_value_minimizers,
             Some(&read_opts),
-        )?;
+        crate::indices::parquet::ParquetShardFormat::Parquet,
+    )?;
 
         // Verify all high-value minimizers were found
         for &m in &high_value_minimizers {
@@ -1592,7 +1609,8 @@ mod tests {
             inverted.source_hash,
             &outside_range,
             Some(&read_opts),
-        )?;
+        crate::indices::parquet::ParquetShardFormat::Parquet,
+    )?;
 
         // Stats filtering rejects these (outside min/max range)
         assert_eq!(loaded_outside.minimizers().len(), 0);
@@ -1611,7 +1629,8 @@ mod tests {
             inverted.source_hash,
             &within_range_but_absent,
             Some(&read_opts),
-        )?;
+        crate::indices::parquet::ParquetShardFormat::Parquet,
+    )?;
 
         // These specific values should not be in the result
         // (the row group might be included due to stats overlap, but the values won't match)
@@ -1655,7 +1674,8 @@ mod tests {
             inverted.source_hash,
             &query,
             Some(&read_opts),
-        )?;
+        crate::indices::parquet::ParquetShardFormat::Parquet,
+    )?;
 
         // Should still find the minimizers (graceful fallback to stats-only)
         for &m in &query {
@@ -1697,7 +1717,8 @@ mod tests {
             inverted.source_hash,
             &empty_query,
             Some(&read_opts),
-        )?;
+        crate::indices::parquet::ParquetShardFormat::Parquet,
+    )?;
 
         // Empty query should return empty result
         assert_eq!(loaded.minimizers().len(), 0);
@@ -1752,7 +1773,8 @@ mod tests {
             inverted.source_hash,
             &query,
             Some(&read_opts),
-        )?;
+        crate::indices::parquet::ParquetShardFormat::Parquet,
+    )?;
 
         // Bloom filters guarantee NO false negatives
         // Every queried value that exists MUST be found
@@ -1790,7 +1812,7 @@ mod tests {
 
         // Load pairs from row group 0 with specific query
         let query_minimizers = vec![200, 300, 500];
-        let pairs = load_row_group_pairs(&path, 0, &query_minimizers)?;
+        let pairs = load_row_group_pairs(&path, 0, &query_minimizers, crate::indices::parquet::ParquetShardFormat::Parquet)?;
 
         // Should find pairs for minimizers 200, 300, 500
         let found_mins: std::collections::HashSet<u64> = pairs.iter().map(|(m, _)| *m).collect();
@@ -1822,7 +1844,7 @@ mod tests {
 
         // Query spans wider range than row group
         let query_minimizers = vec![100, 200, 500, 600, 700, 800, 900];
-        let pairs = load_row_group_pairs(&path, 0, &query_minimizers)?;
+        let pairs = load_row_group_pairs(&path, 0, &query_minimizers, crate::indices::parquet::ParquetShardFormat::Parquet)?;
 
         // Should only find pairs within row group range
         for (m, _) in &pairs {
@@ -1853,7 +1875,7 @@ mod tests {
 
         // Query outside row group range
         let query_minimizers = vec![500, 600, 700];
-        let pairs = load_row_group_pairs(&path, 0, &query_minimizers)?;
+        let pairs = load_row_group_pairs(&path, 0, &query_minimizers, crate::indices::parquet::ParquetShardFormat::Parquet)?;
 
         // No overlap - should return empty
         assert!(pairs.is_empty());
@@ -1870,7 +1892,7 @@ mod tests {
         inverted.save_shard_parquet(&path, 0, None)?;
 
         // Empty query
-        let pairs = load_row_group_pairs(&path, 0, &[])?;
+        let pairs = load_row_group_pairs(&path, 0, &[], crate::indices::parquet::ParquetShardFormat::Parquet)?;
         assert!(pairs.is_empty());
 
         Ok(())
@@ -1887,7 +1909,7 @@ mod tests {
 
         let query_minimizers = vec![200, 300];
 
-        let pairs = load_row_group_pairs(&path, 0, &query_minimizers)?;
+        let pairs = load_row_group_pairs(&path, 0, &query_minimizers, crate::indices::parquet::ParquetShardFormat::Parquet)?;
 
         // Should find pairs for 200 and 300
         let found_mins: std::collections::HashSet<u64> = pairs.iter().map(|(m, _)| *m).collect();
@@ -1961,7 +1983,7 @@ mod tests {
         inverted.save_shard_parquet(&path, 0, None)?;
 
         // Try to load invalid row group index
-        let result = load_row_group_pairs(&path, 999, &[100, 200]);
+        let result = load_row_group_pairs(&path, 999, &[100, 200], crate::indices::parquet::ParquetShardFormat::Parquet);
 
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();

@@ -507,6 +507,7 @@ fn parallel_rg_inner<A>(
     total_rg_count: usize,
     filtered_rg_count: usize,
     t_start: Instant,
+    shard_format: crate::indices::parquet::ParquetShardFormat,
     make_acc: impl Fn() -> A + Send + Sync,
 ) -> Result<Vec<HitResult>>
 where
@@ -575,7 +576,8 @@ where
             work_items
                 .into_par_iter()
                 .try_fold(&make_acc, |mut acc, (shard_path, rg_idx)| -> Result<A> {
-                    let pairs = load_row_group_pairs(&shard_path, rg_idx, query_minimizers)?;
+                    let pairs =
+                        load_row_group_pairs(&shard_path, rg_idx, query_minimizers, shard_format)?;
                     let pair_count = pairs.len();
                     if !pairs.is_empty() {
                         let hits = merge_join_pairs_sparse(query_idx, &pairs);
@@ -614,7 +616,12 @@ where
                 let results: Result<Vec<Vec<SparseHit>>> = chunk
                     .par_iter()
                     .map(|(shard_path, rg_idx)| {
-                        let pairs = load_row_group_pairs(shard_path, *rg_idx, query_minimizers)?;
+                        let pairs = load_row_group_pairs(
+                            shard_path,
+                            *rg_idx,
+                            query_minimizers,
+                            shard_format,
+                        )?;
                         let pair_count = pairs.len();
                         let hits = merge_join_pairs_sparse(query_idx, &pairs);
                         pairs_ref.fetch_add(pair_count as u64, Ordering::Relaxed);
@@ -753,6 +760,7 @@ pub fn classify_from_query_index_parallel_rg(
             total_rg_count,
             filtered_rg_count,
             t_start,
+            manifest.shard_format,
             || DenseAccumulator::new(num_reads, max_id),
         )
     } else {
@@ -766,6 +774,7 @@ pub fn classify_from_query_index_parallel_rg(
             total_rg_count,
             filtered_rg_count,
             t_start,
+            manifest.shard_format,
             || SparseAccumulator::new(num_reads),
         )
     }

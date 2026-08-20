@@ -7,7 +7,7 @@
 //! - Manifest counts match actual data
 
 use anyhow::Result;
-use arrow::array::{Array, UInt32Array, UInt64Array};
+use arrow::array::{Array, ListArray, UInt32Array, UInt64Array};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::HashSet;
 use std::fs::File;
@@ -43,7 +43,11 @@ fn create_test_buckets() -> Vec<BucketData> {
     ]
 }
 
-/// Read all (minimizer, bucket_id) pairs from a Parquet shard file.
+/// Read all (minimizer, bucket_id) pairs from a Parquet shard file, expanding
+/// v2's one-row-per-minimizer `List<UInt32>` `bucket_ids` column back into
+/// individual pairs. `create_parquet_inverted_index` always writes v2 now
+/// (see `ParquetShardFormat::Csr`) — this reads the real on-disk shape via
+/// the public API, not a v1-only assumption.
 fn read_shard_pairs(path: &Path) -> Result<Vec<(u64, u32)>> {
     let file = File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
@@ -60,15 +64,23 @@ fn read_shard_pairs(path: &Path) -> Result<Vec<(u64, u32)>> {
             .downcast_ref::<UInt64Array>()
             .expect("minimizer should be UInt64");
 
-        let bucket_ids = batch
-            .column_by_name("bucket_id")
-            .expect("bucket_id column missing")
+        let bucket_ids_list = batch
+            .column_by_name("bucket_ids")
+            .expect("bucket_ids column missing")
             .as_any()
-            .downcast_ref::<UInt32Array>()
-            .expect("bucket_id should be UInt32");
+            .downcast_ref::<ListArray>()
+            .expect("bucket_ids should be List<UInt32>");
 
         for i in 0..batch.num_rows() {
-            pairs.push((minimizers.value(i), bucket_ids.value(i)));
+            let m = minimizers.value(i);
+            let row_buckets = bucket_ids_list.value(i);
+            let row_buckets = row_buckets
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .expect("bucket_ids list items should be UInt32");
+            for b in row_buckets.values() {
+                pairs.push((m, *b));
+            }
         }
     }
 
@@ -102,16 +114,28 @@ fn test_parquet_schema_is_correct() -> Result<()> {
         "minimizer should not be nullable"
     );
 
-    let bucket_id_field = schema.field_with_name("bucket_id")?;
-    assert_eq!(
-        bucket_id_field.data_type(),
-        &arrow::datatypes::DataType::UInt32,
-        "bucket_id should be UInt32"
-    );
+    // v2 (ParquetShardFormat::Csr): one row per distinct minimizer, buckets
+    // as a List<UInt32> rather than one row per (minimizer, bucket_id) pair —
+    // see scratch/PHASE0-RESULTS.md and the "ryxdi v2" plan for why.
+    let bucket_ids_field = schema.field_with_name("bucket_ids")?;
     assert!(
-        !bucket_id_field.is_nullable(),
-        "bucket_id should not be nullable"
+        !bucket_ids_field.is_nullable(),
+        "bucket_ids should not be nullable"
     );
+    match bucket_ids_field.data_type() {
+        arrow::datatypes::DataType::List(item_field) => {
+            assert_eq!(
+                item_field.data_type(),
+                &arrow::datatypes::DataType::UInt32,
+                "bucket_ids list items should be UInt32"
+            );
+            assert!(
+                !item_field.is_nullable(),
+                "bucket_ids list items should not be nullable"
+            );
+        }
+        other => panic!("bucket_ids should be List<UInt32>, got {other:?}"),
+    }
 
     Ok(())
 }

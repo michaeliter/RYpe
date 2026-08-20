@@ -58,6 +58,10 @@ pub struct ShardManifest {
     /// Always `true` for bucket-partitioned shards (the only type currently supported).
     /// When true, shards have overlapping minimizer ranges and classification must check all shards.
     pub has_overlapping_shards: bool,
+    /// On-disk row layout of every shard in this index (v1 COO or v2 CSR).
+    /// One value for the whole index, not per-shard: all shards of one index
+    /// are written by the same build, so they share a format.
+    pub shard_format: super::parquet::ParquetShardFormat,
     pub shards: Vec<ShardInfo>,
     /// Bucket names. Maps bucket_id to human-readable name.
     pub bucket_names: HashMap<u32, String>,
@@ -174,6 +178,7 @@ impl ShardedInvertedIndex {
             total_minimizers: inverted.total_entries.min(usize::MAX as u64) as usize,
             total_bucket_ids: inverted.total_entries.min(usize::MAX as u64) as usize,
             has_overlapping_shards: inverted.has_overlapping_shards,
+            shard_format: inverted.format,
             shards,
             bucket_names,
             bucket_sources,
@@ -414,6 +419,7 @@ impl ShardedInvertedIndex {
             self.manifest.source_hash,
             query_minimizers,
             options,
+            self.manifest.shard_format,
         )
         .map_err(|e| RypeError::format(&path, e.to_string()))
     }
@@ -434,8 +440,14 @@ impl ShardedInvertedIndex {
         options: Option<&super::parquet::ParquetReadOptions>,
     ) -> Result<Vec<(u64, u32)>> {
         let path = self.shard_path(shard_id);
-        InvertedIndex::load_shard_coo_for_query(&path, self.manifest.k, query_minimizers, options)
-            .map_err(|e| RypeError::format(&path, e.to_string()))
+        InvertedIndex::load_shard_coo_for_query(
+            &path,
+            self.manifest.k,
+            query_minimizers,
+            options,
+            self.manifest.shard_format,
+        )
+        .map_err(|e| RypeError::format(&path, e.to_string()))
     }
 
     /// Check if this index uses Parquet format (always true).

@@ -241,9 +241,10 @@ pub struct MergeStats {
 pub fn load_all_minimizers(index: &ShardedInvertedIndex) -> Result<HashSet<u64>> {
     let mut minimizers = HashSet::new();
 
+    let shard_format = index.manifest().shard_format;
     for shard_info in &index.manifest().shards {
         let shard_path = index.shard_path(shard_info.shard_id);
-        let pairs = read_shard_pairs(&shard_path)?;
+        let pairs = read_shard_pairs(&shard_path, shard_format)?;
         for (minimizer, _) in pairs {
             minimizers.insert(minimizer);
         }
@@ -282,11 +283,14 @@ fn process_shard_parallel_row_groups(
     shard_path: &Path,
     exclusion_set: &HashSet<u64>,
     remapping: &HashMap<u32, u32>,
+    shard_format: ParquetShardFormat,
 ) -> Result<RowGroupProcessingResult> {
-    use arrow::array::{UInt32Array, UInt64Array};
+    use arrow::array::UInt64Array;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::file::reader::FileReader;
     use parquet::file::serialized_reader::SerializedFileReader;
+
+    use super::shard_decode::BucketIdColumn;
 
     // Get row group count
     let file = File::open(shard_path)
@@ -353,41 +357,35 @@ fn process_shard_parallel_row_groups(
                         )
                     })?;
 
-                let bucket_ids = batch
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<UInt32Array>()
-                    .ok_or_else(|| {
-                        RypeError::format(
-                            &shard_path_buf,
-                            "Expected UInt32Array for bucket_id column",
-                        )
-                    })?;
+                let bucket_ids = BucketIdColumn::downcast(&batch, shard_format, &shard_path_buf)?;
 
-                for i in 0..batch.num_rows() {
+                for i in 0..bucket_ids.len() {
                     let minimizer = minimizers.value(i);
-                    let old_bucket_id = bucket_ids.value(i);
+                    let mut bi = 0usize;
+                    while let Some(old_bucket_id) = bucket_ids.bucket_at(i, bi) {
+                        bi += 1;
 
-                    // Track original count
-                    *bucket_counts_original.entry(old_bucket_id).or_insert(0) += 1;
+                        // Track original count
+                        *bucket_counts_original.entry(old_bucket_id).or_insert(0) += 1;
 
-                    // O(1) HashSet lookup for exclusion
-                    if exclusion_set.contains(&minimizer) {
-                        excluded += 1;
-                        continue;
+                        // O(1) HashSet lookup for exclusion
+                        if exclusion_set.contains(&minimizer) {
+                            excluded += 1;
+                            continue;
+                        }
+
+                        // Remap bucket ID
+                        let new_bucket_id = *remapping.get(&old_bucket_id).ok_or_else(|| {
+                            RypeError::validation(format!(
+                                "Secondary bucket ID {} not found in remapping",
+                                old_bucket_id
+                            ))
+                        })?;
+
+                        filtered_pairs.push((minimizer, new_bucket_id));
+                        *bucket_counts.entry(old_bucket_id).or_insert(0) += 1;
+                        *bucket_minimizer_counts.entry(new_bucket_id).or_insert(0) += 1;
                     }
-
-                    // Remap bucket ID
-                    let new_bucket_id = *remapping.get(&old_bucket_id).ok_or_else(|| {
-                        RypeError::validation(format!(
-                            "Secondary bucket ID {} not found in remapping",
-                            old_bucket_id
-                        ))
-                    })?;
-
-                    filtered_pairs.push((minimizer, new_bucket_id));
-                    *bucket_counts.entry(old_bucket_id).or_insert(0) += 1;
-                    *bucket_minimizer_counts.entry(new_bucket_id).or_insert(0) += 1;
                 }
             }
 
@@ -480,7 +478,7 @@ fn finish_merge(
         num_buckets: remapped.bucket_names.len() as u32,
         total_minimizers: total_entries,
         inverted: Some(InvertedManifest {
-            format: ParquetShardFormat::Parquet,
+            format: ParquetShardFormat::Csr,
             num_shards: shard_infos.len() as u32,
             total_entries,
             has_overlapping_shards,
@@ -669,7 +667,7 @@ pub fn merge_indices_streaming(
 
         // Read shard pairs and remap bucket IDs
         let shard_path = primary.shard_path(shard_info.shard_id);
-        let pairs = read_shard_pairs(&shard_path)?;
+        let pairs = read_shard_pairs(&shard_path, primary.manifest().shard_format)?;
 
         for (minimizer, old_bucket_id) in pairs {
             let new_bucket_id = *remapped.primary_id_map.get(&old_bucket_id).ok_or_else(|| {
@@ -743,6 +741,7 @@ pub fn merge_indices_streaming(
                 &shard_path,
                 &primary_minimizers,
                 &remapped.secondary_id_map,
+                secondary.manifest().shard_format,
             )?;
 
             // Update statistics
@@ -821,7 +820,7 @@ pub fn merge_indices_streaming(
             );
 
             let shard_path = secondary.shard_path(shard_info.shard_id);
-            let pairs = read_shard_pairs(&shard_path)?;
+            let pairs = read_shard_pairs(&shard_path, secondary.manifest().shard_format)?;
 
             for (minimizer, old_bucket_id) in pairs {
                 secondary_entries_original += 1;
@@ -872,9 +871,11 @@ pub fn merge_indices_streaming(
 ///
 /// Loads the entire shard at once — memory usage is O(shard entries × 12 bytes).
 /// Used internally by `consolidate_shards` and available for testing/inspection.
-pub fn read_shard_pairs(path: &Path) -> Result<Vec<(u64, u32)>> {
-    use arrow::array::{UInt32Array, UInt64Array};
+pub fn read_shard_pairs(path: &Path, shard_format: ParquetShardFormat) -> Result<Vec<(u64, u32)>> {
+    use arrow::array::UInt64Array;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    use super::shard_decode::BucketIdColumn;
 
     let file = std::fs::File::open(path)
         .map_err(|e| RypeError::io(path.to_path_buf(), "open shard", e))?;
@@ -889,14 +890,10 @@ pub fn read_shard_pairs(path: &Path) -> Result<Vec<(u64, u32)>> {
             .as_any()
             .downcast_ref::<UInt64Array>()
             .ok_or_else(|| RypeError::format(path, "Expected UInt64Array for minimizer column"))?;
-        let bucket_ids = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .ok_or_else(|| RypeError::format(path, "Expected UInt32Array for bucket_id column"))?;
+        let bucket_ids = BucketIdColumn::downcast(&batch, shard_format, path)?;
 
-        for i in 0..batch.num_rows() {
-            pairs.push((minimizers.value(i), bucket_ids.value(i)));
+        for i in 0..bucket_ids.len() {
+            bucket_ids.push_row(i, minimizers.value(i), &mut pairs);
         }
     }
     Ok(pairs)
@@ -2391,7 +2388,8 @@ mod tests {
             let mut all_entries = Vec::new();
             for shard_info in merged.manifest().shards.iter() {
                 let shard_path = merged.shard_path(shard_info.shard_id);
-                let pairs = read_shard_pairs(&shard_path).unwrap();
+                let pairs =
+                    read_shard_pairs(&shard_path, merged.manifest().shard_format).unwrap();
                 all_entries.extend(pairs);
             }
             all_entries.sort();
