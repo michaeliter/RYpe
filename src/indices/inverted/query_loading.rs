@@ -724,10 +724,7 @@ fn load_filtered_coo_pairs(
                 "read row group chunk",
                 std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    format!(
-                        "row groups {:?}..={:?}: {}",
-                        first_rg, last_rg, e
-                    ),
+                    format!("row groups {:?}..={:?}: {}", first_rg, last_rg, e),
                 ),
             )
         })?;

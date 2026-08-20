@@ -1108,8 +1108,9 @@ pub fn estimate_batch_memory(
     // the real dense stride for contiguously numbered buckets, which is what
     // the index builders produce; an index with sparse bucket ids uses more
     // than this estimate.
-    let accumulators = batch_size
-        .checked_mul(estimate_accumulator_bytes_per_read(num_buckets.saturating_sub(1))?)?;
+    let accumulators = batch_size.checked_mul(estimate_accumulator_bytes_per_read(
+        num_buckets.saturating_sub(1),
+    )?)?;
 
     // Sum components with overflow checking
     let mut base_estimate = input_records
@@ -1453,7 +1454,8 @@ mod tests {
             let is_dense_cost = cost == (max_bucket_id + 1) * 8;
 
             assert_eq!(
-                is_dense_cost, expect_dense,
+                is_dense_cost,
+                expect_dense,
                 "max_bucket_id={max_bucket_id}: estimator picked {} but \
                  use_dense_accumulator picks {} (cost was {cost} bytes/read)",
                 if is_dense_cost { "dense" } else { "sparse" },

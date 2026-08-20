@@ -487,7 +487,11 @@ fn accumulate_coo_run_csr<A: HitAccumulator>(
 /// chunk its own full-size accumulator (see `FOLD_REDUCE_MAX_READS`) — the
 /// output size here is bounded by actual match count, not read count.
 #[inline]
-fn accumulate_coo_run_csr_sparse(entries: &[(u64, u32)], bucket_slice: &[u32], out: &mut Vec<SparseHit>) {
+fn accumulate_coo_run_csr_sparse(
+    entries: &[(u64, u32)],
+    bucket_slice: &[u32],
+    out: &mut Vec<SparseHit>,
+) {
     for &(_, packed) in entries {
         let (read_idx, is_rc) = QueryInvertedIndex::unpack_read_id(packed);
         for &bucket_id in bucket_slice {
@@ -1999,9 +2003,7 @@ mod tests {
     /// minimizers drawn from `[0, keyspace)`, each with 1-4 random bucket ids.
     fn build_random_csr(unique_count: usize, keyspace: u64, seed: u64) -> InvertedIndex {
         let mut rng = Xorshift64(seed | 1);
-        let mut mins: Vec<u64> = (0..unique_count)
-            .map(|_| rng.next() % keyspace)
-            .collect();
+        let mut mins: Vec<u64> = (0..unique_count).map(|_| rng.next() % keyspace).collect();
         mins.sort_unstable();
         mins.dedup();
         // dedup may shrink below unique_count; that's fine for test purposes.
@@ -2034,7 +2036,12 @@ mod tests {
     /// a handful of minimizers drawn from `[0, keyspace)` so that a
     /// meaningful fraction overlap with a reference built from the same
     /// keyspace.
-    fn build_random_query(num_reads: usize, minimizers_per_read: usize, keyspace: u64, seed: u64) -> QueryInvertedIndex {
+    fn build_random_query(
+        num_reads: usize,
+        minimizers_per_read: usize,
+        keyspace: u64,
+        seed: u64,
+    ) -> QueryInvertedIndex {
         let mut rng = Xorshift64(seed | 1);
         let mut queries = Vec::with_capacity(num_reads);
         for _ in 0..num_reads {
@@ -2057,7 +2064,8 @@ mod tests {
         ref_idx: &InvertedIndex,
     ) -> Vec<HashMap<u32, (u32, u32)>> {
         let num_reads = query_idx.num_reads();
-        let mut acc: Vec<HashMap<u32, (u32, u32)>> = (0..num_reads).map(|_| HashMap::new()).collect();
+        let mut acc: Vec<HashMap<u32, (u32, u32)>> =
+            (0..num_reads).map(|_| HashMap::new()).collect();
         for &(m, packed) in &query_idx.entries {
             let (read_idx, is_rc) = QueryInvertedIndex::unpack_read_id(packed);
             if let Ok(pos) = ref_idx.minimizers.binary_search(&m) {
@@ -2114,8 +2122,7 @@ mod tests {
             for bucket_id in 1..=max_bucket_id {
                 let (fwd, rc) = accumulator.data[base + bucket_id as usize];
                 if fwd > 0 || rc > 0 {
-                    let score =
-                        compute_score(fwd as usize, fwd_total, rc as usize, rc_total);
+                    let score = compute_score(fwd as usize, fwd_total, rc as usize, rc_total);
                     out.push((read_idx, bucket_id, score));
                 }
             }
@@ -2135,7 +2142,10 @@ mod tests {
         assert!(rayon::current_num_threads() >= 1);
         let unique_mins = query_idx.unique_minimizers();
         // Sanity: confirm this test actually lands in the intended branch.
-        assert!(unique_mins.len() >= MIN_PARALLEL_SHARD_SIZE || ref_idx.minimizers.len() >= MIN_PARALLEL_SHARD_SIZE);
+        assert!(
+            unique_mins.len() >= MIN_PARALLEL_SHARD_SIZE
+                || ref_idx.minimizers.len() >= MIN_PARALLEL_SHARD_SIZE
+        );
 
         let oracle = oracle_scores(&oracle_csr_join(&query_idx, &ref_idx), &query_idx);
         let dispatched = dispatched_scores(&query_idx, &ref_idx, 50);

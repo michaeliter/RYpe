@@ -6300,8 +6300,9 @@ fn test_multi_pass_byte_budget_run_yields_expected_pass_count() -> Result<()> {
     const READS_PER_BATCH: usize = 5;
     const BATCHES_PER_PASS: usize = 3;
     const NUM_BATCHES: usize = 6;
-    let seq: Vec<u8> = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT"
-        .to_vec();
+    let seq: Vec<u8> =
+        b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT"
+            .to_vec();
     let make_batch = |start_id: i64| -> Vec<rype::QueryRecord<'static>> {
         // Leak so the &[u8] borrows are 'static — fine for a short-lived test.
         (0..READS_PER_BATCH)
@@ -6314,7 +6315,8 @@ fn test_multi_pass_byte_budget_run_yields_expected_pass_count() -> Result<()> {
 
     // Measure three batches' accumulated byte size in isolation, then set
     // the real accumulator's budget to exactly that.
-    let mut probe_acc: rype::QueryAccumulator<i64> = rype::QueryAccumulator::with_budget(usize::MAX);
+    let mut probe_acc: rype::QueryAccumulator<i64> =
+        rype::QueryAccumulator::with_budget(usize::MAX);
     for batch_idx in 0..BATCHES_PER_PASS {
         let start_id = (batch_idx * READS_PER_BATCH) as i64;
         let batch = make_batch(start_id);
@@ -6323,9 +6325,13 @@ fn test_multi_pass_byte_budget_run_yields_expected_pass_count() -> Result<()> {
         probe_acc.extend_extracted(ids, extracted);
     }
     let three_batch_bytes = probe_acc.approx_bytes();
-    assert!(three_batch_bytes > 0, "test setup: batches should produce nonzero entries");
+    assert!(
+        three_batch_bytes > 0,
+        "test setup: batches should produce nonzero entries"
+    );
 
-    let mut acc: rype::QueryAccumulator<i64> = rype::QueryAccumulator::with_budget(three_batch_bytes);
+    let mut acc: rype::QueryAccumulator<i64> =
+        rype::QueryAccumulator::with_budget(three_batch_bytes);
     let mut pass_count = 0usize;
     let mut total_reads_classified = 0usize;
 
