@@ -373,7 +373,7 @@ fn extract_bucket_minimizers_parallel(
     let available = detect_available_memory().bytes / rayon::current_num_threads().max(1);
     let chunk_config = calculate_chunk_config(available);
 
-    let mut merged: Vec<u64> = Vec::new();
+    let mut chunk_results: Vec<Vec<u64>> = Vec::new();
     let mut sources: Vec<String> = Vec::new();
     let mut file_length_map: std::collections::HashMap<String, u64> =
         std::collections::HashMap::new();
@@ -413,27 +413,34 @@ fn extract_bucket_minimizers_parallel(
             )
             .collect();
 
-        let chunk_merged = kway_merge_dedup(chunk_mins);
-        merge_sorted_into(&mut merged, &chunk_merged);
+        chunk_results.push(kway_merge_dedup(chunk_mins));
     }
 
-    // One entry per file that produced sequences, in the order files were
-    // read (matches `build_single_bucket_streaming`'s file-length accounting).
-    let mut file_lengths: Vec<u64> = Vec::with_capacity(files.len());
-    let mut seen_filenames: HashSet<String> = HashSet::new();
-    for file_path in files {
-        let abs_path = resolve_path(config_dir, file_path);
-        let filename = abs_path
-            .canonicalize()
-            .unwrap_or(abs_path)
-            .to_string_lossy()
-            .to_string();
-        if seen_filenames.insert(filename.clone()) {
-            if let Some(&len) = file_length_map.get(&filename) {
-                file_lengths.push(len);
-            }
-        }
-    }
+    // Single k-way merge across all chunks' results (O(n log chunk_count)),
+    // instead of an incremental merge_sorted_into per chunk, which cost
+    // O(bucket_size) per chunk — effectively quadratic in chunk count for a
+    // fixed chunk size. Each chunk's Vec is already sorted+deduped, so this
+    // is exactly what kway_merge_dedup is for.
+    let merged = kway_merge_dedup(chunk_results);
+
+    // One entry per input file, in file order — matches
+    // `extract_bucket_minimizers_oriented`'s per-file accounting exactly: a
+    // file that produced zero sequences (empty/skipped) still gets an entry
+    // of 0, and a duplicated file path in `files` gets one entry per
+    // occurrence, so `--orient` and non-`--orient` builds of the same config
+    // produce identical BucketFileStats.
+    let file_lengths: Vec<u64> = files
+        .iter()
+        .map(|file_path| {
+            let abs_path = resolve_path(config_dir, file_path);
+            let filename = abs_path
+                .canonicalize()
+                .unwrap_or(abs_path)
+                .to_string_lossy()
+                .to_string();
+            file_length_map.get(&filename).copied().unwrap_or(0)
+        })
+        .collect();
 
     Ok((merged, sources, file_lengths))
 }
