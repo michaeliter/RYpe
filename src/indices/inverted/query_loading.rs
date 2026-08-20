@@ -508,7 +508,17 @@ fn load_filtered_coo_pairs(
             let file = File::open(&path)?;
             let builder =
                 ParquetRecordBatchReaderBuilder::new_with_metadata(file, arrow_metadata.clone());
-            let mut reader = builder.with_row_groups(rg_indices).build()?;
+            // Explicit batch size: arrow-rs defaults to 1024 rows/batch, which for a
+            // shard with DEFAULT_ROW_GROUP_SIZE (100_000) rows/row-group means ~100
+            // RecordBatch allocations per row group decoded here. Matching the row
+            // group size means one batch per row group in the common case (a row
+            // group rarely spans a batch boundary), cutting per-batch overhead
+            // ~100x with no correctness change — the two-pointer loop below already
+            // handles a batch spanning multiple row groups or vice versa.
+            let mut reader = builder
+                .with_row_groups(rg_indices)
+                .with_batch_size(DEFAULT_ROW_GROUP_SIZE)
+                .build()?;
 
             let mut pairs = Vec::with_capacity(estimated_pairs_per_rg);
 
@@ -601,27 +611,46 @@ fn load_filtered_coo_pairs(
                         ));
                     }
                 }
-                if let Some(pos) = mins.windows(2).position(|w| w[0] > w[1]) {
-                    return Err(RypeError::format(
-                        &path,
-                        format!(
-                            "non-monotonic minimizer column within a row-group chunk: \
-                             {} follows {} within one batch (row groups {:?})",
-                            mins[pos + 1],
-                            mins[pos],
-                            chunk.iter().map(|&(idx, _, _)| idx).collect::<Vec<_>>(),
-                        ),
-                    ));
-                }
                 if let Some(&last_min) = mins.last() {
                     prev_batch_last_min = Some(last_min);
                 }
 
+                // Intra-batch monotonicity is checked inline in the two-pointer
+                // loop below (via `prev_rv`) instead of a separate
+                // `mins.windows(2).position(...)` pass over the whole batch.
+                // That separate pass touched every decoded row unconditionally,
+                // even in release builds, and measured as a meaningful share of
+                // shard-load wall time. The two-pointer loop already visits
+                // every index of `mins` up to `ri` in ascending order (`ri` only
+                // ever increments), so checking `prev_rv` there covers exactly
+                // the same prefix a `windows(2)` scan would — with one
+                // exception: if `qi` exhausts (`bounded` runs out) before `ri`
+                // reaches the end of `mins`, the unvisited tail of this batch
+                // goes unchecked. That's fine here: `qi` exhausting also ends
+                // the outer `loop` (see the `break` at the top), so this
+                // function never reads or uses any row after that point either
+                // — an unchecked-but-unused tail can't corrupt this call's
+                // output. (Pre-existing behavior already skips whole subsequent
+                // row groups in a chunk once `qi` exhausts, for the same reason.)
                 let t_filter = Instant::now();
                 let mut ri = 0usize;
+                let mut prev_rv: Option<u64> = None;
                 while qi < bounded.len() && ri < mins.len() {
                     let qv = bounded[qi];
                     let rv = mins[ri];
+                    if let Some(prev) = prev_rv {
+                        if prev > rv {
+                            return Err(RypeError::format(
+                                &path,
+                                format!(
+                                    "non-monotonic minimizer column within a row-group chunk: \
+                                     {rv} follows {prev} within one batch (row groups {:?})",
+                                    chunk.iter().map(|&(idx, _, _)| idx).collect::<Vec<_>>(),
+                                ),
+                            ));
+                        }
+                    }
+                    prev_rv = Some(rv);
                     if qv < rv {
                         qi += 1;
                     } else if qv > rv {
@@ -852,8 +881,25 @@ pub fn load_row_group_pairs(
     let bounded_queries = &query_minimizers[q_start..q_end];
 
     // Build the Arrow reader from the already-parsed metadata (no second footer parse).
+    // Explicit batch size matching this row group's row count: arrow-rs defaults
+    // to 1024 rows/batch, which would split a single 100K-row group into ~100
+    // RecordBatch allocations for no benefit here (only one row group is read).
+    //
+    // Capped at DEFAULT_ROW_GROUP_SIZE rather than using `rg_num_rows` directly:
+    // `--row-group-size` is a user-settable, unbounded `usize` CLI flag at index
+    // build time (`commands/args.rs`), so `rg_num_rows` for a custom-built index
+    // could be far larger than the default. `memory.rs::estimate_shard_reservation`
+    // already budgets `--parallel-rg`'s decode buffers as `num_threads` concurrent
+    // decodes of up to `DEFAULT_ROW_GROUP_SIZE` entries each — matching the batch
+    // size to the cap that reservation assumes, not to the row group's actual
+    // (possibly much larger) size, keeps this call's transient memory within what
+    // `--max-memory` already accounted for.
+    let batch_size = rg_num_rows.min(DEFAULT_ROW_GROUP_SIZE).max(1);
     let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, arrow_metadata);
-    let reader = builder.with_row_groups(vec![rg_idx]).build()?;
+    let reader = builder
+        .with_row_groups(vec![rg_idx])
+        .with_batch_size(batch_size)
+        .build()?;
 
     // Estimate capacity based on row group size
     let estimated_pairs = rg_num_rows / 10; // Assume ~10% match rate
