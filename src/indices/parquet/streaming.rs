@@ -698,7 +698,7 @@ impl ShardAccumulator {
             MIN_SHARD_BYTES
         );
         Self {
-            entries: Vec::with_capacity(max_shard_bytes / Self::BYTES_PER_ENTRY),
+            entries: Vec::new(),
             max_shard_bytes,
             output_dir: PathBuf::new(),
             current_shard_id: 0,
@@ -733,7 +733,7 @@ impl ShardAccumulator {
             MIN_SHARD_BYTES
         );
         Self {
-            entries: Vec::with_capacity(max_shard_bytes / Self::BYTES_PER_ENTRY),
+            entries: Vec::new(),
             max_shard_bytes,
             output_dir: output_dir.to_path_buf(),
             current_shard_id: 0,
@@ -773,7 +773,7 @@ impl ShardAccumulator {
             MIN_SHARD_BYTES
         );
         Self {
-            entries: Vec::with_capacity(max_shard_bytes / Self::BYTES_PER_ENTRY),
+            entries: Vec::new(),
             max_shard_bytes,
             output_dir: output_dir.to_path_buf(),
             current_shard_id: start_shard_id,
@@ -798,34 +798,36 @@ impl ShardAccumulator {
 
     /// Returns the estimated current size in bytes.
     ///
-    /// Uses `len()`, not `capacity()`: `entries` is pre-allocated to
-    /// `max_shard_bytes` worth of capacity once per shard cycle (see
-    /// [`reset_entries`](Self::reset_entries)), so capacity no longer tracks how
-    /// full the buffer actually is. Measuring by capacity here previously let
-    /// `Vec`'s amortized-doubling growth (triggered incrementally by
-    /// `add_entries_from_minimizers`) silently double resident memory past
-    /// `max_shard_bytes` before a flush caught it.
+    /// Uses `len()`, not `capacity()`. Previously this read `capacity()`, which
+    /// let `Vec`'s amortized-doubling growth (triggered incrementally by
+    /// `add_entries_from_minimizers`, growing from empty after each flush)
+    /// transiently double allocated capacity past `max_shard_bytes` before a
+    /// flush caught it. Measuring `len()` instead makes the flush threshold
+    /// track real data volume regardless of how the backing `Vec` grows; see
+    /// [`reset_entries`](Self::reset_entries) for how capacity is retained
+    /// (not eagerly pre-allocated) across cycles.
     ///
-    /// Note: fixing this transient doubling did not close the real-world gap
-    /// between `--max-memory` and measured peak RSS (benchmarked at ~2.7GB
-    /// actual vs. a ~256MB shard budget on real WoL2 genome data, even at
-    /// `effective_concurrency = 1`) — that gap is still open and likely
-    /// allocator-level (retained-but-freed heap pages inflating the
-    /// high-water-mark RSS metric across many large alloc/free cycles), not a
-    /// live-memory bug in this accumulator.
+    /// Note: fixing this transient doubling alone did not close the
+    /// real-world gap between `--max-memory` and measured peak RSS
+    /// (benchmarked at ~2.7GB actual vs. a ~256MB shard budget on real WoL2
+    /// genome data, even at `effective_concurrency = 1`). The dominant cause
+    /// turned out to be [`flush_shard`](Self::flush_shard)'s unconditional use
+    /// of the parallel [`flush_sort_pool`] — see its `PARALLEL_SORT_THRESHOLD`
+    /// comment.
     pub fn current_size_bytes(&self) -> usize {
         self.entries.len() * Self::BYTES_PER_ENTRY
     }
 
-    /// Replace `entries` with a fresh buffer pre-allocated to the full
-    /// `max_shard_bytes` capacity in one allocation.
-    ///
-    /// Used instead of `clear()` + `shrink_to_fit()` so that filling the buffer
-    /// back up never needs `Vec::reserve` to grow it (and potentially
-    /// over-allocate via doubling) mid-cycle.
+    /// Reset `entries` to empty for the next shard cycle, keeping its current
+    /// capacity rather than eagerly reserving `max_shard_bytes` worth up
+    /// front. Many buckets hold far less data than `max_shard_bytes` allows
+    /// (never triggering a real flush), so eagerly reserving the full budget
+    /// would needlessly bloat allocated (if not necessarily resident) memory
+    /// for them. `len()`-based flush thresholds (see
+    /// [`current_size_bytes`](Self::current_size_bytes)) already prevent the
+    /// capacity this settles into from overshooting `max_shard_bytes`.
     fn reset_entries(&mut self) {
-        let target_capacity = self.max_shard_bytes / Self::BYTES_PER_ENTRY;
-        self.entries = Vec::with_capacity(target_capacity);
+        self.entries.clear();
     }
 
     /// Returns the number of accumulated entries.
@@ -933,13 +935,27 @@ impl ShardAccumulator {
         // Sort entries by (minimizer, bucket_id) and remove duplicates. This flush
         // buffer holds up to ~max_shard_bytes/16 entries (≈1B at a 30 GiB build), and
         // the sort runs on the serial flush path between parallel extraction bursts, so
-        // it is one of the build's larger single-threaded costs. par_sort_unstable
-        // parallelizes it (with a sequential fallback for small buffers); the ordering —
-        // and therefore the subsequent dedup — is identical. It runs on a dedicated pool
-        // ([`flush_sort_pool`]) rather than the global one to avoid deadlocking against a
-        // concurrent global-pool producer in the CLI streaming build.
-        let entries = &mut self.entries;
-        flush_sort_pool().install(move || entries.par_sort_unstable());
+        // it is one of the build's larger single-threaded costs for a genuinely large
+        // flush. par_sort_unstable parallelizes that case on a dedicated pool
+        // ([`flush_sort_pool`]) rather than the global one, to avoid deadlocking against
+        // a concurrent global-pool producer in the CLI streaming build.
+        //
+        // Below `PARALLEL_SORT_THRESHOLD`, sort sequentially instead: a many-small-buckets
+        // build (e.g. thousands of buckets each flushing a few million entries) calls
+        // flush_shard once per bucket, and `flush_sort_pool`'s worker threads are a
+        // process-lifetime static whose work-stealing deques grow (and never shrink)
+        // across repeated use — measured to add several hundred MB of resident memory
+        // over a few dozen small flushes. A plain sequential sort touches no rayon pool
+        // at all, so it carries none of that cost and sidesteps the deadlock risk
+        // entirely (nothing to deadlock against). The ordering — and therefore the
+        // subsequent dedup — is identical either way.
+        const PARALLEL_SORT_THRESHOLD: usize = 10_000_000;
+        if self.entries.len() >= PARALLEL_SORT_THRESHOLD {
+            let entries = &mut self.entries;
+            flush_sort_pool().install(move || entries.par_sort_unstable());
+        } else {
+            self.entries.sort_unstable();
+        }
         self.entries.dedup();
 
         // Cross-shard dedup filter (single bucket): drop minimizers already written
