@@ -698,7 +698,7 @@ impl ShardAccumulator {
             MIN_SHARD_BYTES
         );
         Self {
-            entries: Vec::new(),
+            entries: Vec::with_capacity(max_shard_bytes / Self::BYTES_PER_ENTRY),
             max_shard_bytes,
             output_dir: PathBuf::new(),
             current_shard_id: 0,
@@ -733,7 +733,7 @@ impl ShardAccumulator {
             MIN_SHARD_BYTES
         );
         Self {
-            entries: Vec::new(),
+            entries: Vec::with_capacity(max_shard_bytes / Self::BYTES_PER_ENTRY),
             max_shard_bytes,
             output_dir: output_dir.to_path_buf(),
             current_shard_id: 0,
@@ -773,7 +773,7 @@ impl ShardAccumulator {
             MIN_SHARD_BYTES
         );
         Self {
-            entries: Vec::new(),
+            entries: Vec::with_capacity(max_shard_bytes / Self::BYTES_PER_ENTRY),
             max_shard_bytes,
             output_dir: output_dir.to_path_buf(),
             current_shard_id: start_shard_id,
@@ -798,10 +798,34 @@ impl ShardAccumulator {
 
     /// Returns the estimated current size in bytes.
     ///
-    /// Uses `capacity()` rather than `len()` to account for the actual memory
-    /// allocated by the Vec, which may be up to 2x the number of elements.
+    /// Uses `len()`, not `capacity()`: `entries` is pre-allocated to
+    /// `max_shard_bytes` worth of capacity once per shard cycle (see
+    /// [`reset_entries`](Self::reset_entries)), so capacity no longer tracks how
+    /// full the buffer actually is. Measuring by capacity here previously let
+    /// `Vec`'s amortized-doubling growth (triggered incrementally by
+    /// `add_entries_from_minimizers`) silently double resident memory past
+    /// `max_shard_bytes` before a flush caught it.
+    ///
+    /// Note: fixing this transient doubling did not close the real-world gap
+    /// between `--max-memory` and measured peak RSS (benchmarked at ~2.7GB
+    /// actual vs. a ~256MB shard budget on real WoL2 genome data, even at
+    /// `effective_concurrency = 1`) — that gap is still open and likely
+    /// allocator-level (retained-but-freed heap pages inflating the
+    /// high-water-mark RSS metric across many large alloc/free cycles), not a
+    /// live-memory bug in this accumulator.
     pub fn current_size_bytes(&self) -> usize {
-        self.entries.capacity() * Self::BYTES_PER_ENTRY
+        self.entries.len() * Self::BYTES_PER_ENTRY
+    }
+
+    /// Replace `entries` with a fresh buffer pre-allocated to the full
+    /// `max_shard_bytes` capacity in one allocation.
+    ///
+    /// Used instead of `clear()` + `shrink_to_fit()` so that filling the buffer
+    /// back up never needs `Vec::reserve` to grow it (and potentially
+    /// over-allocate via doubling) mid-cycle.
+    fn reset_entries(&mut self) {
+        let target_capacity = self.max_shard_bytes / Self::BYTES_PER_ENTRY;
+        self.entries = Vec::with_capacity(target_capacity);
     }
 
     /// Returns the number of accumulated entries.
@@ -928,8 +952,7 @@ impl ShardAccumulator {
         }
         // The whole window may have been seen already — nothing to write.
         if self.entries.is_empty() {
-            self.entries.clear();
-            self.entries.shrink_to_fit();
+            self.reset_entries();
             return Ok(None);
         }
 
@@ -1002,9 +1025,8 @@ impl ShardAccumulator {
             }
         }
 
-        // Clear buffer and release memory
-        self.entries.clear();
-        self.entries.shrink_to_fit();
+        // Reset buffer to a fresh, fully pre-allocated one for the next cycle
+        self.reset_entries();
 
         Ok(Some(shard_info))
     }
