@@ -2,6 +2,7 @@
 
 use crate::constants::{MAX_READS, RC_FLAG_BIT, READ_INDEX_MASK};
 use std::borrow::Borrow;
+#[cfg(feature = "arrow-ffi")]
 use std::collections::HashSet;
 
 /// Query inverted index for merge-join classification.
@@ -227,6 +228,7 @@ impl QueryInvertedIndex {
     /// correct without re-sorting.
     ///
     /// No-op (and no allocation) when `exclude` is empty.
+    #[cfg(feature = "arrow-ffi")]
     pub(crate) fn retain_minimizers_not_in(&mut self, exclude: &HashSet<u64>) {
         if exclude.is_empty() {
             return;
@@ -529,6 +531,7 @@ mod tests {
     // === retain_minimizers_not_in (deferred negative filtering) ===
 
     #[test]
+    #[cfg(feature = "arrow-ffi")]
     fn test_retain_minimizers_not_in_matches_pre_filter() {
         // Filtering minimizers out of each read's vectors *before* building
         // (the old per-batch approach) must produce the same index as
@@ -546,8 +549,14 @@ mod tests {
             .iter()
             .map(|(fwd, rc)| {
                 (
-                    fwd.iter().copied().filter(|m| !exclude.contains(m)).collect(),
-                    rc.iter().copied().filter(|m| !exclude.contains(m)).collect(),
+                    fwd.iter()
+                        .copied()
+                        .filter(|m| !exclude.contains(m))
+                        .collect(),
+                    rc.iter()
+                        .copied()
+                        .filter(|m| !exclude.contains(m))
+                        .collect(),
                 )
             })
             .collect();
@@ -564,6 +573,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "arrow-ffi")]
     fn test_retain_minimizers_not_in_empty_exclude_is_noop() {
         let raw = vec![(vec![100u64, 200], vec![150u64])];
         let mut qidx = QueryInvertedIndex::build(&raw);
@@ -576,14 +586,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "arrow-ffi")]
     fn test_retain_minimizers_not_in_can_empty_a_read() {
         // A read whose every minimizer is excluded must survive as a
         // zero-count read, not disappear — read indices for the *other*
         // reads must stay stable.
-        let raw = vec![
-            (vec![100u64], vec![]),
-            (vec![200u64], vec![]),
-        ];
+        let raw = vec![(vec![100u64], vec![]), (vec![200u64], vec![])];
         let exclude: HashSet<u64> = [100].into_iter().collect();
 
         let mut qidx = QueryInvertedIndex::build(&raw);

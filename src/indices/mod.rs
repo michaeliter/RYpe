@@ -11,8 +11,7 @@ pub mod sharded;
 
 // Re-export primary types at the indices module level
 pub use inverted::{
-    get_row_group_ranges, load_row_group_pairs, InvertedIndex, QueryAccumulator,
-    QueryInvertedIndex,
+    get_row_group_ranges, load_row_group_pairs, InvertedIndex, QueryAccumulator, QueryInvertedIndex,
 };
 pub use parquet::{
     compute_source_hash, create_parquet_inverted_index, is_parquet_index, BucketData,
