@@ -94,11 +94,23 @@ cargo test -- --nocapture    # show output
   - Parquet-converted versions also present (`*.parquet`)
 - **Pre-built indices**:
   - `perf-assessment/parquet-index/n100-w200.ryxdi/` — 160-bucket index (k=64, w=200, 8 shards, ~486M minimizers)
+  - `perf-assessment/parquet-index/n97-w50.ryxdi/` — 97-bucket index (k=64, w=50, 11 shards, ~10.5B minimizers, ~18GB, `has_overlapping_shards = true`)
   - `perf-assessment/config/numerator-w200.ryxdi/` — single-bucket (8000 genomes, buckets 1–80, 267M minimizers)
   - `perf-assessment/config/denominator-w200.ryxdi/` — single-bucket (7952 genomes, buckets 81–160, 216M minimizers)
 - **Index configs**: `perf-assessment/config/*.toml`
 
-Tests using this data should be `#[ignore]`.
+Tests using this data should be `#[ignore]`. Where a regression check is scale-independent
+(a threshold that holds regardless of shard count or size), prefer covering *both*
+`n100-w200.ryxdi` and `n97-w50.ryxdi` rather than picking one — different contributors have
+built whichever one they happened to need, and covering both means the test gives real
+coverage from whichever fixture is present instead of silently skipping for anyone who only
+has the other (see `commands/helpers/batch_config.rs`'s `#[ignore]`d tests for the pattern).
+
+If this data lives under an iCloud Drive-synced directory (e.g. under
+`~/Documents/...`), local disk pressure can silently evict shard files to
+0-byte cloud-only placeholders that then hang on read (`rype`, raw `dd`, even
+`mv`) with no error — move it outside iCloud sync (e.g. `~/rype-work/`) if
+you hit an unexplained hang opening a `.ryxdi`.
 
 ### Building single-bucket indices
 

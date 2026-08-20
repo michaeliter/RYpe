@@ -16,7 +16,9 @@ use std::collections::HashMap;
 
 use rayon::prelude::*;
 
-use crate::constants::{ESTIMATED_BUCKETS_PER_READ, GALLOP_THRESHOLD, MIN_PARALLEL_SHARD_SIZE};
+use crate::constants::{
+    ESTIMATED_BUCKETS_PER_READ, FOLD_REDUCE_MAX_READS, GALLOP_THRESHOLD, MIN_PARALLEL_SHARD_SIZE,
+};
 use crate::core::gallop_for_each;
 use crate::indices::{InvertedIndex, QueryInvertedIndex};
 use crate::types::HitResult;
@@ -32,7 +34,7 @@ use super::scoring::compute_score;
 /// Provides an abstraction over dense (array-based) and sparse (HashMap-based)
 /// accumulation strategies. Dense accumulators are faster for indices with few
 /// buckets, while sparse accumulators handle arbitrary bucket counts.
-pub(super) trait HitAccumulator: Sized + Send {
+pub(super) trait HitAccumulator: Sized + Send + Sync {
     /// Record a single hit for a read against a bucket.
     fn record_hit(&mut self, read_idx: usize, bucket_id: u32, is_rc: bool);
 
@@ -41,6 +43,12 @@ pub(super) trait HitAccumulator: Sized + Send {
 
     /// Merge another accumulator into this one (for parallel reduce).
     fn merge(&mut self, other: Self);
+
+    /// Create a fresh, empty accumulator with the same shape (same `num_reads`,
+    /// same bucket range) as `self`. Used as the per-task identity when
+    /// parallelizing a merge-join over query chunks: each rayon task needs its
+    /// own accumulator to fold into, sized identically to the caller's.
+    fn new_like(&self) -> Self;
 
     /// Score all accumulated hits and filter by threshold.
     fn score_and_filter(
@@ -106,6 +114,10 @@ impl HitAccumulator for DenseAccumulator {
             a.0 = a.0.wrapping_add(b.0);
             a.1 = a.1.wrapping_add(b.1);
         }
+    }
+
+    fn new_like(&self) -> Self {
+        Self::new(self.num_reads, self.max_bucket_id)
     }
 
     fn score_and_filter(
@@ -186,6 +198,10 @@ impl HitAccumulator for SparseAccumulator {
                 entry.1 += rc;
             }
         }
+    }
+
+    fn new_like(&self) -> Self {
+        Self::new(self.accumulators.len())
     }
 
     fn score_and_filter(
@@ -465,6 +481,29 @@ fn accumulate_coo_run_csr<A: HitAccumulator>(
     }
 }
 
+/// Same cross-product as `accumulate_coo_run_csr`, but appends `SparseHit`
+/// tuples to `out` instead of writing into an accumulator. Used by the
+/// parallel CSR joins when `num_reads` is too large to give every rayon
+/// chunk its own full-size accumulator (see `FOLD_REDUCE_MAX_READS`) — the
+/// output size here is bounded by actual match count, not read count.
+#[inline]
+fn accumulate_coo_run_csr_sparse(
+    entries: &[(u64, u32)],
+    bucket_slice: &[u32],
+    out: &mut Vec<SparseHit>,
+) {
+    for &(_, packed) in entries {
+        let (read_idx, is_rc) = QueryInvertedIndex::unpack_read_id(packed);
+        for &bucket_id in bucket_slice {
+            if is_rc {
+                out.push((read_idx, bucket_id, 0, 1));
+            } else {
+                out.push((read_idx, bucket_id, 1, 0));
+            }
+        }
+    }
+}
+
 /// CSR linear merge-join for similar-sized query and reference indices.
 ///
 /// Walks query COO entries and reference CSR minimizers in parallel.
@@ -548,8 +587,130 @@ fn gallop_join_csr<A: HitAccumulator>(
     });
 }
 
+/// Emit hits for a single matched minimizer at known `ref_pos` (index into
+/// `ref_idx.minimizers`/`ref_idx.offsets`) against the query COO run for
+/// `target`. Shared by both orientations of `gallop_join_csr_parallel`.
+#[inline]
+fn emit_csr_hit<A: HitAccumulator>(
+    query_idx: &QueryInvertedIndex,
+    ref_idx: &InvertedIndex,
+    target: u64,
+    ref_pos: usize,
+    accumulator: &mut A,
+) {
+    let run_start = query_idx.entries.partition_point(|e| e.0 < target);
+    let run_end = query_idx.entries.partition_point(|e| e.0 <= target);
+    let r_start = ref_idx.offsets[ref_pos] as usize;
+    let r_end = ref_idx.offsets[ref_pos + 1] as usize;
+    let bucket_slice = &ref_idx.bucket_ids[r_start..r_end];
+    accumulate_coo_run_csr(
+        &query_idx.entries[run_start..run_end],
+        bucket_slice,
+        accumulator,
+    );
+}
+
+/// Sparse-hit variant of `emit_csr_hit`: appends to `out` instead of writing
+/// into an accumulator.
+#[inline]
+fn emit_csr_hit_sparse(
+    query_idx: &QueryInvertedIndex,
+    ref_idx: &InvertedIndex,
+    target: u64,
+    ref_pos: usize,
+    out: &mut Vec<SparseHit>,
+) {
+    let run_start = query_idx.entries.partition_point(|e| e.0 < target);
+    let run_end = query_idx.entries.partition_point(|e| e.0 <= target);
+    let r_start = ref_idx.offsets[ref_pos] as usize;
+    let r_end = ref_idx.offsets[ref_pos + 1] as usize;
+    let bucket_slice = &ref_idx.bucket_ids[r_start..r_end];
+    accumulate_coo_run_csr_sparse(&query_idx.entries[run_start..run_end], bucket_slice, out);
+}
+
+/// A single CSR-linear-join task: intersect `entries` (a contiguous chunk of
+/// query COO entries) against `ref_idx.minimizers[r_start..r_end]`, recording
+/// hits into `accumulator`. Used by both the sequential and parallel linear
+/// join — the sequential version is just this called with the full ranges.
+fn merge_join_csr_linear_slice<A: HitAccumulator>(
+    entries: &[(u64, u32)],
+    ref_idx: &InvertedIndex,
+    r_start: usize,
+    r_end: usize,
+    accumulator: &mut A,
+) {
+    let ref_minimizers = &ref_idx.minimizers[r_start..r_end];
+    let mut qi = 0usize;
+    let mut ri = 0usize; // local index into ref_minimizers
+
+    while qi < entries.len() && ri < ref_minimizers.len() {
+        let q_min = entries[qi].0;
+        let r_min = ref_minimizers[ri];
+
+        if q_min < r_min {
+            qi = entries[qi..].partition_point(|e| e.0 == q_min) + qi;
+        } else if q_min > r_min {
+            ri += 1;
+        } else {
+            let run_end = entries[qi..].partition_point(|e| e.0 == q_min) + qi;
+
+            let global_ri = r_start + ri;
+            let bucket_start = ref_idx.offsets[global_ri] as usize;
+            let bucket_end = ref_idx.offsets[global_ri + 1] as usize;
+            let bucket_slice = &ref_idx.bucket_ids[bucket_start..bucket_end];
+
+            accumulate_coo_run_csr(&entries[qi..run_end], bucket_slice, accumulator);
+
+            qi = run_end;
+            ri += 1;
+        }
+    }
+}
+
+/// Sparse-hit variant of `merge_join_csr_linear_slice`: returns `SparseHit`
+/// tuples instead of writing into an accumulator. Used when `num_reads`
+/// exceeds `FOLD_REDUCE_MAX_READS` (see that constant's doc comment) — output
+/// size is bounded by actual match count, not read count.
+fn merge_join_csr_linear_slice_sparse(
+    entries: &[(u64, u32)],
+    ref_idx: &InvertedIndex,
+    r_start: usize,
+    r_end: usize,
+) -> Vec<SparseHit> {
+    let ref_minimizers = &ref_idx.minimizers[r_start..r_end];
+    let mut hits = Vec::new();
+    let mut qi = 0usize;
+    let mut ri = 0usize;
+
+    while qi < entries.len() && ri < ref_minimizers.len() {
+        let q_min = entries[qi].0;
+        let r_min = ref_minimizers[ri];
+
+        if q_min < r_min {
+            qi = entries[qi..].partition_point(|e| e.0 == q_min) + qi;
+        } else if q_min > r_min {
+            ri += 1;
+        } else {
+            let run_end = entries[qi..].partition_point(|e| e.0 == q_min) + qi;
+
+            let global_ri = r_start + ri;
+            let bucket_start = ref_idx.offsets[global_ri] as usize;
+            let bucket_end = ref_idx.offsets[global_ri + 1] as usize;
+            let bucket_slice = &ref_idx.bucket_ids[bucket_start..bucket_end];
+
+            accumulate_coo_run_csr_sparse(&entries[qi..run_end], bucket_slice, &mut hits);
+
+            qi = run_end;
+            ri += 1;
+        }
+    }
+    hits
+}
+
 /// CSR merge-join dispatcher: chooses between linear merge-join and galloping
-/// based on size ratio.
+/// based on size ratio. Parallelizes across `rayon::current_num_threads()`
+/// when the reference side is large enough to amortize the overhead (same
+/// `MIN_PARALLEL_SHARD_SIZE` threshold used by the COO parallel join).
 ///
 /// Used for multi-bucket indices where CSR's compact unique-minimizer
 /// iteration is faster than COO's pair-by-pair iteration.
@@ -569,17 +730,254 @@ pub(super) fn merge_join_csr<A: HitAccumulator>(
 
     let q_len = unique_mins.len();
     let r_len = ref_idx.minimizers.len();
+    let num_threads = rayon::current_num_threads();
 
     if q_len * GALLOP_THRESHOLD < r_len {
         // Query much smaller: gallop through reference
-        gallop_join_csr(query_idx, ref_idx, accumulator, unique_mins, true);
+        if num_threads > 1 && q_len >= MIN_PARALLEL_SHARD_SIZE {
+            gallop_join_csr_parallel(query_idx, ref_idx, accumulator, unique_mins, true);
+        } else {
+            gallop_join_csr(query_idx, ref_idx, accumulator, unique_mins, true);
+        }
     } else if r_len * GALLOP_THRESHOLD < q_len {
         // Reference much smaller: gallop through query
-        gallop_join_csr(query_idx, ref_idx, accumulator, unique_mins, false);
+        if num_threads > 1 && r_len >= MIN_PARALLEL_SHARD_SIZE {
+            gallop_join_csr_parallel(query_idx, ref_idx, accumulator, unique_mins, false);
+        } else {
+            gallop_join_csr(query_idx, ref_idx, accumulator, unique_mins, false);
+        }
+    } else if num_threads > 1 && r_len >= MIN_PARALLEL_SHARD_SIZE {
+        // Similar sizes: pure merge-join, parallelized over query chunks.
+        merge_join_csr_linear_parallel(query_idx, ref_idx, accumulator);
     } else {
-        // Similar sizes: pure merge-join
         merge_join_csr_linear(query_idx, ref_idx, accumulator);
     }
+}
+
+/// Parallel CSR linear merge-join: splits query COO entries into
+/// `rayon::current_num_threads()` chunks at minimizer-run boundaries (same
+/// chunking as `merge_join_coo_parallel`), binary-searches each chunk's
+/// bounded range into `ref_idx.minimizers`, and joins each chunk in
+/// parallel.
+///
+/// Two aggregation strategies, chosen by `num_reads` (see
+/// `FOLD_REDUCE_MAX_READS`):
+/// - Few reads: each chunk gets its own full-size accumulator (`new_like`),
+///   reduced (tree-merge) into `accumulator`. Cheap when `num_reads` is
+///   small (long-read-shaped batches), since a full accumulator is small.
+/// - Many reads: each chunk returns `SparseHit`s (bounded by actual match
+///   count, not read count) and the merge into `accumulator` happens once,
+///   single-threaded, at the end. Avoids allocating `num_threads` full-size
+///   accumulators when `num_reads` is in the millions (short-read-shaped
+///   batches) — that overflows available memory well before it's useful.
+fn merge_join_csr_linear_parallel<A: HitAccumulator>(
+    query_idx: &QueryInvertedIndex,
+    ref_idx: &InvertedIndex,
+    accumulator: &mut A,
+) {
+    let entries = &query_idx.entries;
+    let num_threads = rayon::current_num_threads();
+
+    let ranges = compute_chunk_ranges(entries, num_threads);
+    if ranges.len() <= 1 {
+        merge_join_csr_linear(query_idx, ref_idx, accumulator);
+        return;
+    }
+
+    if query_idx.num_reads() > FOLD_REDUCE_MAX_READS {
+        let all_hits: Vec<Vec<SparseHit>> = ranges
+            .into_par_iter()
+            .map(|(q_start, q_end)| {
+                let chunk = &entries[q_start..q_end];
+                let min_min = chunk[0].0;
+                let max_min = chunk[chunk.len() - 1].0;
+                let r_start = ref_idx.minimizers.partition_point(|&m| m < min_min);
+                let r_end = ref_idx.minimizers.partition_point(|&m| m <= max_min);
+                if r_start >= r_end {
+                    return Vec::new();
+                }
+                merge_join_csr_linear_slice_sparse(chunk, ref_idx, r_start, r_end)
+            })
+            .collect();
+
+        for chunk_hits in all_hits {
+            for (read_idx, bucket_id, fwd, rc) in chunk_hits {
+                accumulator.record_hit_counts(read_idx as usize, bucket_id, fwd, rc);
+            }
+        }
+        return;
+    }
+
+    let merged = ranges
+        .into_par_iter()
+        .map(|(q_start, q_end)| {
+            let chunk = &entries[q_start..q_end];
+            let min_min = chunk[0].0;
+            let max_min = chunk[chunk.len() - 1].0;
+            let r_start = ref_idx.minimizers.partition_point(|&m| m < min_min);
+            let r_end = ref_idx.minimizers.partition_point(|&m| m <= max_min);
+
+            let mut local = accumulator.new_like();
+            if r_start < r_end {
+                merge_join_csr_linear_slice(chunk, ref_idx, r_start, r_end, &mut local);
+            }
+            local
+        })
+        .reduce(
+            || accumulator.new_like(),
+            |mut a, b| {
+                a.merge(b);
+                a
+            },
+        );
+
+    accumulator.merge(merged);
+}
+
+/// Parallel CSR galloping join: chunks the smaller side (whichever
+/// `query_smaller` indicates) into `rayon::current_num_threads()` contiguous
+/// slices, bounds the larger side per chunk, gallops within that bound, and
+/// joins each chunk in parallel.
+///
+/// Same two aggregation strategies as `merge_join_csr_linear_parallel`,
+/// chosen by `num_reads` vs `FOLD_REDUCE_MAX_READS` — see that function's
+/// doc comment.
+fn gallop_join_csr_parallel<A: HitAccumulator>(
+    query_idx: &QueryInvertedIndex,
+    ref_idx: &InvertedIndex,
+    accumulator: &mut A,
+    unique_mins: &[u64],
+    query_smaller: bool,
+) {
+    let num_threads = rayon::current_num_threads();
+    let smaller_len = if query_smaller {
+        unique_mins.len()
+    } else {
+        ref_idx.minimizers.len()
+    };
+
+    // smaller_len.div_ceil(num_threads) would be simpler but div_ceil on
+    // usize was stabilized in Rust 1.73, above this crate's declared MSRV
+    // (1.70) — see the same workaround in c_api.rs. num_threads is always
+    // >= 1 (rayon::current_num_threads()), so no division by zero.
+    let chunk_size = (smaller_len + num_threads - 1) / num_threads;
+    if chunk_size == 0 {
+        gallop_join_csr(query_idx, ref_idx, accumulator, unique_mins, query_smaller);
+        return;
+    }
+
+    let chunk_starts: Vec<usize> = (0..smaller_len).step_by(chunk_size).collect();
+    if chunk_starts.len() <= 1 {
+        gallop_join_csr(query_idx, ref_idx, accumulator, unique_mins, query_smaller);
+        return;
+    }
+
+    if query_idx.num_reads() > FOLD_REDUCE_MAX_READS {
+        let all_hits: Vec<Vec<SparseHit>> = chunk_starts
+            .into_par_iter()
+            .map(|start| {
+                let end = (start + chunk_size).min(smaller_len);
+                let mut hits = Vec::new();
+
+                if query_smaller {
+                    let chunk = &unique_mins[start..end];
+                    if !chunk.is_empty() {
+                        let min_min = chunk[0];
+                        let max_min = chunk[chunk.len() - 1];
+                        let l_start = ref_idx.minimizers.partition_point(|&m| m < min_min);
+                        let l_end = ref_idx.minimizers.partition_point(|&m| m <= max_min);
+                        if l_start < l_end {
+                            let larger_slice = &ref_idx.minimizers[l_start..l_end];
+                            gallop_for_each(chunk, larger_slice, |s_idx, l_idx_local| {
+                                let target = chunk[s_idx];
+                                let ref_pos = l_start + l_idx_local;
+                                emit_csr_hit_sparse(query_idx, ref_idx, target, ref_pos, &mut hits);
+                            });
+                        }
+                    }
+                } else {
+                    let chunk = &ref_idx.minimizers[start..end];
+                    if !chunk.is_empty() {
+                        let min_min = chunk[0];
+                        let max_min = chunk[chunk.len() - 1];
+                        let l_start = unique_mins.partition_point(|&m| m < min_min);
+                        let l_end = unique_mins.partition_point(|&m| m <= max_min);
+                        if l_start < l_end {
+                            let larger_slice = &unique_mins[l_start..l_end];
+                            gallop_for_each(chunk, larger_slice, |s_idx, _l_idx_local| {
+                                let target = chunk[s_idx];
+                                let ref_pos = start + s_idx;
+                                emit_csr_hit_sparse(query_idx, ref_idx, target, ref_pos, &mut hits);
+                            });
+                        }
+                    }
+                }
+
+                hits
+            })
+            .collect();
+
+        for chunk_hits in all_hits {
+            for (read_idx, bucket_id, fwd, rc) in chunk_hits {
+                accumulator.record_hit_counts(read_idx as usize, bucket_id, fwd, rc);
+            }
+        }
+        return;
+    }
+
+    let merged = chunk_starts
+        .into_par_iter()
+        .map(|start| {
+            let end = (start + chunk_size).min(smaller_len);
+            let mut local = accumulator.new_like();
+
+            if query_smaller {
+                // smaller = unique_mins (query); gallop through ref_idx.minimizers.
+                let chunk = &unique_mins[start..end];
+                if !chunk.is_empty() {
+                    let min_min = chunk[0];
+                    let max_min = chunk[chunk.len() - 1];
+                    let l_start = ref_idx.minimizers.partition_point(|&m| m < min_min);
+                    let l_end = ref_idx.minimizers.partition_point(|&m| m <= max_min);
+                    if l_start < l_end {
+                        let larger_slice = &ref_idx.minimizers[l_start..l_end];
+                        gallop_for_each(chunk, larger_slice, |s_idx, l_idx_local| {
+                            let target = chunk[s_idx];
+                            let ref_pos = l_start + l_idx_local;
+                            emit_csr_hit(query_idx, ref_idx, target, ref_pos, &mut local);
+                        });
+                    }
+                }
+            } else {
+                // smaller = ref_idx.minimizers; gallop through unique_mins (query).
+                let chunk = &ref_idx.minimizers[start..end];
+                if !chunk.is_empty() {
+                    let min_min = chunk[0];
+                    let max_min = chunk[chunk.len() - 1];
+                    let l_start = unique_mins.partition_point(|&m| m < min_min);
+                    let l_end = unique_mins.partition_point(|&m| m <= max_min);
+                    if l_start < l_end {
+                        let larger_slice = &unique_mins[l_start..l_end];
+                        gallop_for_each(chunk, larger_slice, |s_idx, _l_idx_local| {
+                            let target = chunk[s_idx];
+                            let ref_pos = start + s_idx;
+                            emit_csr_hit(query_idx, ref_idx, target, ref_pos, &mut local);
+                        });
+                    }
+                }
+            }
+
+            local
+        })
+        .reduce(
+            || accumulator.new_like(),
+            |mut a, b| {
+                a.merge(b);
+                a
+            },
+        );
+
+    accumulator.merge(merged);
 }
 
 // ============================================================================
@@ -1572,5 +1970,288 @@ mod tests {
         let ref_pairs: Vec<(u64, u32)> = vec![(200, 1)];
 
         assert!(merge_join_coo_slice(&entries, &ref_pairs).is_empty());
+    }
+
+    // ========================================================================
+    // Differential tests: parallel CSR merge-join vs. an independent oracle
+    //
+    // `MIN_PARALLEL_SHARD_SIZE` (10,000) and `GALLOP_THRESHOLD` (16) gate which
+    // branch `merge_join_csr` dispatches to. The tests above all use small,
+    // hand-written data that stays under those thresholds, so none of them
+    // exercise `merge_join_csr_linear_parallel` or `gallop_join_csr_parallel`.
+    // These tests build data sized specifically to land in each of the three
+    // parallel branches and check the result against a brute-force oracle
+    // that shares no code with the merge-join implementation (binary search
+    // per query entry, no run-detection, no chunking).
+    // ========================================================================
+
+    /// Deterministic xorshift64* PRNG — avoids adding a `rand` dev-dependency
+    /// for what only needs to be reproducible, not cryptographically random.
+    struct Xorshift64(u64);
+    impl Xorshift64 {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x.wrapping_mul(0x2545F4914F6CDD1D)
+        }
+    }
+
+    /// Build a CSR `InvertedIndex` with exactly `unique_count` unique sorted
+    /// minimizers drawn from `[0, keyspace)`, each with 1-4 random bucket ids.
+    fn build_random_csr(unique_count: usize, keyspace: u64, seed: u64) -> InvertedIndex {
+        let mut rng = Xorshift64(seed | 1);
+        let mut mins: Vec<u64> = (0..unique_count).map(|_| rng.next() % keyspace).collect();
+        mins.sort_unstable();
+        mins.dedup();
+        // dedup may shrink below unique_count; that's fine for test purposes.
+
+        let mut minimizers = Vec::with_capacity(mins.len());
+        let mut offsets = Vec::with_capacity(mins.len() + 1);
+        let mut bucket_ids = Vec::new();
+        offsets.push(0u32);
+        for &m in &mins {
+            minimizers.push(m);
+            let n_buckets = 1 + (rng.next() % 4) as u32;
+            for _ in 0..n_buckets {
+                bucket_ids.push(1 + (rng.next() % 50) as u32);
+            }
+            offsets.push(bucket_ids.len() as u32);
+        }
+
+        InvertedIndex {
+            k: 64,
+            w: 50,
+            salt: 0,
+            source_hash: 0,
+            minimizers,
+            offsets,
+            bucket_ids,
+        }
+    }
+
+    /// Build a `QueryInvertedIndex` with `num_reads` reads, each contributing
+    /// a handful of minimizers drawn from `[0, keyspace)` so that a
+    /// meaningful fraction overlap with a reference built from the same
+    /// keyspace.
+    fn build_random_query(
+        num_reads: usize,
+        minimizers_per_read: usize,
+        keyspace: u64,
+        seed: u64,
+    ) -> QueryInvertedIndex {
+        let mut rng = Xorshift64(seed | 1);
+        let mut queries = Vec::with_capacity(num_reads);
+        for _ in 0..num_reads {
+            let fwd: Vec<u64> = (0..minimizers_per_read)
+                .map(|_| rng.next() % keyspace)
+                .collect();
+            let rc: Vec<u64> = (0..minimizers_per_read)
+                .map(|_| rng.next() % keyspace)
+                .collect();
+            queries.push((fwd, rc));
+        }
+        QueryInvertedIndex::build(&queries)
+    }
+
+    /// Independent oracle: binary search per query COO entry, no run
+    /// detection, no chunking — deliberately different code path from
+    /// `merge_join_csr` so a bug shared between them wouldn't hide here.
+    fn oracle_csr_join(
+        query_idx: &QueryInvertedIndex,
+        ref_idx: &InvertedIndex,
+    ) -> Vec<HashMap<u32, (u32, u32)>> {
+        let num_reads = query_idx.num_reads();
+        let mut acc: Vec<HashMap<u32, (u32, u32)>> =
+            (0..num_reads).map(|_| HashMap::new()).collect();
+        for &(m, packed) in &query_idx.entries {
+            let (read_idx, is_rc) = QueryInvertedIndex::unpack_read_id(packed);
+            if let Ok(pos) = ref_idx.minimizers.binary_search(&m) {
+                let start = ref_idx.offsets[pos] as usize;
+                let end = ref_idx.offsets[pos + 1] as usize;
+                for &bucket_id in &ref_idx.bucket_ids[start..end] {
+                    let e = acc[read_idx as usize].entry(bucket_id).or_insert((0, 0));
+                    if is_rc {
+                        e.1 += 1;
+                    } else {
+                        e.0 += 1;
+                    }
+                }
+            }
+        }
+        acc
+    }
+
+    /// Score an oracle accumulator the same way `DenseAccumulator::score_and_filter`
+    /// does, so results are directly comparable.
+    fn oracle_scores(
+        acc: &[HashMap<u32, (u32, u32)>],
+        query_idx: &QueryInvertedIndex,
+    ) -> Vec<(usize, u32, f64)> {
+        let mut out = Vec::new();
+        for (read_idx, buckets) in acc.iter().enumerate() {
+            let fwd_total = query_idx.fwd_counts[read_idx] as usize;
+            let rc_total = query_idx.rc_counts[read_idx] as usize;
+            for (&bucket_id, &(fwd, rc)) in buckets {
+                let score = compute_score(fwd as usize, fwd_total, rc as usize, rc_total);
+                out.push((read_idx, bucket_id, score));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        out
+    }
+
+    /// Run `merge_join_csr` (the real dispatcher, whatever branch it picks)
+    /// via `DenseAccumulator` and extract comparable scores.
+    fn dispatched_scores(
+        query_idx: &QueryInvertedIndex,
+        ref_idx: &InvertedIndex,
+        max_bucket_id: u32,
+    ) -> Vec<(usize, u32, f64)> {
+        let unique_mins = query_idx.unique_minimizers();
+        let mut accumulator = DenseAccumulator::new(query_idx.num_reads(), max_bucket_id);
+        merge_join_csr(query_idx, ref_idx, &mut accumulator, &unique_mins);
+
+        let mut out = Vec::new();
+        for read_idx in 0..query_idx.num_reads() {
+            let fwd_total = query_idx.fwd_counts[read_idx] as usize;
+            let rc_total = query_idx.rc_counts[read_idx] as usize;
+            let base = read_idx * accumulator.stride;
+            for bucket_id in 1..=max_bucket_id {
+                let (fwd, rc) = accumulator.data[base + bucket_id as usize];
+                if fwd > 0 || rc > 0 {
+                    let score = compute_score(fwd as usize, fwd_total, rc as usize, rc_total);
+                    out.push((read_idx, bucket_id, score));
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        out
+    }
+
+    /// Exercises `merge_join_csr_linear_parallel`: q_len and r_len both well
+    /// above MIN_PARALLEL_SHARD_SIZE (10,000) and within GALLOP_THRESHOLD
+    /// (16x) of each other.
+    #[test]
+    fn test_merge_join_csr_parallel_linear_matches_oracle() {
+        let ref_idx = build_random_csr(60_000, 5_000_000, 0xA11CE);
+        let query_idx = build_random_query(8_000, 8, 5_000_000, 0xB0B);
+
+        assert!(rayon::current_num_threads() >= 1);
+        let unique_mins = query_idx.unique_minimizers();
+        // Sanity: confirm this test actually lands in the intended branch.
+        assert!(
+            unique_mins.len() >= MIN_PARALLEL_SHARD_SIZE
+                || ref_idx.minimizers.len() >= MIN_PARALLEL_SHARD_SIZE
+        );
+
+        let oracle = oracle_scores(&oracle_csr_join(&query_idx, &ref_idx), &query_idx);
+        let dispatched = dispatched_scores(&query_idx, &ref_idx, 50);
+        assert_eq!(oracle, dispatched);
+    }
+
+    /// Exercises `gallop_join_csr_parallel` with `query_smaller = true`:
+    /// unique query minimizers >= MIN_PARALLEL_SHARD_SIZE, and the reference
+    /// side is more than GALLOP_THRESHOLD times larger.
+    #[test]
+    fn test_merge_join_csr_parallel_gallop_query_smaller_matches_oracle() {
+        let ref_idx = build_random_csr(300_000, 20_000_000, 0xCAFE);
+        let query_idx = build_random_query(7_000, 1, 20_000_000, 0xF00D);
+
+        let unique_mins = query_idx.unique_minimizers();
+        assert!(unique_mins.len() >= MIN_PARALLEL_SHARD_SIZE);
+        assert!(unique_mins.len() * GALLOP_THRESHOLD < ref_idx.minimizers.len());
+
+        let oracle = oracle_scores(&oracle_csr_join(&query_idx, &ref_idx), &query_idx);
+        let dispatched = dispatched_scores(&query_idx, &ref_idx, 50);
+        assert_eq!(oracle, dispatched);
+    }
+
+    /// Exercises `gallop_join_csr_parallel` with `query_smaller = false`:
+    /// reference side >= MIN_PARALLEL_SHARD_SIZE, and query unique minimizers
+    /// are more than GALLOP_THRESHOLD times larger.
+    #[test]
+    fn test_merge_join_csr_parallel_gallop_ref_smaller_matches_oracle() {
+        let ref_idx = build_random_csr(12_000, 20_000_000, 0x1DEA);
+        let query_idx = build_random_query(60_000, 3, 20_000_000, 0x5EED);
+
+        let unique_mins = query_idx.unique_minimizers();
+        assert!(ref_idx.minimizers.len() >= MIN_PARALLEL_SHARD_SIZE);
+        assert!(ref_idx.minimizers.len() * GALLOP_THRESHOLD < unique_mins.len());
+
+        let oracle = oracle_scores(&oracle_csr_join(&query_idx, &ref_idx), &query_idx);
+        let dispatched = dispatched_scores(&query_idx, &ref_idx, 50);
+        assert_eq!(oracle, dispatched);
+    }
+
+    /// The scalar (non-parallel) CSR paths must agree with the same oracle,
+    /// so the parallel-vs-scalar comparison above is meaningful (if the
+    /// scalar baseline itself were wrong, the parallel tests could still
+    /// "pass" by being consistently wrong in the same way).
+    #[test]
+    fn test_merge_join_csr_scalar_matches_oracle_small() {
+        let ref_idx = build_random_csr(500, 2_000, 0x51A2);
+        let query_idx = build_random_query(200, 4, 2_000, 0xB33F);
+
+        let unique_mins = query_idx.unique_minimizers();
+        assert!(unique_mins.len() < MIN_PARALLEL_SHARD_SIZE);
+        assert!(ref_idx.minimizers.len() < MIN_PARALLEL_SHARD_SIZE);
+
+        let oracle = oracle_scores(&oracle_csr_join(&query_idx, &ref_idx), &query_idx);
+        let dispatched = dispatched_scores(&query_idx, &ref_idx, 50);
+        assert_eq!(oracle, dispatched);
+    }
+
+    // ========================================================================
+    // Regression coverage: `num_reads` above FOLD_REDUCE_MAX_READS must use
+    // the sparse-hit collection path, not per-chunk full-size accumulators.
+    //
+    // An earlier version of the parallel CSR joins always gave each rayon
+    // chunk its own `new_like()` accumulator (sized `num_reads * stride * 8`
+    // bytes). That's fine when num_reads is small (long-read-shaped
+    // batches), but for millions of reads it multiplies out to tens of GB
+    // across chunks — confirmed against the real short-read benchmark
+    // (3.38M reads, 97 buckets): wall time went from 40.9s to 392.8s and
+    // peak memory footprint hit ~72GB with heavy swapping. These tests use
+    // num_reads > FOLD_REDUCE_MAX_READS specifically to keep that regression
+    // class caught by `cargo test` rather than only by a multi-minute
+    // real-index benchmark.
+    // ========================================================================
+
+    /// Many reads (> FOLD_REDUCE_MAX_READS), sizes landing in the linear
+    /// branch — exercises the sparse-hit path in `merge_join_csr_linear_parallel`.
+    #[test]
+    fn test_merge_join_csr_parallel_linear_many_reads_matches_oracle() {
+        let ref_idx = build_random_csr(300_000, 20_000_000, 0x900D);
+        let query_idx = build_random_query(600_000, 1, 20_000_000, 0xF15EE);
+
+        assert!(query_idx.num_reads() > FOLD_REDUCE_MAX_READS);
+        let unique_mins = query_idx.unique_minimizers();
+        assert!(ref_idx.minimizers.len() * GALLOP_THRESHOLD >= unique_mins.len());
+        assert!(unique_mins.len() * GALLOP_THRESHOLD >= ref_idx.minimizers.len());
+
+        let oracle = oracle_scores(&oracle_csr_join(&query_idx, &ref_idx), &query_idx);
+        let dispatched = dispatched_scores(&query_idx, &ref_idx, 50);
+        assert_eq!(oracle, dispatched);
+    }
+
+    /// Many reads (> FOLD_REDUCE_MAX_READS), sizes landing in the
+    /// reference-much-smaller gallop branch — exercises the sparse-hit path
+    /// in `gallop_join_csr_parallel` with `query_smaller = false`.
+    #[test]
+    fn test_merge_join_csr_parallel_gallop_many_reads_matches_oracle() {
+        let ref_idx = build_random_csr(15_000, 30_000_000, 0xB16);
+        let query_idx = build_random_query(600_000, 1, 30_000_000, 0xDA7A);
+
+        assert!(query_idx.num_reads() > FOLD_REDUCE_MAX_READS);
+        assert!(ref_idx.minimizers.len() >= MIN_PARALLEL_SHARD_SIZE);
+        let unique_mins = query_idx.unique_minimizers();
+        assert!(ref_idx.minimizers.len() * GALLOP_THRESHOLD < unique_mins.len());
+
+        let oracle = oracle_scores(&oracle_csr_join(&query_idx, &ref_idx), &query_idx);
+        let dispatched = dispatched_scores(&query_idx, &ref_idx, 50);
+        assert_eq!(oracle, dispatched);
     }
 }

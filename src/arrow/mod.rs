@@ -225,6 +225,48 @@ pub fn classify_arrow_from_extracted(
     hits_to_record_batch(hits)
 }
 
+/// Classify a pre-built `QueryInvertedIndex` (an accumulated group's minimizers,
+/// already flattened and sorted) and encode the results into a `RecordBatch`.
+///
+/// This is `classify_arrow_from_extracted`'s counterpart for callers that
+/// accumulate across many input batches (`AccumulatingClassifier`): the flat
+/// COO representation is built incrementally as batches arrive, so by the
+/// time a group is ready to classify there is no `extracted` to hold —
+/// `query_idx` is already the thing `classify_arrow_from_extracted` would
+/// have built internally.
+///
+/// # Errors
+///
+/// Returns an error if `query_ids` and `query_idx` differ in read count, if
+/// classification fails, or if the results cannot be encoded.
+pub fn classify_arrow_from_query_index(
+    sharded: &ShardedInvertedIndex,
+    query_idx: crate::QueryInvertedIndex,
+    query_ids: &[i64],
+    threshold: f64,
+    best_hit_only: bool,
+) -> Result<RecordBatch, ArrowClassifyError> {
+    if query_ids.len() != query_idx.num_reads() {
+        return Err(ArrowClassifyError::Classification(format!(
+            "query_ids length ({}) does not match query index read count ({})",
+            query_ids.len(),
+            query_idx.num_reads()
+        )));
+    }
+
+    let hits = crate::classify_from_query_index(sharded, &query_idx, query_ids, threshold, None)
+        .map_err(|e| ArrowClassifyError::Classification(e.to_string()))?;
+    drop(query_idx);
+
+    let hits = if best_hit_only {
+        crate::classify::filter_best_hits(hits)
+    } else {
+        hits
+    };
+
+    hits_to_record_batch(hits)
+}
+
 /// Internal implementation that supports both regular and best-hit modes.
 fn classify_arrow_batch_sharded_internal(
     sharded: &ShardedInvertedIndex,

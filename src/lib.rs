@@ -107,6 +107,7 @@ pub use constants::BUCKET_SOURCE_DELIM;
 // Sharded index internals
 pub use indices::{
     // Inverted index internals
+    QueryAccumulator,
     QueryInvertedIndex,
     ShardInfo,
     ShardManifest,

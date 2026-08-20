@@ -2,6 +2,8 @@
 
 use crate::constants::{MAX_READS, RC_FLAG_BIT, READ_INDEX_MASK};
 use std::borrow::Borrow;
+#[cfg(feature = "arrow-ffi")]
+use std::collections::HashSet;
 
 /// Query inverted index for merge-join classification.
 /// Stores sorted COO (coordinate) entries: (minimizer, packed_read_id).
@@ -212,6 +214,42 @@ impl QueryInvertedIndex {
             rc_counts,
             unique_count,
         }
+    }
+
+    /// Remove all entries whose minimizer is in `exclude`, then recompute
+    /// per-read forward/reverse-complement counts from the survivors.
+    ///
+    /// Filtering the flat, already-built entries (rather than each read's
+    /// minimizer vectors before building) is what lets negative-index
+    /// filtering be deferred until after a whole accumulated group is built:
+    /// one negative-index query then covers the group, instead of one per
+    /// read. Ordering is preserved — a subsequence of a sorted sequence is
+    /// still sorted, so `unique_minimizers()`/`minimizer_range()` remain
+    /// correct without re-sorting.
+    ///
+    /// No-op (and no allocation) when `exclude` is empty.
+    #[cfg(feature = "arrow-ffi")]
+    pub(crate) fn retain_minimizers_not_in(&mut self, exclude: &HashSet<u64>) {
+        if exclude.is_empty() {
+            return;
+        }
+
+        self.entries.retain(|(m, _)| !exclude.contains(m));
+
+        let num_reads = self.fwd_counts.len();
+        let mut fwd_counts = vec![0u32; num_reads];
+        let mut rc_counts = vec![0u32; num_reads];
+        for &(_, packed) in &self.entries {
+            let (read_idx, is_rc) = Self::unpack_read_id(packed);
+            if is_rc {
+                rc_counts[read_idx as usize] += 1;
+            } else {
+                fwd_counts[read_idx as usize] += 1;
+            }
+        }
+        self.fwd_counts = fwd_counts;
+        self.rc_counts = rc_counts;
+        self.unique_count = Self::compute_unique_count(&self.entries);
     }
 }
 
@@ -488,5 +526,80 @@ mod tests {
         );
         // Verify correctness: 100, 150, 200, 250, 300, 350, 400
         assert_eq!(mins, vec![100, 150, 200, 250, 300, 350, 400]);
+    }
+
+    // === retain_minimizers_not_in (deferred negative filtering) ===
+
+    #[test]
+    #[cfg(feature = "arrow-ffi")]
+    fn test_retain_minimizers_not_in_matches_pre_filter() {
+        // Filtering minimizers out of each read's vectors *before* building
+        // (the old per-batch approach) must produce the same index as
+        // building unfiltered and filtering the flat entries *after* (the
+        // deferred approach `retain_minimizers_not_in` enables) — same set
+        // of surviving (minimizer, read) pairs either way.
+        let raw = vec![
+            (vec![100u64, 200, 300], vec![150u64, 250]),
+            (vec![100, 300, 400], vec![150, 350]),
+            (vec![500], vec![]),
+        ];
+        let exclude: HashSet<u64> = [200, 350, 500].into_iter().collect();
+
+        let pre_filtered: Vec<(Vec<u64>, Vec<u64>)> = raw
+            .iter()
+            .map(|(fwd, rc)| {
+                (
+                    fwd.iter()
+                        .copied()
+                        .filter(|m| !exclude.contains(m))
+                        .collect(),
+                    rc.iter()
+                        .copied()
+                        .filter(|m| !exclude.contains(m))
+                        .collect(),
+                )
+            })
+            .collect();
+        let expected = QueryInvertedIndex::build(&pre_filtered);
+
+        let mut actual = QueryInvertedIndex::build(&raw);
+        actual.retain_minimizers_not_in(&exclude);
+
+        assert_eq!(actual.entries, expected.entries);
+        assert_eq!(actual.fwd_counts, expected.fwd_counts);
+        assert_eq!(actual.rc_counts, expected.rc_counts);
+        assert_eq!(actual.unique_minimizers(), expected.unique_minimizers());
+        assert_eq!(actual.num_reads(), expected.num_reads());
+    }
+
+    #[test]
+    #[cfg(feature = "arrow-ffi")]
+    fn test_retain_minimizers_not_in_empty_exclude_is_noop() {
+        let raw = vec![(vec![100u64, 200], vec![150u64])];
+        let mut qidx = QueryInvertedIndex::build(&raw);
+        let before = (qidx.entries.clone(), qidx.fwd_counts.clone());
+
+        qidx.retain_minimizers_not_in(&HashSet::new());
+
+        assert_eq!(qidx.entries, before.0);
+        assert_eq!(qidx.fwd_counts, before.1);
+    }
+
+    #[test]
+    #[cfg(feature = "arrow-ffi")]
+    fn test_retain_minimizers_not_in_can_empty_a_read() {
+        // A read whose every minimizer is excluded must survive as a
+        // zero-count read, not disappear — read indices for the *other*
+        // reads must stay stable.
+        let raw = vec![(vec![100u64], vec![]), (vec![200u64], vec![])];
+        let exclude: HashSet<u64> = [100].into_iter().collect();
+
+        let mut qidx = QueryInvertedIndex::build(&raw);
+        qidx.retain_minimizers_not_in(&exclude);
+
+        assert_eq!(qidx.num_reads(), 2);
+        assert_eq!(qidx.fwd_count(0), 0);
+        assert_eq!(qidx.fwd_count(1), 1);
+        assert_eq!(qidx.unique_minimizers(), vec![200]);
     }
 }

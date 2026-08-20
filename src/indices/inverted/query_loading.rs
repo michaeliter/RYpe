@@ -2,9 +2,12 @@
 
 use crate::error::{Result, RypeError};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use super::InvertedIndex;
-use crate::constants::{DEFAULT_ROW_GROUP_SIZE, QUERY_HASHSET_THRESHOLD};
+use crate::constants::DEFAULT_ROW_GROUP_SIZE;
+use crate::log_timing;
 
 impl InvertedIndex {
     /// Check if ANY query minimizer might be in this row group's bloom filter.
@@ -204,7 +207,7 @@ fn load_filtered_coo_pairs(
     options: Option<&super::super::parquet::ParquetReadOptions>,
 ) -> Result<Vec<(u64, u32)>> {
     use arrow::array::{Array, UInt32Array, UInt64Array};
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
     use parquet::file::properties::ReaderProperties;
     use parquet::file::reader::FileReader;
     use parquet::file::serialized_reader::{ReadOptionsBuilder, SerializedFileReader};
@@ -240,7 +243,7 @@ fn load_filtered_coo_pairs(
     //
     // When bloom filter is enabled, we keep the reader alive longer to access bloom
     // filters for each row group after statistics filtering.
-    let matching_row_groups: Vec<usize> = {
+    let matching_row_groups: Vec<(usize, u64, u64)> = {
         let file = File::open(path).map_err(|e| RypeError::io(path, "open Parquet shard", e))?;
 
         // Use new_with_options when bloom filter reading is requested
@@ -381,8 +384,20 @@ fn load_filtered_coo_pairs(
             }
 
             bloom_filtered
+                .into_iter()
+                .map(|rg_idx| {
+                    let (rg_min, rg_max) = rg_stats[rg_idx];
+                    (rg_idx, rg_min, rg_max)
+                })
+                .collect::<Vec<(usize, u64, u64)>>()
         } else {
             stats_filtered
+                .into_iter()
+                .map(|rg_idx| {
+                    let (rg_min, rg_max) = rg_stats[rg_idx];
+                    (rg_idx, rg_min, rg_max)
+                })
+                .collect::<Vec<(usize, u64, u64)>>()
         }
     }; // parquet_reader and file handle dropped here
 
@@ -390,35 +405,168 @@ fn load_filtered_coo_pairs(
         return Ok(Vec::new());
     }
 
-    // Filtered loading is always beneficial - even loading 90% of row groups
-    // still filters individual rows within those groups, reducing memory usage.
-    let use_hashset = query_minimizers.len() > QUERY_HASHSET_THRESHOLD;
-    let query_set: Option<std::collections::HashSet<u64>> = if use_hashset {
-        Some(query_minimizers.iter().copied().collect())
-    } else {
-        None
+    // Parse the footer once and reuse it in every per-row-group reader below via
+    // `new_with_metadata`. Without this, each of the (potentially thousands of)
+    // parallel per-row-group tasks below would re-open the file AND re-parse and
+    // re-deserialize the full footer (which itself lists every row group's
+    // statistics) just to build a reader for a single row group.
+    let arrow_metadata = {
+        let file = File::open(path).map_err(|e| RypeError::io(path, "open Parquet shard", e))?;
+        ArrowReaderMetadata::load(&file, Default::default())?
     };
 
-    // Parallel read of matching row groups only.
-    // Each row group is internally sorted by minimizer (enforced at write time).
-    // Results from different row groups may overlap, so we sort after concatenation.
-    // Each thread opens its own file handle; OS page cache handles deduplication.
+    // Parallel read of matching row groups, batched into `num_threads` large
+    // chunks rather than one rayon task per row group.
+    //
+    // A large shard can have on the order of 10,000 matching row groups, and
+    // one-task-per-row-group was measured (via --timing on the real 22GB
+    // perf index) to leave most of the theoretical 12x parallel speedup on
+    // the table — decode+filter work summed to ~90s across tasks but the
+    // parallel map's wall time was ~65s (~1.4x effective speedup, not 12x)
+    // — the tasks are too small and too numerous for rayon to schedule
+    // efficiently, and per-task allocation/file-open overhead dominates.
+    // The single-threaded concatenation afterward cost another ~39s across
+    // ~9,852 small `extend()` calls even after pre-sizing the destination.
+    //
+    // Batching into ~num_threads chunks fixes both: each task now opens one
+    // file and reads many row groups through one `ParquetRecordBatchReader`
+    // (`with_row_groups` accepts multiple indices and streams their batches
+    // in order), and the final concatenation is ~num_threads `extend()`
+    // calls instead of thousands.
+    //
+    // Correctness: row groups within one chunk are contiguous, non-overlapping,
+    // ascending-sorted ranges of one globally sorted stream (established at
+    // write time), so the two-pointer merge can run continuously across an
+    // entire chunk's batch stream using one combined [chunk_min, chunk_max]
+    // bound — no per-row-group bounding is needed within a chunk.
     let path = path.to_path_buf(); // Clone path for parallel closure
 
-    // Estimate pairs per row group for pre-allocation.
-    // We expect query selectivity to filter most rows. Conservative estimate: 10%.
+    // Oversubscribe chunks relative to thread count. Exactly num_threads
+    // chunks (tried first) removed rayon's ability to load-balance: with one
+    // chunk per thread and no spare work, an unevenly-sized chunk (row
+    // groups don't all match the same number of query minimizers) leaves
+    // other threads idle while the straggler finishes alone — measured on
+    // the real 22GB index, shard_load_total got *worse* (146.6s -> 173.5s)
+    // with exactly num_threads chunks despite far fewer file opens.
+    // Oversubscribing gives the work-stealing scheduler enough granularity
+    // to rebalance stragglers, while still cutting file-open/concat count
+    // by roughly this factor vs one task per row group (was ~9,852/shard).
+    const CHUNK_OVERSUBSCRIPTION_FACTOR: usize = 8;
+    let num_threads = rayon::current_num_threads();
+    let num_chunks = (num_threads * CHUNK_OVERSUBSCRIPTION_FACTOR)
+        .min(matching_row_groups.len())
+        .max(1);
+    // matching_row_groups.len().div_ceil(num_chunks) would be simpler but
+    // div_ceil on usize was stabilized in Rust 1.73, above this crate's
+    // declared MSRV (1.70) — see the same workaround in c_api.rs.
+    let chunk_size = (matching_row_groups.len() + num_chunks - 1) / num_chunks;
+    let chunks: Vec<&[(usize, u64, u64)]> = matching_row_groups.chunks(chunk_size).collect();
+
+    // Estimate pairs for pre-allocation: one row group's worth at a
+    // conservative 10% selectivity, *not* scaled by how many row groups a
+    // chunk covers. Real selectivity is often 1-5% (see the module-level
+    // SHARD_SELECTIVITY_ESTIMATE discussion in memory.rs), and a chunk can
+    // cover 100+ row groups at high oversubscription — scaling this
+    // estimate by chunk.len() would over-reserve by that same factor for
+    // every chunk's result Vec, and since chunk_results below buffers every
+    // chunk's completed Vec (with whatever capacity it was given) until the
+    // final concat loop runs, all of them are resident at once by the time
+    // this function returns. Reserving for one row group and letting `pairs`
+    // grow via ordinary amortized doubling for the rest of the chunk keeps
+    // the initial (and typically dominant, at low real selectivity)
+    // allocation bounded independent of chunk size.
     let estimated_pairs_per_rg = DEFAULT_ROW_GROUP_SIZE / 10;
 
-    let row_group_results: Vec<Result<Vec<(u64, u32)>>> = matching_row_groups
+    // Instrumentation: split shard_load_total into "decode" (opening the file,
+    // Snappy/DELTA_BINARY_PACKED decompression, Arrow batch materialization —
+    // all inside the `parquet`/`arrow` crates, not our code) vs "filter" (our
+    // two-pointer sorted-intersection loop below). Only meaningful under
+    // --timing; the atomics are Relaxed fetch_adds, cheap enough to leave on
+    // the hot path unconditionally rather than branch on ENABLE_TIMING per chunk.
+    let decode_ns = AtomicU64::new(0);
+    let filter_ns = AtomicU64::new(0);
+
+    let t_parallel_phase = Instant::now();
+    let chunk_results: Vec<Result<Vec<(u64, u32)>>> = chunks
         .par_iter()
-        .map(|&rg_idx| {
+        .map(|chunk| {
+            // Combined bound spanning the whole chunk — row groups within a
+            // chunk are contiguous and sorted, so one [min, max] pair covers
+            // the entire chunk's minimizer range.
+            let chunk_min = chunk.iter().map(|&(_, min, _)| min).min().unwrap();
+            let chunk_max = chunk.iter().map(|&(_, _, max)| max).max().unwrap();
+            let q_start = query_minimizers.partition_point(|&m| m < chunk_min);
+            let q_end = query_minimizers.partition_point(|&m| m <= chunk_max);
+            let bounded = &query_minimizers[q_start..q_end];
+
+            if bounded.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let rg_indices: Vec<usize> = chunk.iter().map(|&(rg_idx, _, _)| rg_idx).collect();
+
             let file = File::open(&path)?;
-            let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-            let reader = builder.with_row_groups(vec![rg_idx]).build()?;
+            let builder =
+                ParquetRecordBatchReaderBuilder::new_with_metadata(file, arrow_metadata.clone());
+            let mut reader = builder.with_row_groups(rg_indices).build()?;
 
             let mut pairs = Vec::with_capacity(estimated_pairs_per_rg);
 
-            for batch in reader {
+            // Two-pointer sorted intersection: `bounded` (query minimizers, unique,
+            // ascending) against this chunk's minimizer column, streamed across
+            // every row group in the chunk (ascending; may contain runs of
+            // duplicate minimizers with different bucket_ids). `qi` is carried
+            // across every batch in the chunk, spanning row-group boundaries,
+            // since the whole chunk is one continuous sorted range.
+            let mut qi = 0usize;
+
+            // Guards the invariant the two-pointer merge below depends on:
+            // each row group's minimizer column is ascending, AND row groups
+            // within a chunk concatenate into one ascending stream (both
+            // established at write time — `ShardAccumulator::flush_shard`
+            // sorts before writing, `stream_to_parquet_shards` k-way-merges).
+            // This is why a boundary-only check (comparing only each chunk's
+            // first/last pair, as the check below this closure does) is
+            // insufficient: the two-pointer only ever pushes on `qv == rv`
+            // with `qi` advancing monotonically, so its *output* is sorted
+            // by construction regardless of whether the input was — an
+            // interior violation doesn't produce unsorted output for that
+            // check to catch, it silently drops the matches that fell
+            // behind `qi`.
+            //
+            // Checking only *batch* edges (previous batch's last value vs.
+            // this batch's first) is ALSO insufficient, despite looking like
+            // an O(num_batches) version of the same idea: `with_row_groups`
+            // does not guarantee a batch never spans two row groups —
+            // verified directly (see the regression test below): row groups
+            // smaller than the reader's internal batch size get coalesced
+            // into one shared Arrow batch, so a violation between two row
+            // groups can land *inside* a single batch's own `mins` array,
+            // not at its edge. So this checks each batch's own values for
+            // monotonicity too, not just against the previous batch.
+            //
+            // This is O(total rows read), not O(num_batches) — the same
+            // order as the single-threaded `all_pairs.windows(2)` scan this
+            // function replaced overall, but done here per-chunk, inline
+            // with decode, inside the already-parallel `par_iter` this
+            // closure runs under (the same rows the two-pointer below
+            // already touches), rather than as a second single-threaded
+            // pass over the whole concatenated result.
+            let mut prev_batch_last_min: Option<u64> = None;
+
+            loop {
+                if qi >= bounded.len() {
+                    break;
+                }
+                // Timed around `reader.next()` itself (not `for batch in reader`,
+                // whose desugared `.next()` call runs *before* the loop body —
+                // timing inside the body there measures almost nothing, since the
+                // real decompression work already happened by the time the body
+                // starts). This is the only place actual decode work occurs.
+                let t_decode = Instant::now();
+                let next = reader.next();
+                decode_ns.fetch_add(t_decode.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                let Some(batch) = next else { break };
                 let batch = batch?;
 
                 let min_col = batch
@@ -437,46 +585,157 @@ fn load_filtered_coo_pairs(
                         RypeError::format(&path, "Expected UInt32Array for bucket_id column")
                     })?;
 
-                for i in 0..batch.num_rows() {
-                    let m = min_col.value(i);
-                    // Filter: only include pairs where minimizer is in query set
-                    let matches = if let Some(ref hs) = query_set {
-                        hs.contains(&m)
-                    } else {
-                        // Binary search for small query sets
-                        query_minimizers.binary_search(&m).is_ok()
-                    };
-                    if matches {
-                        pairs.push((m, bid_col.value(i)));
+                let mins: &[u64] = min_col.values();
+                let bids: &[u32] = bid_col.values();
+
+                if let (Some(&first_min), Some(prev_last)) = (mins.first(), prev_batch_last_min) {
+                    if prev_last > first_min {
+                        return Err(RypeError::format(
+                            &path,
+                            format!(
+                                "non-monotonic minimizer column within a row-group chunk: \
+                                 batch starting at {first_min} follows a batch ending at \
+                                 {prev_last} (row groups {:?})",
+                                chunk.iter().map(|&(idx, _, _)| idx).collect::<Vec<_>>(),
+                            ),
+                        ));
                     }
                 }
+                if let Some(pos) = mins.windows(2).position(|w| w[0] > w[1]) {
+                    return Err(RypeError::format(
+                        &path,
+                        format!(
+                            "non-monotonic minimizer column within a row-group chunk: \
+                             {} follows {} within one batch (row groups {:?})",
+                            mins[pos + 1],
+                            mins[pos],
+                            chunk.iter().map(|&(idx, _, _)| idx).collect::<Vec<_>>(),
+                        ),
+                    ));
+                }
+                if let Some(&last_min) = mins.last() {
+                    prev_batch_last_min = Some(last_min);
+                }
+
+                let t_filter = Instant::now();
+                let mut ri = 0usize;
+                while qi < bounded.len() && ri < mins.len() {
+                    let qv = bounded[qi];
+                    let rv = mins[ri];
+                    if qv < rv {
+                        qi += 1;
+                    } else if qv > rv {
+                        ri += 1;
+                    } else {
+                        pairs.push((rv, bids[ri]));
+                        ri += 1;
+                    }
+                }
+                filter_ns.fetch_add(t_filter.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
 
             Ok(pairs)
         })
         .collect();
 
-    // Concatenate results from all row groups, adding context for failures
-    let mut all_pairs: Vec<(u64, u32)> = Vec::new();
+    log_timing(
+        "load_filtered_coo_pairs: parallel_phase_wall (map+collect, wall time)",
+        t_parallel_phase.elapsed().as_millis(),
+    );
+    log_timing(
+        "load_filtered_coo_pairs: decode (open+decompress+decode, sum across chunk tasks)",
+        (decode_ns.load(Ordering::Relaxed) / 1_000_000) as u128,
+    );
+    log_timing(
+        "load_filtered_coo_pairs: filter (two-pointer intersection, sum across chunk tasks)",
+        (filter_ns.load(Ordering::Relaxed) / 1_000_000) as u128,
+    );
 
-    for (idx, result) in matching_row_groups.iter().zip(row_group_results) {
+    // Concatenate results from all chunks (now ~num_threads of them, not
+    // thousands), adding context for failures. Pre-size from the
+    // already-known per-task lengths to avoid repeated reallocate-and-copy.
+    let t_concat = Instant::now();
+    let total_len: usize = chunk_results
+        .iter()
+        .map(|r| r.as_ref().map(|v| v.len()).unwrap_or(0))
+        .sum();
+    let mut all_pairs: Vec<(u64, u32)> = Vec::with_capacity(total_len);
+
+    // Each chunk's own `pairs` come out ascending by construction — not
+    // because its input was valid, but because the two-pointer above only
+    // pushes on `qv == rv` with `qi` advancing monotonically across the
+    // whole chunk, so the output can never regress regardless of what the
+    // underlying row groups actually contained. That's why this boundary
+    // check exists *alongside* the per-batch check inside the chunk closure
+    // above, not instead of it: an interior (within-chunk) ordering
+    // violation doesn't produce unsorted `pairs` for a boundary check to
+    // catch here — it silently drops the matches that `qi` had already
+    // advanced past, which the per-batch check catches at the point of
+    // decode instead. This check covers only the boundary *between* chunks,
+    // which the per-batch check (scoped to one chunk's own reader) cannot
+    // see. Checking just those boundaries is O(num_chunks), not
+    // O(total_len), so it's cheap enough to run unconditionally in release
+    // builds — unlike the full `all_pairs.windows(2)` scan this replaces,
+    // which is exactly the per-entry cost the batching in this function
+    // exists to avoid.
+    //
+    // Both checks guard a real invariant, not a hypothetical one: it holds
+    // for every shard this repo's writers produce
+    // (`ShardAccumulator::flush_shard` sorts before writing,
+    // `stream_to_parquet_shards` k-way-merges), but an externally produced
+    // or future `.ryxdi` that violates it would otherwise corrupt every
+    // downstream binary_search/partition_point/gallop_for_each silently,
+    // with no error and no way to detect it from the output — so violations
+    // are a hard error, not a debug-only assert.
+    let mut prev_chunk_last_min: Option<u64> = None;
+    for (chunk_idx, result) in chunk_results.into_iter().enumerate() {
         let pairs = result.map_err(|e| {
+            let first_rg = chunks[chunk_idx].first().map(|&(idx, _, _)| idx);
+            let last_rg = chunks[chunk_idx].last().map(|&(idx, _, _)| idx);
             RypeError::io(
                 path.clone(),
-                "read row group",
+                "read row group chunk",
                 std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    format!("row group {}: {}", idx, e),
+                    format!("row groups {:?}..={:?}: {}", first_rg, last_rg, e),
                 ),
             )
         })?;
+
+        if let Some((first_min, _)) = pairs.first().copied() {
+            if let Some(prev_last) = prev_chunk_last_min {
+                if prev_last > first_min {
+                    let first_rg = chunks[chunk_idx].first().map(|&(idx, _, _)| idx);
+                    return Err(RypeError::format(
+                        &path,
+                        format!(
+                            "non-monotonic minimizer stream at row group chunk boundary \
+                             (starting row group {:?}): previous chunk ended at {}, this \
+                             chunk starts at {} — shard file is not globally sorted by \
+                             minimizer, which every downstream binary search assumes",
+                            first_rg, prev_last, first_min
+                        ),
+                    ));
+                }
+            }
+            prev_chunk_last_min = pairs.last().map(|&(m, _)| m);
+        }
+
         all_pairs.extend(pairs);
     }
+    log_timing(
+        "load_filtered_coo_pairs: concat (single-threaded extend into all_pairs)",
+        t_concat.elapsed().as_millis(),
+    );
 
-    // Sort concatenated results to handle overlapping row groups.
-    // Multiple row groups may contain the same minimizer if a bucket list spans
-    // the row group size boundary during write.
-    all_pairs.sort_unstable_by_key(|&(m, _)| m);
+    // Row groups are visited in ascending rg_idx order (matching_row_groups is
+    // built by iterating 0..num_row_groups in order and rayon's par_iter().collect()
+    // preserves input order), and within a single shard file, row groups are
+    // non-overlapping contiguous slices of one globally sorted stream (the writer
+    // emits one continuous sorted (minimizer, bucket_id) stream chunked into row
+    // groups — has_overlapping_shards refers to overlap ACROSS shard files, not
+    // within one). So the concatenation above is already fully sorted — verified,
+    // not just asserted, at each chunk boundary in the loop above.
 
     Ok(all_pairs)
 }
@@ -514,11 +773,8 @@ pub fn load_row_group_pairs(
     rg_idx: usize,
     query_minimizers: &[u64],
 ) -> Result<Vec<(u64, u32)>> {
-    use crate::constants::BOUNDED_QUERY_HASHSET_THRESHOLD;
     use arrow::array::{Array, UInt32Array, UInt64Array};
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use parquet::file::reader::FileReader;
-    use parquet::file::serialized_reader::SerializedFileReader;
+    use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
     use parquet::file::statistics::Statistics;
     use std::fs::File;
 
@@ -526,10 +782,14 @@ pub fn load_row_group_pairs(
         return Ok(Vec::new());
     }
 
-    // Open file and get row group metadata
+    // Open the file once and parse the footer once, reusing the same
+    // ArrowReaderMetadata both for statistics (below) and for building the
+    // Arrow reader (further down). Previously this opened the file and parsed
+    // the footer twice per call, which is expensive when a shard has many row
+    // groups (the footer lists every row group's statistics).
     let file = File::open(path).map_err(|e| RypeError::io(path, "open Parquet file", e))?;
-    let parquet_reader = SerializedFileReader::new(file)?;
-    let metadata = parquet_reader.metadata();
+    let arrow_metadata = ArrowReaderMetadata::load(&file, Default::default())?;
+    let metadata = arrow_metadata.metadata();
 
     if rg_idx >= metadata.num_row_groups() {
         return Err(RypeError::validation(format!(
@@ -577,9 +837,6 @@ pub fn load_row_group_pairs(
         }
     };
 
-    // Drop the parquet_reader before doing more work
-    drop(parquet_reader);
-
     // Binary search to find bounded query minimizers
     let q_start = query_minimizers.partition_point(|&m| m < rg_min);
     let q_end = query_minimizers.partition_point(|&m| m <= rg_max);
@@ -591,25 +848,24 @@ pub fn load_row_group_pairs(
 
     let bounded_queries = &query_minimizers[q_start..q_end];
 
-    // Build HashSet from bounded queries for O(1) filtering when set is large enough.
-    // Always build from bounded_queries (not the full query set) for efficiency.
-    let local_set: Option<std::collections::HashSet<u64>> =
-        if bounded_queries.len() > BOUNDED_QUERY_HASHSET_THRESHOLD {
-            Some(bounded_queries.iter().copied().collect())
-        } else {
-            None
-        };
-
-    // Load the row group using Arrow reader
-    let file = File::open(path).map_err(|e| RypeError::io(path, "open Parquet file", e))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    // Build the Arrow reader from the already-parsed metadata (no second footer parse).
+    let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, arrow_metadata);
     let reader = builder.with_row_groups(vec![rg_idx]).build()?;
 
     // Estimate capacity based on row group size
     let estimated_pairs = rg_num_rows / 10; // Assume ~10% match rate
     let mut pairs = Vec::with_capacity(estimated_pairs);
 
+    // Two-pointer sorted intersection against `bounded_queries` (sorted, unique).
+    // The row group's minimizer column is sorted ascending (may contain runs of
+    // duplicate minimizers with different bucket_ids), and `qi` is carried across
+    // Arrow batches since the column is sorted continuously within the row group.
+    let mut qi = 0usize;
+
     for batch in reader {
+        if qi >= bounded_queries.len() {
+            break;
+        }
         let batch = batch?;
 
         let min_col = batch
@@ -624,19 +880,20 @@ pub fn load_row_group_pairs(
             .downcast_ref::<UInt32Array>()
             .ok_or_else(|| RypeError::format(path, "Expected UInt32Array for bucket_id column"))?;
 
-        for i in 0..batch.num_rows() {
-            let m = min_col.value(i);
+        let mins: &[u64] = min_col.values();
+        let bids: &[u32] = bid_col.values();
 
-            // Filter: only include pairs where minimizer is in bounded query set
-            let matches = if let Some(ref hs) = local_set {
-                hs.contains(&m)
+        let mut ri = 0usize;
+        while qi < bounded_queries.len() && ri < mins.len() {
+            let qv = bounded_queries[qi];
+            let rv = mins[ri];
+            if qv < rv {
+                qi += 1;
+            } else if qv > rv {
+                ri += 1;
             } else {
-                // Binary search for small query sets
-                bounded_queries.binary_search(&m).is_ok()
-            };
-
-            if matches {
-                pairs.push((m, bid_col.value(i)));
+                pairs.push((rv, bids[ri]));
+                ri += 1;
             }
         }
     }
@@ -940,6 +1197,161 @@ mod tests {
         assert!(
             err_msg.contains("sorted"),
             "Error message should mention sorting: {}",
+            err_msg
+        );
+
+        Ok(())
+    }
+
+    /// Regression: `load_filtered_coo_pairs` must reject a shard file whose
+    /// row groups are individually sorted but not globally sorted as a
+    /// whole (a non-monotonic concatenation), rather than silently
+    /// returning wrong data.
+    ///
+    /// The concatenation step assumes row groups form one continuous sorted
+    /// stream (true for every shard this repo's writers produce), and used
+    /// to guard that with `all_pairs.windows(2).all(...)` — a no-op in
+    /// release builds. This writes a shard file directly (bypassing the
+    /// normal sorted writer) with two row groups that are each internally
+    /// sorted but decreasing relative to each other, which is exactly the
+    /// class of corruption the guard exists to catch, and asserts it
+    /// surfaces as an error rather than silently wrong results.
+    #[test]
+    fn test_load_filtered_coo_pairs_rejects_non_monotonic_row_groups() -> Result<()> {
+        use arrow::array::{ArrayRef, UInt32Array, UInt64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        use std::sync::Arc;
+
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("adversarial.parquet");
+
+        // Row group 0: minimizers 100_000..100_010 (internally sorted).
+        // Row group 1: minimizers 0..10 (internally sorted).
+        // Concatenated (RG0 then RG1, ascending rg_idx order): decreasing at
+        // the boundary — exactly the violation this test targets.
+        let rg0_mins: Vec<u64> = (100_000u64..100_010).collect();
+        let rg1_mins: Vec<u64> = (0u64..10).collect();
+        let all_mins: Vec<u64> = rg0_mins.iter().chain(rg1_mins.iter()).copied().collect();
+        let all_bucket_ids: Vec<u32> = vec![1u32; all_mins.len()];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("minimizer", DataType::UInt64, false),
+            Field::new("bucket_id", DataType::UInt32, false),
+        ]));
+        // One row group per 10 rows, so the two halves land in separate row
+        // groups without needing multiple write_batch calls.
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(10))
+            .build();
+        let file = std::fs::File::create(&path)?;
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
+        let min_array: ArrayRef = Arc::new(UInt64Array::from(all_mins));
+        let bid_array: ArrayRef = Arc::new(UInt32Array::from(all_bucket_ids));
+        let batch = RecordBatch::try_new(schema, vec![min_array, bid_array])?;
+        writer.write(&batch)?;
+        writer.close()?;
+
+        // Query spans both row groups so both get selected for reading.
+        let query_minimizers = vec![5u64, 100_005u64];
+        let result = load_filtered_coo_pairs(&path, 64, &query_minimizers, None);
+
+        assert!(
+            result.is_err(),
+            "non-monotonic row-group concatenation must be rejected, not silently accepted"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("non-monotonic") || err_msg.contains("sorted"),
+            "error should describe the sortedness violation: {}",
+            err_msg
+        );
+
+        Ok(())
+    }
+
+    /// Reproduces the re-review's Finding C: the chunk-boundary check above
+    /// can only see a violation *between* chunks, because the two-pointer
+    /// merge's output is sorted by construction (it only pushes on
+    /// `qv == rv` with `qi` advancing monotonically) regardless of whether
+    /// its input was — an ordering violation *interior* to a chunk (between
+    /// two row groups that land in the same chunk) doesn't produce unsorted
+    /// output for the boundary check to catch; it silently drops the
+    /// matches `qi` had already advanced past.
+    ///
+    /// The prior version of this test (2 row groups) passed only because
+    /// `num_chunks = min(num_threads * 8, matching_row_groups.len())` made
+    /// `chunk_size == 1` at that size, so the violation always landed
+    /// exactly on a chunk boundary — the case that check *does* cover, not
+    /// the interior case it doesn't. This test sizes the row-group count
+    /// from the live thread count so the first chunk always contains at
+    /// least 3 row groups (`chunk_size >= 3`) regardless of machine core
+    /// count, and swaps the first two row groups' values so the violation
+    /// is interior to that chunk.
+    #[test]
+    fn test_load_filtered_coo_pairs_rejects_non_monotonic_row_groups_interior_to_a_chunk(
+    ) -> Result<()> {
+        use arrow::array::{ArrayRef, UInt32Array, UInt64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        use std::sync::Arc;
+
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("adversarial_interior.parquet");
+
+        // `num_chunks = min(num_threads * 8, num_row_groups)`. Sizing
+        // `num_row_groups` to exactly `num_threads * 8 * 3` makes
+        // `chunk_size == 3` regardless of the live thread count, so the
+        // first chunk always spans row groups 0, 1, and 2.
+        let num_threads = rayon::current_num_threads().max(1);
+        let num_row_groups = num_threads * 8 * 3;
+
+        // Row group i holds one minimizer, i * 1000 — globally ascending by
+        // row-group index — except row groups 0 and 1 are swapped (1000,
+        // then 0), which is interior to the first chunk (row groups 0..3)
+        // rather than at a chunk boundary.
+        let mut mins: Vec<u64> = (0..num_row_groups as u64).map(|i| i * 1000).collect();
+        mins.swap(0, 1);
+        let bucket_ids: Vec<u32> = vec![1u32; mins.len()];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("minimizer", DataType::UInt64, false),
+            Field::new("bucket_id", DataType::UInt32, false),
+        ]));
+        // One row per row group, so each element of `mins` becomes its own
+        // row group in file order.
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1))
+            .build();
+        let file = std::fs::File::create(&path)?;
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
+        let min_array: ArrayRef = Arc::new(UInt64Array::from(mins.clone()));
+        let bid_array: ArrayRef = Arc::new(UInt32Array::from(bucket_ids));
+        let batch = RecordBatch::try_new(schema, vec![min_array, bid_array])?;
+        writer.write(&batch)?;
+        writer.close()?;
+
+        // Query every real value so every row group's [min, max] (a single
+        // value each) overlaps the query set and gets selected as matching.
+        let mut query_minimizers = mins.clone();
+        query_minimizers.sort_unstable();
+        query_minimizers.dedup();
+
+        let result = load_filtered_coo_pairs(&path, 64, &query_minimizers, None);
+
+        assert!(
+            result.is_err(),
+            "a non-monotonic pair interior to a chunk must be rejected, not silently \
+             dropped (num_row_groups={num_row_groups}, num_threads={num_threads})"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("non-monotonic") || err_msg.contains("sorted"),
+            "error should describe the sortedness violation: {}",
             err_msg
         );
 
