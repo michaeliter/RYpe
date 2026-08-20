@@ -29,8 +29,8 @@ pub(crate) mod seq_writer;
 // Some items are marked #[allow(dead_code)] in their modules as they provide
 // complete API surface for future use; we re-export them here for API stability.
 pub use arg_parsing::{
-    parse_bloom_fpp, parse_max_memory_arg, parse_shard_size_arg, validate_dedup_cross_bucket_min,
-    validate_minimum_length, validate_trim_to,
+    parse_bloom_fpp, parse_max_memory_arg, parse_shard_size_arg, validate_minimum_length,
+    validate_trim_to,
 };
 pub use batch_config::{compute_effective_batch_size, BatchSizeConfig};
 #[allow(unused_imports)]

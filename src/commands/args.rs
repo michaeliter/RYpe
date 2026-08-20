@@ -4,8 +4,8 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use super::helpers::{
-    parse_bloom_fpp, parse_max_memory_arg, parse_shard_size_arg, validate_dedup_cross_bucket_min,
-    validate_minimum_length, validate_trim_to,
+    parse_bloom_fpp, parse_max_memory_arg, parse_shard_size_arg, validate_minimum_length,
+    validate_trim_to,
 };
 
 #[derive(Parser)]
@@ -120,17 +120,6 @@ pub enum IndexCommands {
         /// (e.g., individual genes, plasmids, or genomes in a multi-FASTA).
         #[arg(long)]
         separate_buckets: bool,
-
-        /// Remove minimizers shared across too many buckets, keeping each bucket's
-        /// stored minimizers more discriminative. Requires at least 2 buckets.
-        /// Off by default. See --dedup-cross-bucket-min for the threshold.
-        #[arg(long)]
-        dedup_cross_bucket: bool,
-
-        /// Minimum number of distinct buckets a minimizer must appear in to be
-        /// removed. Only has effect when --dedup-cross-bucket is set.
-        #[arg(long, default_value = "2", value_parser = validate_dedup_cross_bucket_min)]
-        dedup_cross_bucket_min: usize,
 
         /// Maximum shard size for large indices (e.g., "1G", "512M").
         /// Creates multiple shard files loaded on-demand during classification.
@@ -264,18 +253,6 @@ SUBTRACTION MODE (--subtract-from):
         /// The subtraction index must have the same k, w, and salt values.
         #[arg(long)]
         subtract_from: Option<PathBuf>,
-
-        /// Remove minimizers shared across too many buckets, keeping each bucket's
-        /// stored minimizers more discriminative. Requires at least 2 buckets.
-        /// Off by default. See --dedup-cross-bucket-min for the threshold.
-        /// Costs roughly 2x extraction time (re-extracts each bucket twice).
-        #[arg(long)]
-        dedup_cross_bucket: bool,
-
-        /// Minimum number of distinct buckets a minimizer must appear in to be
-        /// removed. Only has effect when --dedup-cross-bucket is set.
-        #[arg(long, default_value = "2", value_parser = validate_dedup_cross_bucket_min)]
-        dedup_cross_bucket_min: usize,
     },
 
     /// Add files to existing index using TOML config (development pending)

@@ -39,20 +39,6 @@ The shard layout enables the three properties we need:
 
 DELTA_BINARY_PACKED encoding gives strong compression on sorted minimizer columns. Per-row-group bloom filters can reject I/O early when a batch's minimizers don't appear in a shard.
 
-## Cross-bucket minimizer dedup (`--dedup-cross-bucket`)
-
-Multi-bucket indices can accumulate minimizers shared across many buckets — e.g. a conserved core genome shared by closely related strains. These add classification noise: a read landing entirely on shared content scores equally against every bucket that contains it, rather than identifying its true source.
-
-`--dedup-cross-bucket` (opt-in, `--dedup-cross-bucket-min N`, default `N=2`) removes any minimizer present in `N` or more buckets from *all* buckets that contain it, at build time. `rype index create` does this in a single pass (all buckets already resident in memory). `rype index from-config` (multi-bucket) does it in two passes — extract once to count bucket membership, extract again to filter and write — to preserve the streaming path's bounded-memory design rather than holding every bucket's minimizers in memory at once. The counting pass is order-independent, so it's safe to run before `--orient`'s (also order-independent) orientation choice.
-
-**What it actually buys you, empirically** (tested against real WoL2 genomes — 5 *E. coli* strains plus 4 distantly related taxa): the benefit and the cost are both concentrated in whichever buckets actually share content.
-
-- For genuinely distinct organisms (different genus/family), baseline classification is already ~100% accurate and dedup changes essentially nothing — there's no shared content to remove (observed: <40 minimizers removed out of hundreds of thousands per bucket).
-- For closely related genomes (same species, different strains), dedup substantially reduces cross-bucket false-positive scoring (in one measurement, off-target hit rate on sibling strains dropped from ~90% to ~35% at the default threshold) — but at a real sensitivity cost, since the same shared minimizers that caused confusion also contributed to some reads' correct self-identification. It is **not** equivalent to keeping the baseline index and doing best-hit tie-breaking: it's a global, count-based filter applied uniformly to the reference data, not a per-read decision, so it doesn't precisely target only the reads that were actually ambiguous.
-- This feature was designed for distinguishing different organisms, not resolving fine-grained strain-level identity — don't expect it to cleanly separate near-identical genomes.
-
-Classification against a deduped index is also measurably faster and lighter, roughly proportional to how much smaller the index gets (fewer minimizers to decode and merge-join against), independent of any accuracy effect.
-
 ## Build → classify lifecycle
 
 1. **Build** (`rype index create` or `from-config`): FASTA → minimizer extraction → sorted Parquet shards → manifest.

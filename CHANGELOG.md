@@ -8,7 +8,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- `--dedup-cross-bucket` / `--dedup-cross-bucket-min` opt-in index-build option (`index create` and `index from-config`) to remove minimizers shared across too many buckets, improving discrimination between closely related genomes at some sensitivity cost. See `docs/architecture.md` for details and measured trade-offs.
 - Initial public release
 - RY-space minimizer-based sequence classification
 - Support for k-mer sizes 16, 32, and 64
