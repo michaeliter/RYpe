@@ -2481,8 +2481,9 @@ pub fn build_parquet_index_from_config_streaming(
         // alone exceeded a 400GB budget under the old whole-bucket-in-memory
         // approach, regardless of concurrency).
         //
-        // Per-bucket memory budgets are divided by thread count, since up to
-        // that many buckets may have their own accumulator active at once.
+        // Per-bucket memory budgets are divided by effective concurrency, since up
+        // to that many buckets may have their own accumulator *and* extraction
+        // chunk active at once.
         //
         // Chunk sizing is derived from `max_shard_size` (not a fresh
         // `detect_available_memory()` call) so that an explicit `--max-memory`
@@ -2492,15 +2493,49 @@ pub fn build_parquet_index_from_config_streaming(
         // 80% of detected system memory), so doubling it back recovers that
         // budget instead of silently re-detecting real system memory and
         // ignoring the override.
+        //
+        // `calculate_chunk_config` floors a bucket's extraction chunk at
+        // MIN_CHUNK_BYTES regardless of how little memory it's handed, so a
+        // bucket's real working set can't shrink below roughly
+        // MIN_CHUNK_BYTES * EXTRACTION_MEMORY_MULTIPLIER + MIN_SHARD_BYTES. If
+        // `concurrency` buckets all run at once, dividing the budget by thread
+        // count without accounting for that floor lets total memory exceed the
+        // requested budget by a large factor on high-core-count machines with a
+        // tight `--max-memory`. Cap actual bucket-level concurrency so the floor
+        // times concurrency stays within the overall estimate, rather than
+        // always assuming full thread-count concurrency is affordable.
         let concurrency = rayon::current_num_threads().max(1);
         let overall_available_estimate = max_shard_size
             .saturating_mul(2)
             .max(rype::parquet_index::MIN_SHARD_BYTES);
-        let per_bucket_available = (overall_available_estimate / concurrency).max(1);
+        let per_bucket_floor = ((MIN_CHUNK_BYTES as f64 * EXTRACTION_MEMORY_MULTIPLIER) as usize)
+            .saturating_add(rype::parquet_index::MIN_SHARD_BYTES);
+        let effective_concurrency = concurrency
+            .min((overall_available_estimate / per_bucket_floor).max(1));
+        if effective_concurrency < concurrency {
+            log::info!(
+                "Limiting concurrent bucket builds to {} (of {} available threads) to keep peak \
+                 memory within the requested budget",
+                effective_concurrency,
+                concurrency
+            );
+        }
+        let per_bucket_available = (overall_available_estimate / effective_concurrency).max(1);
         let per_bucket_chunk_bytes =
             calculate_chunk_config(per_bucket_available).target_chunk_bytes;
-        let per_bucket_shard_size =
-            (max_shard_size / concurrency).max(rype::parquet_index::MIN_SHARD_BYTES);
+        let per_bucket_shard_size = (max_shard_size / effective_concurrency)
+            .max(rype::parquet_index::MIN_SHARD_BYTES);
+
+        // Bound actual bucket-level (and nested per-chunk) parallelism to
+        // `effective_concurrency` threads, so the memory budget computed above is
+        // actually enforced rather than just recomputed and ignored: without
+        // this, `work_items.par_iter()` below still runs on the full global
+        // rayon pool (`concurrency` threads), independent of the per-bucket
+        // budgets it was just handed.
+        let bucket_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(effective_concurrency)
+            .build()
+            .context("Failed to build bucket-concurrency-limited thread pool")?;
 
         type IsolatedResult = Result<IsolatedBucketResult>;
 
@@ -2511,54 +2546,57 @@ pub fn build_parquet_index_from_config_streaming(
                 let cancelled_ref = &cancelled;
                 let processed_ref = &processed_count;
                 let output_path_ref = &output_path;
+                let bucket_pool_ref = &bucket_pool;
                 s.spawn(move || {
-                    work_items.par_iter().panic_fuse().for_each_with(
-                        tx,
-                        |tx, (bucket_id, bucket_name, files)| {
-                            if cancelled_ref.load(std::sync::atomic::Ordering::Relaxed) {
-                                return;
-                            }
+                    bucket_pool_ref.install(|| {
+                        work_items.par_iter().panic_fuse().for_each_with(
+                            tx,
+                            |tx, (bucket_id, bucket_name, files)| {
+                                if cancelled_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                                    return;
+                                }
 
-                            log::info!(
-                                "Processing bucket '{}' ({}/{}) ...",
-                                bucket_name,
-                                bucket_id,
-                                num_buckets,
-                            );
+                                log::info!(
+                                    "Processing bucket '{}' ({}/{}) ...",
+                                    bucket_name,
+                                    bucket_id,
+                                    num_buckets,
+                                );
 
-                            let sanitized_name = sanitize_bucket_name(bucket_name);
-                            let temp_dir =
-                                output_path_ref.join(format!(".tmp_bucket_{}", bucket_id));
+                                let sanitized_name = sanitize_bucket_name(bucket_name);
+                                let temp_dir =
+                                    output_path_ref.join(format!(".tmp_bucket_{}", bucket_id));
 
-                            let result: IsolatedResult = (|| {
-                                rype::parquet_index::create_index_directory(&temp_dir)?;
-                                build_bucket_streaming_isolated(
-                                    &temp_dir,
-                                    *bucket_id,
-                                    &sanitized_name,
-                                    files,
-                                    config_dir,
-                                    cfg.index.k,
-                                    cfg.index.window,
-                                    cfg.index.salt,
-                                    per_bucket_chunk_bytes,
-                                    per_bucket_shard_size,
-                                    Some(&opts),
-                                    exclusion_set,
-                                )
-                            })()
-                            .map_err(|e| {
-                                e.context(format!(
-                                    "Failed processing bucket '{}' (ID {})",
-                                    bucket_name, bucket_id
-                                ))
-                            });
+                                let result: IsolatedResult = (|| {
+                                    rype::parquet_index::create_index_directory(&temp_dir)?;
+                                    build_bucket_streaming_isolated(
+                                        &temp_dir,
+                                        *bucket_id,
+                                        &sanitized_name,
+                                        files,
+                                        config_dir,
+                                        cfg.index.k,
+                                        cfg.index.window,
+                                        cfg.index.salt,
+                                        per_bucket_chunk_bytes,
+                                        per_bucket_shard_size,
+                                        Some(&opts),
+                                        exclusion_set,
+                                    )
+                                })()
+                                .map_err(|e| {
+                                    e.context(format!(
+                                        "Failed processing bucket '{}' (ID {})",
+                                        bucket_name, bucket_id
+                                    ))
+                                });
 
-                            if tx.send(result).is_ok() {
-                                processed_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        },
-                    );
+                                if tx.send(result).is_ok() {
+                                    processed_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            },
+                        );
+                    });
                 });
 
                 let mut next_shard_id: u32 = 0;
