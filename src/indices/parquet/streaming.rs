@@ -1297,7 +1297,11 @@ impl StreamingShardReader {
         let file = std::fs::File::open(path)
             .map_err(|e| RypeError::io(path.to_path_buf(), "open shard", e))?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-        let iter = builder.build()?;
+        // Explicit batch size: arrow-rs's 1024-row default was measured
+        // (see scratch/PHASE0-RESULTS.md) to be a meaningful share of
+        // shard-load cost when left unset. This reader streams a full shard
+        // sequentially (consolidation, migrate), so the win applies here too.
+        let iter = builder.with_batch_size(PARQUET_BATCH_SIZE).build()?;
         Ok(Self {
             iter,
             current: None,
