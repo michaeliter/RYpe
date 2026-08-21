@@ -816,8 +816,8 @@ impl ShardAccumulator {
     /// transiently double allocated capacity past `max_shard_bytes` before a
     /// flush caught it. Measuring `len()` instead makes the flush threshold
     /// track real data volume regardless of how the backing `Vec` grows; see
-    /// [`reset_entries`](Self::reset_entries) for how capacity is retained
-    /// (not eagerly pre-allocated) across cycles.
+    /// `reset_entries` (private) for how capacity is retained (not eagerly
+    /// pre-allocated) across cycles.
     ///
     /// Note: fixing this transient doubling alone did not close the
     /// real-world gap between `--max-memory` and measured peak RSS
@@ -825,7 +825,7 @@ impl ShardAccumulator {
     /// genome data, even at `effective_concurrency = 1`). The dominant cause
     /// turned out to be [`flush_shard`](Self::flush_shard)'s prior
     /// unconditional use of a process-lifetime parallel sort pool — see the
-    /// `sort_pool` field and [`build_flush_sort_pool`].
+    /// `sort_pool` field and `build_flush_sort_pool` (private).
     pub fn current_size_bytes(&self) -> usize {
         self.entries.len() * Self::BYTES_PER_ENTRY
     }

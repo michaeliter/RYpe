@@ -2510,8 +2510,8 @@ pub fn build_parquet_index_from_config_streaming(
             .max(rype::parquet_index::MIN_SHARD_BYTES);
         let per_bucket_floor = ((MIN_CHUNK_BYTES as f64 * EXTRACTION_MEMORY_MULTIPLIER) as usize)
             .saturating_add(rype::parquet_index::MIN_SHARD_BYTES);
-        let effective_concurrency = concurrency
-            .min((overall_available_estimate / per_bucket_floor).max(1));
+        let effective_concurrency =
+            concurrency.min((overall_available_estimate / per_bucket_floor).max(1));
         if effective_concurrency < concurrency {
             log::info!(
                 "Limiting concurrent bucket builds to {} (of {} available threads) to keep peak \
@@ -2523,8 +2523,8 @@ pub fn build_parquet_index_from_config_streaming(
         let per_bucket_available = (overall_available_estimate / effective_concurrency).max(1);
         let per_bucket_chunk_bytes =
             calculate_chunk_config(per_bucket_available).target_chunk_bytes;
-        let per_bucket_shard_size = (max_shard_size / effective_concurrency)
-            .max(rype::parquet_index::MIN_SHARD_BYTES);
+        let per_bucket_shard_size =
+            (max_shard_size / effective_concurrency).max(rype::parquet_index::MIN_SHARD_BYTES);
 
         // Bound actual bucket-level (and nested per-chunk) parallelism to
         // `effective_concurrency` threads, so the memory budget computed above is
@@ -2592,7 +2592,8 @@ pub fn build_parquet_index_from_config_streaming(
                                 });
 
                                 if tx.send(result).is_ok() {
-                                    processed_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    processed_ref
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
                             },
                         );
@@ -2874,8 +2875,7 @@ output = "{}"
         );
 
         // Build parquet index
-        let result =
-            build_parquet_index_from_config(&config_path, None, None, false, None);
+        let result = build_parquet_index_from_config(&config_path, None, None, false, None);
         assert!(result.is_ok(), "Should succeed: {:?}", result);
 
         // Verify the parquet index was created
@@ -2909,13 +2909,8 @@ output = "{}"
             ..Default::default()
         };
 
-        let result = build_parquet_index_from_config(
-            &config_path,
-            None,
-            Some(&options),
-            false,
-            None,
-        );
+        let result =
+            build_parquet_index_from_config(&config_path, None, Some(&options), false, None);
         assert!(
             result.is_ok(),
             "Should succeed with bloom filter: {:?}",
@@ -2940,8 +2935,7 @@ output = "{}"
             10,
         );
 
-        let result =
-            build_parquet_index_from_config(&config_path, None, None, false, None);
+        let result = build_parquet_index_from_config(&config_path, None, None, false, None);
         assert!(result.is_err(), "Should fail with missing file");
     }
 
@@ -3410,13 +3404,8 @@ files = ["ref2.fa"]
         std::fs::write(&config_path, config_content).unwrap();
 
         // Build streaming index
-        let result = build_parquet_index_from_config_streaming(
-            &config_path,
-            None,
-            None,
-            false,
-            None,
-        );
+        let result =
+            build_parquet_index_from_config_streaming(&config_path, None, None, false, None);
         assert!(
             result.is_ok(),
             "Streaming index creation should succeed: {:?}",
@@ -3562,13 +3551,8 @@ files = ["ref2.fa"]
         let config_path = dir.join("config.toml");
         std::fs::write(&config_path, config_content).unwrap();
 
-        let result = build_parquet_index_from_config_streaming(
-            &config_path,
-            None,
-            None,
-            false,
-            None,
-        );
+        let result =
+            build_parquet_index_from_config_streaming(&config_path, None, None, false, None);
         assert!(result.is_ok(), "Should succeed: {:?}", result);
 
         // Load and verify manifest
@@ -3693,13 +3677,8 @@ files = ["small5.fa"]
 
         // Time the streaming build
         let start = Instant::now();
-        let result = build_parquet_index_from_config_streaming(
-            &config_path,
-            None,
-            None,
-            false,
-            None,
-        );
+        let result =
+            build_parquet_index_from_config_streaming(&config_path, None, None, false, None);
         let elapsed = start.elapsed();
 
         assert!(result.is_ok(), "Should succeed: {:?}", result);
@@ -3852,13 +3831,8 @@ files = ["valid2.fa"]
         std::fs::write(&config_path, config_content).unwrap();
 
         // Should fail during validation (before processing starts)
-        let result = build_parquet_index_from_config_streaming(
-            &config_path,
-            None,
-            None,
-            false,
-            None,
-        );
+        let result =
+            build_parquet_index_from_config_streaming(&config_path, None, None, false, None);
         assert!(result.is_err(), "Should fail with missing file");
 
         let err_msg = result.unwrap_err().to_string();
@@ -3916,13 +3890,8 @@ files = ["valid2.fa"]
         let config_path = dir.join("config.toml");
         std::fs::write(&config_path, config_content).unwrap();
 
-        let result = build_parquet_index_from_config_streaming(
-            &config_path,
-            None,
-            None,
-            false,
-            None,
-        );
+        let result =
+            build_parquet_index_from_config_streaming(&config_path, None, None, false, None);
 
         // The corrupt file might either fail (if FASTA parser rejects it) or
         // produce empty output (if parser is lenient). Either is acceptable.
@@ -3978,8 +3947,7 @@ files = ["ref3.fa"]
         let config_path_ns = dir.join("config_nonstream.toml");
         std::fs::write(&config_path_ns, config_nonstream).unwrap();
 
-        let result_ns =
-            build_parquet_index_from_config(&config_path_ns, None, None, false, None);
+        let result_ns = build_parquet_index_from_config(&config_path_ns, None, None, false, None);
         assert!(
             result_ns.is_ok(),
             "Non-streaming should succeed: {:?}",
@@ -4006,13 +3974,8 @@ files = ["ref3.fa"]
         let config_path_s = dir.join("config_stream.toml");
         std::fs::write(&config_path_s, config_stream).unwrap();
 
-        let result_s = build_parquet_index_from_config_streaming(
-            &config_path_s,
-            None,
-            None,
-            false,
-            None,
-        );
+        let result_s =
+            build_parquet_index_from_config_streaming(&config_path_s, None, None, false, None);
         assert!(result_s.is_ok(), "Streaming should succeed: {:?}", result_s);
 
         // Compare the two indices
@@ -4213,13 +4176,8 @@ files = [{}]
         let config_path = dir.join("config.toml");
         std::fs::write(&config_path, &config).unwrap();
 
-        let result = build_parquet_index_from_config_streaming(
-            &config_path,
-            None,
-            None,
-            false,
-            None,
-        );
+        let result =
+            build_parquet_index_from_config_streaming(&config_path, None, None, false, None);
         assert!(
             result.is_ok(),
             "Streaming build should succeed: {:?}",
@@ -4256,13 +4214,8 @@ files = [{}]
         let config_baseline = config.replace("multi_chunk.ryidx", "baseline.ryidx");
         let config_path_baseline = dir.join("config_baseline.toml");
         std::fs::write(&config_path_baseline, &config_baseline).unwrap();
-        let result_baseline = build_parquet_index_from_config(
-            &config_path_baseline,
-            None,
-            None,
-            false,
-            None,
-        );
+        let result_baseline =
+            build_parquet_index_from_config(&config_path_baseline, None, None, false, None);
         assert!(
             result_baseline.is_ok(),
             "Baseline build should succeed: {:?}",
@@ -4374,8 +4327,7 @@ files = ["ref0.fa", "ref1.fa", "ref2.fa", "ref3.fa", "ref4.fa"]
         std::fs::write(&config_path, config_content).unwrap();
 
         // Build index using non-streaming path (which will eventually use parallel)
-        let result =
-            build_parquet_index_from_config(&config_path, None, None, false, None);
+        let result = build_parquet_index_from_config(&config_path, None, None, false, None);
         assert!(
             result.is_ok(),
             "Index creation should succeed: {:?}",
@@ -4466,8 +4418,7 @@ files = ["ref_g.fa"]
         std::fs::write(&config_path, config_content).unwrap();
 
         // Build index
-        let result =
-            build_parquet_index_from_config(&config_path, None, None, false, None);
+        let result = build_parquet_index_from_config(&config_path, None, None, false, None);
         assert!(
             result.is_ok(),
             "Index creation should succeed: {:?}",
@@ -4558,8 +4509,7 @@ files = ["ref0.fa", "ref1.fa", "ref2.fa", "ref3.fa"]
         std::fs::write(&config_path, config_content).unwrap();
 
         // Build index with orientation
-        let result =
-            build_parquet_index_from_config(&config_path, None, None, false, None);
+        let result = build_parquet_index_from_config(&config_path, None, None, false, None);
         assert!(
             result.is_ok(),
             "Oriented index creation should succeed: {:?}",
@@ -4621,8 +4571,7 @@ files = ["single.fa"]
         std::fs::write(&config_path, config_content).unwrap();
 
         // Build index
-        let result =
-            build_parquet_index_from_config(&config_path, None, None, false, None);
+        let result = build_parquet_index_from_config(&config_path, None, None, false, None);
         assert!(
             result.is_ok(),
             "Single sequence index should succeed: {:?}",
@@ -4695,8 +4644,7 @@ files = ["short.fa", "long.fa"]
         std::fs::write(&config_path, config_content).unwrap();
 
         // Build index - should not crash
-        let result =
-            build_parquet_index_from_config(&config_path, None, None, false, None);
+        let result = build_parquet_index_from_config(&config_path, None, None, false, None);
         assert!(
             result.is_ok(),
             "Index with short sequences should succeed: {:?}",
@@ -6080,5 +6028,4 @@ files = ["short.fa", "long.fa"]
 
         assert!(result.total_minimizers > 0);
     }
-
 }
