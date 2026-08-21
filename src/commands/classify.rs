@@ -293,10 +293,10 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
     //   accumulator; a classification pass happens only when should_flush() fires,
     //   which is what collapses many input batches into few index scans.
     let process_batch = |batch_refs: &[rype::QueryRecord],
-                              headers: Vec<String>,
-                              out_writer: &mut OutputWriter,
-                              acc: &mut rype::QueryAccumulator<String>,
-                              pass_num: &mut usize|
+                         headers: Vec<String>,
+                         out_writer: &mut OutputWriter,
+                         acc: &mut rype::QueryAccumulator<String>,
+                         pass_num: &mut usize|
      -> Result<()> {
         if let Some(ref neg) = negative_sharded {
             if args.common.parallel_rg {
@@ -329,8 +329,7 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
             *pass_num += 1;
         } else {
             let t_extract = std::time::Instant::now();
-            let extracted =
-                extract_batch_minimizers(idx_k, idx_w, idx_salt, None, batch_refs);
+            let extracted = extract_batch_minimizers(idx_k, idx_w, idx_salt, None, batch_refs);
             log_timing("batch: extract", t_extract.elapsed().as_millis());
             acc.extend_extracted(headers, extracted);
 
@@ -347,11 +346,7 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
                     &metadata.bucket_names,
                     out_writer,
                 )?;
-                log::info!(
-                    "Classification pass {}: {} reads",
-                    *pass_num,
-                    read_count
-                );
+                log::info!("Classification pass {}: {} reads", *pass_num, read_count);
             }
         }
         Ok(())

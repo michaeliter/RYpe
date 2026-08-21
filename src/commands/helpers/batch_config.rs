@@ -500,16 +500,19 @@ num_entries = 3
     #[test]
     fn test_fold_reduce_budget_reserve_capped_at_one_eighth_of_mem_limit() {
         let mem_limit = 16 * 1024 * 1024 * 1024; // 16GB
-        // A large per-read accumulator cost (many buckets) and many threads
-        // — deliberately sized so the uncapped product would exceed mem_limit
-        // entirely: FOLD_REDUCE_MAX_READS (500_000) * 1000 * 23 ~= 11.5 TB.
+                                                 // A large per-read accumulator cost (many buckets) and many threads
+                                                 // — deliberately sized so the uncapped product would exceed mem_limit
+                                                 // entirely: FOLD_REDUCE_MAX_READS (500_000) * 1000 * 23 ~= 11.5 TB.
         let reserve = fold_reduce_budget_reserve(mem_limit, 1000, 12);
         assert_eq!(
             reserve,
             mem_limit / 8,
             "reserve should be capped at mem_limit/8 when the uncapped figure would exceed it"
         );
-        assert!(reserve < mem_limit, "capped reserve must leave room for everything else");
+        assert!(
+            reserve < mem_limit,
+            "capped reserve must leave room for everything else"
+        );
     }
 
     /// Direct check on the floor helper: below the floor, clamps up to it;

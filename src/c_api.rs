@@ -2436,7 +2436,9 @@ mod arrow_ffi {
         classify_rows: usize,
     ) -> Result<(), String>
     where
-        F: Fn(<ExtractedSink as GroupSink>::Output) -> Result<RecordBatch, arrow::error::ArrowError>
+        F: Fn(
+                <ExtractedSink as GroupSink>::Output,
+            ) -> Result<RecordBatch, arrow::error::ArrowError>
             + Send
             + 'static,
     {
@@ -2475,7 +2477,9 @@ mod arrow_ffi {
         classify_rows: usize,
     ) -> Result<(), String>
     where
-        F: Fn(<QueryIndexSink as GroupSink>::Output) -> Result<RecordBatch, arrow::error::ArrowError>
+        F: Fn(
+                <QueryIndexSink as GroupSink>::Output,
+            ) -> Result<RecordBatch, arrow::error::ArrowError>
             + Send
             + 'static,
     {
@@ -2498,7 +2502,6 @@ mod arrow_ffi {
 
         Ok(())
     }
-
 
     // -------------------------------------------------------------------------
     // Internal helper: Shared Arrow classification logic
@@ -2586,25 +2589,26 @@ mod arrow_ffi {
         let manifest = unsafe { &*index_ptr }.0.manifest();
         let (k, w, salt) = (manifest.k, manifest.w, manifest.salt);
 
-        let classify_fn = move |(mut query_idx, query_ids): (crate::QueryInvertedIndex, Vec<i64>)| {
-            let index = unsafe { index_send.get() };
+        let classify_fn =
+            move |(mut query_idx, query_ids): (crate::QueryInvertedIndex, Vec<i64>)| {
+                let index = unsafe { index_send.get() };
 
-            // Sharded negative filtering: drop query minimizers that hit the
-            // negative index, then recompute per-read counts. Equivalent to
-            // filtering during extraction (see classify::common::filter_negative_mins),
-            // but deferred so a single negative pass covers the whole
-            // accumulated group instead of one per read.
-            if let Some(ref neg_send) = neg_set_send {
-                let neg_index = unsafe { &neg_send.get().index };
-                let neg_mins = collect_negative_mins_for_query_index(neg_index, &query_idx)?;
-                query_idx.retain_minimizers_not_in(&neg_mins);
-            }
+                // Sharded negative filtering: drop query minimizers that hit the
+                // negative index, then recompute per-read counts. Equivalent to
+                // filtering during extraction (see classify::common::filter_negative_mins),
+                // but deferred so a single negative pass covers the whole
+                // accumulated group instead of one per read.
+                if let Some(ref neg_send) = neg_set_send {
+                    let neg_index = unsafe { &neg_send.get().index };
+                    let neg_mins = collect_negative_mins_for_query_index(neg_index, &query_idx)?;
+                    query_idx.retain_minimizers_not_in(&neg_mins);
+                }
 
-            crate::arrow::classify_arrow_from_query_index(
-                &index.0, query_idx, &query_ids, threshold, best_hit,
-            )
-            .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
-        };
+                crate::arrow::classify_arrow_from_query_index(
+                    &index.0, query_idx, &query_ids, threshold, best_hit,
+                )
+                .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
+            };
 
         match create_query_index_accumulating_output(
             input_stream,

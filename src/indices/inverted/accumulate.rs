@@ -158,8 +158,10 @@ impl<M: MetaHeapBytes> QueryAccumulator<M> {
     /// `with_accumulator_cost_per_read`). This, not `approx_bytes()`, is
     /// what `should_flush()` compares against the byte budget.
     pub fn projected_pass_bytes(&self) -> usize {
-        self.approx_bytes()
-            .saturating_add(self.accumulator_bytes_per_read.saturating_mul(self.meta.len()))
+        self.approx_bytes().saturating_add(
+            self.accumulator_bytes_per_read
+                .saturating_mul(self.meta.len()),
+        )
     }
 
     /// Add a read to the accumulator, flattening its minimizers into flat COO
@@ -365,11 +367,18 @@ mod tests {
                 break;
             }
         }
-        assert!(acc.should_flush(), "test setup: should have tripped the budget");
+        assert!(
+            acc.should_flush(),
+            "test setup: should have tripped the budget"
+        );
 
         acc.drain();
 
-        assert_eq!(acc.approx_bytes(), 0, "drained accumulator must report zero bytes");
+        assert_eq!(
+            acc.approx_bytes(),
+            0,
+            "drained accumulator must report zero bytes"
+        );
         assert!(
             !acc.should_flush(),
             "should_flush() must be false immediately after drain with nothing re-pushed"
@@ -417,10 +426,7 @@ mod tests {
     #[should_panic(expected = "metas shorter than extracted")]
     fn test_extend_extracted_rejects_short_metas() {
         let mut acc = QueryAccumulator::with_budget(usize::MAX);
-        acc.extend_extracted(
-            vec!["only_one"],
-            vec![(vec![1], vec![]), (vec![2], vec![])],
-        );
+        acc.extend_extracted(vec!["only_one"], vec![(vec![1], vec![]), (vec![2], vec![])]);
     }
 
     #[test]
