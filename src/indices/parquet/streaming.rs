@@ -1876,6 +1876,86 @@ mod tests {
     }
 
     #[test]
+    fn test_flush_shard_sort_pool_scoped_per_instance_and_skipped_for_small_flushes() {
+        // Regression test for 88877dc/b7bc61f: flush_shard() used to dispatch every
+        // sort onto a process-lifetime static rayon pool (flush_sort_pool()), whose
+        // per-thread work-stealing deques grow via doubling and never shrink. On a
+        // many-small-buckets build, every bucket's flush touched that pool again,
+        // ratcheting resident memory up across the whole run even though each
+        // individual flush was small. The fix made the pool (a) instance-scoped
+        // (`ShardAccumulator::sort_pool`, dropped with the accumulator) instead of
+        // a process-wide static, and (b) skipped entirely for flushes below
+        // MIN_ENTRIES_PER_PARALLEL_PARTITION * num_cpus, so small buckets never
+        // touch a rayon pool at all.
+        //
+        // A regression back to either a process-static pool, or an unconditional
+        // dispatch to the parallel pool regardless of flush size, would not change
+        // sort correctness (covered by test_shard_accumulator_flush_sorts_entries)
+        // but would reintroduce the memory growth this session diagnosed and fixed.
+        // Directly inspecting the private `sort_pool` field (same module) verifies
+        // both properties structurally instead of relying on flaky memory
+        // measurements.
+        let tmp = TempDir::new().unwrap();
+
+        // Pin the ambient rayon pool to 2 threads so the parallel-sort threshold
+        // (MIN_ENTRIES_PER_PARALLEL_PARTITION * num_cpus) is a small, deterministic
+        // 2,000,000 entries, regardless of how many cores the test machine has.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+
+        pool.install(|| {
+            // Small flush: well under the threshold. Must not build a sort pool at all.
+            let small_dir = tmp.path().join("small.ryxdi");
+            std::fs::create_dir_all(small_dir.join("inverted")).unwrap();
+            let mut small_accumulator =
+                ShardAccumulator::with_output_dir(&small_dir, MIN_SHARD_BYTES, None);
+            let small_entries: Vec<(u64, u32)> =
+                (0..1000u64).map(|i| (i, (i % 7) as u32)).collect();
+            small_accumulator.add_entries(&small_entries);
+            small_accumulator.flush_shard().unwrap();
+            assert!(
+                small_accumulator.sort_pool.is_none(),
+                "a small flush (well under MIN_ENTRIES_PER_PARALLEL_PARTITION * num_cpus) \
+                 must not build a sort pool at all"
+            );
+
+            // Large flush: over the threshold at num_cpus=2. Must build a pool and
+            // retain it on this instance (not a shared static).
+            let large_dir = tmp.path().join("large.ryxdi");
+            std::fs::create_dir_all(large_dir.join("inverted")).unwrap();
+            let mut large_accumulator =
+                ShardAccumulator::with_output_dir(&large_dir, MIN_SHARD_BYTES * 200, None);
+            let threshold = MIN_ENTRIES_PER_PARALLEL_PARTITION * rayon::current_num_threads();
+            let large_entries: Vec<(u64, u32)> = (0..(threshold as u64 + 1))
+                .map(|i| (i, (i % 7) as u32))
+                .collect();
+            large_accumulator.add_entries(&large_entries);
+            large_accumulator.flush_shard().unwrap();
+            assert!(
+                large_accumulator.sort_pool.is_some(),
+                "a flush over the parallel-sort threshold must build and retain its own pool"
+            );
+
+            // A second small flush on a fresh instance must still skip the pool —
+            // proving the previous instance's pool isn't a shared/global fallback
+            // that later small flushes pick up.
+            let small_dir2 = tmp.path().join("small2.ryxdi");
+            std::fs::create_dir_all(small_dir2.join("inverted")).unwrap();
+            let mut small_accumulator2 =
+                ShardAccumulator::with_output_dir(&small_dir2, MIN_SHARD_BYTES, None);
+            small_accumulator2.add_entries(&small_entries);
+            small_accumulator2.flush_shard().unwrap();
+            assert!(
+                small_accumulator2.sort_pool.is_none(),
+                "a later small flush must not inherit a pool from an earlier, unrelated \
+                 large flush"
+            );
+        });
+    }
+
+    #[test]
     fn test_flush_shard_deduplicates_entries() {
         let tmp = TempDir::new().unwrap();
         let output_dir = tmp.path().join("test.ryxdi");

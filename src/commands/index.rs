@@ -3297,6 +3297,84 @@ output = "{}"
         assert!(!mins_with_orient.is_empty());
     }
 
+    #[test]
+    fn test_extract_bucket_minimizers_non_oriented_scales_sub_quadratically() {
+        // Regression test for 9028a35: the non-oriented multi-bucket extraction
+        // path used to merge each sequence into a growing accumulator one at a
+        // time via merge_sorted_into, an O(bucket_size) merge per sequence --
+        // effectively quadratic in the number of sequences per bucket. The fix
+        // extracts+sorts each sequence in parallel and combines results with
+        // kway_merge_dedup (O(n log n)) instead.
+        //
+        // A regression back to an incremental per-sequence (or per-chunk, see
+        // bac6601) merge would still pass every correctness test in this file --
+        // sortedness, dedup, and sources are all independent of the merge
+        // strategy -- but would reintroduce quadratic wall-clock scaling. This
+        // test catches that by timing extraction at two input sizes (8x more
+        // sequences) and asserting time grows roughly linearly, not
+        // quadratically: linear predicts ~8x, quadratic predicts ~64x, so a
+        // generous 20x ceiling clearly separates the two while tolerating
+        // machine noise.
+        fn make_sequences(n: usize, len: usize) -> Vec<(String, Vec<u8>)> {
+            let bases = [b'A', b'C', b'G', b'T'];
+            (0..n)
+                .map(|i| {
+                    let name = format!("seq{i}");
+                    // Vary content deterministically so sequences aren't all identical.
+                    let seq: Vec<u8> = (0..len).map(|j| bases[(i + j) % 4]).collect();
+                    (name, seq)
+                })
+                .collect()
+        }
+
+        fn extract_and_time(n: usize) -> std::time::Duration {
+            let tmp = TempDir::new().unwrap();
+            let dir = tmp.path();
+            let owned = make_sequences(n, 150);
+            let borrowed: Vec<(&str, &[u8])> = owned
+                .iter()
+                .map(|(name, seq)| (name.as_str(), seq.as_slice()))
+                .collect();
+            let fasta_path = create_multi_fasta_file(dir, "many.fa", &borrowed);
+
+            let start = std::time::Instant::now();
+            let (minimizers, _sources, _file_lengths) = extract_bucket_minimizers(
+                &[fasta_path],
+                dir,
+                16,                 // k
+                10,                 // w
+                0x5555555555555555, // salt
+                false,              // orient_sequences
+            )
+            .unwrap();
+            assert!(!minimizers.is_empty());
+            start.elapsed()
+        }
+
+        // Warm up (file cache, allocator) without timing it.
+        let _ = extract_and_time(200);
+
+        let small_n = 2_000;
+        let large_n = 16_000; // 8x
+        let small_elapsed = extract_and_time(small_n);
+        let large_elapsed = extract_and_time(large_n);
+
+        let ratio = large_elapsed.as_secs_f64() / small_elapsed.as_secs_f64().max(1e-9);
+        assert!(
+            ratio < 20.0,
+            "extracting {}x more sequences ({} -> {}) took {:.1}x longer ({:?} -> {:?}); \
+             expected roughly linear (~8x), not quadratic (~64x) scaling -- this likely means \
+             the non-oriented multi-bucket extraction path regressed to an incremental \
+             per-sequence or per-chunk merge (see 9028a35, bac6601)",
+            large_n / small_n,
+            small_n,
+            large_n,
+            ratio,
+            small_elapsed,
+            large_elapsed
+        );
+    }
+
     // ============================================================================
     // Phase 6: Streaming Index Builder Tests
     // ============================================================================
