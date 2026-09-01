@@ -39,3 +39,7 @@ Thumbs.db
 
 # Scratch directory for temporary test files
 /scratch/
+
+# Local-only performance test data (see CLAUDE.md)
+/perf-assessment/
+/perf-data/
