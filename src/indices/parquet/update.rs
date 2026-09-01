@@ -595,6 +595,72 @@ mod tests {
         manifest.save(dir).unwrap();
     }
 
+    /// Like [`build_fixture_index`] but each shard is written verbatim from
+    /// an arbitrary list of `(minimizer, bucket_id)` pairs, so a single shard
+    /// can mix multiple buckets and/or a bucket's rows can span more than
+    /// one shard — layouts `build_fixture_index`'s one-shard-per-bucket
+    /// construction cannot produce, but that real (non-`from-config`,
+    /// range-partitioned) indices exhibit.
+    fn build_fixture_index_raw_shards(
+        dir: &Path,
+        k: usize,
+        w: usize,
+        salt: u64,
+        buckets: &[(u32, &str)],
+        shards: &[Vec<(u64, u32)>],
+    ) {
+        std::fs::create_dir_all(dir).unwrap();
+        super::super::create_index_directory(dir).unwrap();
+
+        let mut bucket_names = HashMap::new();
+        let mut bucket_sources = HashMap::new();
+        for (bucket_id, name) in buckets {
+            bucket_names.insert(*bucket_id, name.to_string());
+            bucket_sources.insert(*bucket_id, vec!["orig_source".to_string()]);
+        }
+
+        let mut bucket_minimizer_counts: HashMap<u32, usize> = HashMap::new();
+        let mut shard_infos = Vec::new();
+        for (shard_id, pairs) in shards.iter().enumerate() {
+            for (_, bucket_id) in pairs {
+                *bucket_minimizer_counts.entry(*bucket_id).or_insert(0) += 1;
+            }
+            let path = dir
+                .join(files::INVERTED_DIR)
+                .join(files::inverted_shard(shard_id as u32));
+            write_shard_from_pairs(&path, pairs, &ParquetWriteOptions::default()).unwrap();
+
+            shard_infos.push(InvertedShardInfo {
+                shard_id: shard_id as u32,
+                min_minimizer: pairs.iter().map(|(m, _)| *m).min().unwrap_or(0),
+                max_minimizer: pairs.iter().map(|(m, _)| *m).max().unwrap_or(0),
+                num_entries: pairs.len() as u64,
+            });
+        }
+
+        write_buckets_parquet(dir, &bucket_names, &bucket_sources, None).unwrap();
+
+        let total_entries: u64 = shard_infos.iter().map(|s| s.num_entries).sum();
+        let manifest = ParquetManifest {
+            magic: FORMAT_MAGIC.to_string(),
+            format_version: FORMAT_VERSION,
+            k,
+            w,
+            salt,
+            source_hash: super::super::compute_source_hash(&bucket_minimizer_counts),
+            num_buckets: bucket_names.len() as u32,
+            total_minimizers: total_entries,
+            inverted: Some(InvertedManifest {
+                format: ParquetShardFormat::Parquet,
+                num_shards: shard_infos.len() as u32,
+                total_entries,
+                has_overlapping_shards: true,
+                shards: shard_infos,
+            }),
+        };
+        manifest.save(dir).unwrap();
+    }
+
     /// All `(minimizer, bucket_id)` pairs in an index, grouped by bucket.
     fn all_pairs_by_bucket(dir: &Path) -> HashMap<u32, std::collections::HashSet<u64>> {
         let manifest = ParquetManifest::load(dir).unwrap();
@@ -736,6 +802,83 @@ mod tests {
         assert_eq!(
             after[&2], expected,
             "index content is unchanged: dedup must not introduce duplicate pairs"
+        );
+    }
+
+    #[test]
+    fn apply_bucket_addition_handles_mixed_shard_and_bucket_spanning_multiple_shards() {
+        // Not every index is bucket-exclusive (see module docs): a shard can
+        // hold rows from more than one bucket, and a bucket's rows can be
+        // split across more than one shard. Both must work correctly:
+        // - shard 0 mixes bucket 1 (rows 1, 2) and bucket 2 (rows 10, 20).
+        // - bucket 1 also has row 3 in shard 1, i.e. its data spans shards
+        //   0 and 1 -- both must be classified relevant and merged together.
+        // - shard 2 (bucket 3) is a fully untouched control.
+        let tmp = TempDir::new().unwrap();
+        let index_dir = tmp.path().join("index.ryxdi");
+        build_fixture_index_raw_shards(
+            &index_dir,
+            32,
+            10,
+            1,
+            &[(1, "b1"), (2, "b2"), (3, "b3")],
+            &[
+                vec![(1, 1), (2, 1), (10, 2), (20, 2)],
+                vec![(3, 1)],
+                vec![(100, 3)],
+            ],
+        );
+        let before = all_pairs_by_bucket(&index_dir);
+        assert_eq!(before[&1], [1u64, 2, 3].into_iter().collect());
+        assert_eq!(before[&2], [10u64, 20].into_iter().collect());
+
+        let delta_dir = tmp.path().join("delta");
+        // 4 is genuinely new; 1 already exists in bucket 1's shard-0
+        // fragment, proving dedup reaches across a bucket's shard-spanning
+        // fragments, not just within a single shard.
+        let delta_shards = write_delta(&delta_dir, 1, &[1, 4]);
+
+        let output_dir = tmp.path().join("output.ryxdi");
+        let stats = apply_bucket_addition(
+            &index_dir,
+            1,
+            &delta_dir,
+            &delta_shards,
+            &[],
+            &output_dir,
+            1024 * 1024,
+            &ParquetWriteOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            stats.novel_minimizers, 1,
+            "only 4 is new; 1 duplicates a row already in bucket 1's shard-0 fragment"
+        );
+        assert_eq!(
+            stats.shards_rewritten, 2,
+            "both of bucket 1's shards (0 and 1) must be classified relevant, \
+             even though shard 0 also carries bucket 2's rows"
+        );
+        assert_eq!(
+            stats.shards_carried_over, 1,
+            "shard 2 (bucket 3, never touching bucket 1) is carried over verbatim"
+        );
+
+        let after = all_pairs_by_bucket(&output_dir);
+        assert_eq!(
+            after[&1],
+            [1u64, 2, 3, 4].into_iter().collect(),
+            "bucket 1's rows merged and deduped across both of its shards"
+        );
+        assert_eq!(
+            after[&2], before[&2],
+            "bucket 2's rows, which shared a physical shard with bucket 1, \
+             must survive the rewrite byte-identical"
+        );
+        assert_eq!(
+            after[&3], before[&3],
+            "bucket 3's untouched shard is unaffected"
         );
     }
 
