@@ -80,12 +80,31 @@ pub fn write_buckets_parquet(
     let bucket_id_array: ArrayRef = Arc::new(UInt32Array::from(bucket_ids));
     let bucket_name_array: ArrayRef = Arc::new(LargeStringArray::from(names));
 
-    // Build list array for sources
+    // Build list array for sources. `sources` holds one `file::seq_name` label
+    // per sequence record processed (see BUCKET_SOURCE_DELIM), which for a
+    // bucket built from many fragmented multi-contig assemblies (e.g.
+    // draft/scaffold-level eukaryote genomes) can reach millions of entries
+    // for a single bucket. That entire list is written as ONE row's value in
+    // this table, and Parquet pages cannot split a single row's value across
+    // pages -- so an oversized list here fails with "Page uncompressed size
+    // overflow" at write time (hit in practice on a 713-genome eukaryote
+    // bucket, independent of any index-build parameter). This metadata is
+    // provenance-only (not consulted during classification), so we collapse
+    // to one entry per source FILE (dropping the per-sequence-record
+    // `::seq_name` suffix and de-duplicating) to keep the list bounded by
+    // input file count instead of total sequence-record count.
     let mut list_builder = LargeListBuilder::new(LargeStringBuilder::new());
     for (_, _, sources) in &buckets {
+        let mut seen = std::collections::HashSet::new();
         let values_builder = list_builder.values();
         for source in *sources {
-            values_builder.append_value(source);
+            let file_label = source
+                .find(crate::BUCKET_SOURCE_DELIM)
+                .map(|pos| &source[..pos])
+                .unwrap_or(source.as_str());
+            if seen.insert(file_label) {
+                values_builder.append_value(file_label);
+            }
         }
         list_builder.append(true);
     }
