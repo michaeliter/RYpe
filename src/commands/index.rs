@@ -1727,7 +1727,7 @@ pub fn run_bucket_update(
             &delta_dir,
             &delta_result.shard_infos,
             &delta_result.sources,
-            output_path.expect("output_path required unless in_place"),
+            scratch_neighbor,
             shard_size,
             options,
         )

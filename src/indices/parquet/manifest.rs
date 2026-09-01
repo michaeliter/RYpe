@@ -121,6 +121,23 @@ impl ParquetManifest {
         Ok(())
     }
 
+    /// Atomically save manifest to the index directory: serialize, write to a
+    /// `.tmp` sibling, then rename over the real path. The rename is the
+    /// single commit point — a crash before it leaves the previous manifest
+    /// (and therefore the previous index) completely intact.
+    pub fn save_atomic(&self, index_dir: &Path) -> Result<()> {
+        let final_path = index_dir.join(files::MANIFEST);
+        let tmp_path = index_dir.join(format!("{}.tmp", files::MANIFEST));
+
+        let toml_str = toml::to_string_pretty(self)
+            .map_err(|e| RypeError::encoding(format!("serialize manifest: {}", e)))?;
+        fs::write(&tmp_path, &toml_str)
+            .map_err(|e| RypeError::io(tmp_path.clone(), "write temp manifest", e))?;
+        fs::rename(&tmp_path, &final_path)
+            .map_err(|e| RypeError::io(final_path, "commit manifest", e))?;
+        Ok(())
+    }
+
     /// Load manifest from the index directory.
     pub fn load(index_dir: &Path) -> Result<Self> {
         let path = index_dir.join(files::MANIFEST);

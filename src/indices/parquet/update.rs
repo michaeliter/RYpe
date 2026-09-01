@@ -151,35 +151,36 @@ fn classify_shards(
     shards: &[InvertedShardInfo],
     target_bucket_id: u32,
 ) -> Result<ShardClassification> {
-    let mut untouched: Vec<InvertedShardInfo> = Vec::new();
-    let mut relevant: Vec<InvertedShardInfo> = Vec::new();
+    let mut untouched: Vec<(InvertedShardInfo, (u32, u32))> = Vec::new();
+    let mut relevant: Vec<(InvertedShardInfo, (u32, u32))> = Vec::new();
     for info in shards {
         let path = inverted_dir.join(files::inverted_shard(info.shard_id));
         let range = bucket_id_range(&path)?;
         if range.0 <= target_bucket_id && target_bucket_id <= range.1 {
-            relevant.push(*info);
+            relevant.push((*info, range));
         } else {
-            untouched.push(*info);
+            untouched.push((*info, range));
         }
     }
 
     let mut existing_target_count: u64 = 0;
-    for info in &relevant {
+    for (info, range) in &relevant {
         let path = inverted_dir.join(files::inverted_shard(info.shard_id));
-        let range = bucket_id_range(&path)?;
-        let counts = shard_bucket_counts(&path, range, info.num_entries)?;
+        let counts = shard_bucket_counts(&path, *range, info.num_entries)?;
         existing_target_count += counts.get(&target_bucket_id).copied().unwrap_or(0);
     }
 
     let mut untouched_bucket_counts: HashMap<u32, u64> = HashMap::new();
-    for info in &untouched {
+    for (info, range) in &untouched {
         let path = inverted_dir.join(files::inverted_shard(info.shard_id));
-        let range = bucket_id_range(&path)?;
-        let counts = shard_bucket_counts(&path, range, info.num_entries)?;
+        let counts = shard_bucket_counts(&path, *range, info.num_entries)?;
         for (bucket_id, count) in counts {
             *untouched_bucket_counts.entry(bucket_id).or_insert(0) += count;
         }
     }
+
+    let relevant: Vec<InvertedShardInfo> = relevant.into_iter().map(|(info, _)| info).collect();
+    let untouched: Vec<InvertedShardInfo> = untouched.into_iter().map(|(info, _)| info).collect();
 
     Ok(ShardClassification {
         relevant,
@@ -361,23 +362,6 @@ pub fn apply_bucket_addition(
     })
 }
 
-/// Atomically write `manifest` to `index_dir/manifest.toml`: serialize, write
-/// to a `.tmp` sibling, then `rename` over the real path. The rename is the
-/// single commit point — a crash before it leaves the original manifest (and
-/// therefore the original index) completely intact.
-fn save_manifest_atomically(manifest: &ParquetManifest, index_dir: &Path) -> Result<()> {
-    let final_path = index_dir.join(files::MANIFEST);
-    let tmp_path = index_dir.join(format!("{}.tmp", files::MANIFEST));
-
-    let toml_str = toml::to_string_pretty(manifest)
-        .map_err(|e| RypeError::encoding(format!("serialize manifest: {}", e)))?;
-    std::fs::write(&tmp_path, &toml_str)
-        .map_err(|e| RypeError::io(tmp_path.clone(), "write temp manifest", e))?;
-    std::fs::rename(&tmp_path, &final_path)
-        .map_err(|e| RypeError::io(final_path, "commit manifest", e))?;
-    Ok(())
-}
-
 /// Like [`apply_bucket_addition`] but updates `index_path` itself instead of
 /// writing to a new directory.
 ///
@@ -387,7 +371,7 @@ fn save_manifest_atomically(manifest: &ParquetManifest, index_dir: &Path) -> Res
 /// still exists. `buckets.parquet` is overwritten first (harmless if a crash
 /// follows: a retried update re-derives the same sources from the
 /// unchanged manifest and shard files), then `manifest.toml` is replaced via
-/// a write-to-temp-then-rename helper — that rename is the actual commit point.
+/// `ParquetManifest::save_atomic` — that rename is the actual commit point.
 /// Only after it succeeds are the superseded "relevant" shard files deleted;
 /// a crash at any point before the rename leaves a few harmless orphan shard
 /// files next to a still-valid, unchanged index.
@@ -513,7 +497,7 @@ pub fn apply_bucket_addition_in_place(
             shards: output_shard_infos,
         }),
     };
-    save_manifest_atomically(&output_manifest, index_path)?;
+    output_manifest.save_atomic(index_path)?;
 
     // Commit point has passed: the superseded shards are no longer
     // referenced by any manifest. Best-effort cleanup — an orphan left by a
