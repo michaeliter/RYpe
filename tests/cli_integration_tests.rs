@@ -2730,6 +2730,433 @@ fn test_cli_merge_basic() -> Result<()> {
     Ok(())
 }
 
+/// Test `index bucket-update`: adding a new file to an existing bucket should
+/// extend that bucket's minimizers without disturbing other buckets, and the
+/// updated index should then classify reads drawn from the new file.
+#[test]
+fn test_cli_bucket_update_basic() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let base_path = dir.path().join("base.ryxdi");
+    let updated_path = dir.path().join("updated.ryxdi");
+
+    // Base index has a single bucket built only from phiX174.
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            base_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Base index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // pUC19 must not classify against the base index yet.
+    let classify_before = dir.path().join("before.tsv");
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            base_path.to_str().unwrap(),
+            "-1",
+            puc19_path.to_str().unwrap(),
+            "--threshold",
+            "0.01",
+            "-o",
+            classify_before.to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Classify before update failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let before_lines: Vec<String> = fs::read_to_string(&classify_before)?
+        .lines()
+        .skip(1) // header
+        .map(String::from)
+        .collect();
+    assert!(
+        before_lines.is_empty(),
+        "pUC19 should not match the base index before the update: {:?}",
+        before_lines
+    );
+
+    // Add pUC19 to bucket 1.
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "bucket-update",
+            "-i",
+            base_path.to_str().unwrap(),
+            "--bucket",
+            "1",
+            "--add",
+            puc19_path.to_str().unwrap(),
+            "-o",
+            updated_path.to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "bucket-update failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    println!("bucket-update output:\n{}", stdout);
+    assert!(
+        stdout.contains("Bucket update complete"),
+        "Output should indicate bucket update complete"
+    );
+    assert!(
+        !stdout.contains("New minimizers added: 0"),
+        "pUC19 should contribute new minimizers to the bucket: {}",
+        stdout
+    );
+
+    assert!(updated_path.exists(), "Updated index should exist");
+    assert!(
+        updated_path.join("manifest.toml").exists(),
+        "Manifest should exist"
+    );
+
+    // Stats: still exactly one bucket, just with more content.
+    let output = Command::new(&binary)
+        .args(["index", "stats", "-i", updated_path.to_str().unwrap()])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Stats on updated index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stats_stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stats_stdout.contains("Buckets: 1"),
+        "Updated index should still have exactly 1 bucket. Stats:\n{}",
+        stats_stdout
+    );
+
+    // pUC19 must now classify against the (formerly phiX174-only) bucket.
+    let classify_after = dir.path().join("after.tsv");
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            updated_path.to_str().unwrap(),
+            "-1",
+            puc19_path.to_str().unwrap(),
+            "--threshold",
+            "0.01",
+            "-o",
+            classify_after.to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Classify after update failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let after_lines: Vec<String> = fs::read_to_string(&classify_after)?
+        .lines()
+        .skip(1)
+        .map(String::from)
+        .collect();
+    assert!(
+        !after_lines.is_empty(),
+        "pUC19 should match the updated index after the update"
+    );
+
+    Ok(())
+}
+
+/// `bucket-update --in-place` must have the same observable effect as `-o`:
+/// the index directory is updated at its own path and the new sequence
+/// classifies afterward.
+#[test]
+fn test_cli_bucket_update_in_place() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let index_path = dir.path().join("index.ryxdi");
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Base index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "bucket-update",
+            "-i",
+            index_path.to_str().unwrap(),
+            "--bucket",
+            "1",
+            "--add",
+            puc19_path.to_str().unwrap(),
+            "--in-place",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "in-place bucket-update failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Updated in place"),
+        "Output should indicate an in-place update: {}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("New minimizers added: 0"),
+        "pUC19 should contribute new minimizers to the bucket: {}",
+        stdout
+    );
+
+    // The index still lives at its original path.
+    assert!(index_path.exists());
+
+    let classify_after = dir.path().join("after.tsv");
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            puc19_path.to_str().unwrap(),
+            "--threshold",
+            "0.01",
+            "-o",
+            classify_after.to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Classify after in-place update failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let after_lines: Vec<String> = fs::read_to_string(&classify_after)?
+        .lines()
+        .skip(1)
+        .map(String::from)
+        .collect();
+    assert!(
+        !after_lines.is_empty(),
+        "pUC19 should match the index in place after the update"
+    );
+
+    Ok(())
+}
+
+/// Parse an integer out of a `index stats` / `bucket-update` summary line
+/// like `"  Buckets: 160"` or `"  Shards rewritten: 3, carried over: 157"`.
+fn parse_labeled_int(text: &str, label: &str) -> u64 {
+    let line = text
+        .lines()
+        .find(|l| l.trim_start().starts_with(label))
+        .unwrap_or_else(|| panic!("no line starting with {:?} in:\n{}", label, text));
+    let rest = line.trim_start().strip_prefix(label).unwrap();
+    rest.trim_start_matches([':', ' '])
+        .split(|c: char| !c.is_ascii_digit())
+        .find(|s| !s.is_empty())
+        .unwrap_or_else(|| panic!("no integer after {:?} in line {:?}", label, line))
+        .parse()
+        .unwrap_or_else(|_| {
+            panic!(
+                "failed to parse integer after {:?} in line {:?}",
+                label, line
+            )
+        })
+}
+
+/// Regression: `bucket-update` against a real, large sharded index must
+/// actually add minimizers and must not touch the other buckets' totals —
+/// this is scale-independent (holds regardless of shard count or index
+/// size), so both local fixtures documented in CLAUDE.md's "Local-Only
+/// Performance Test Data" are covered: `n100-w200.ryxdi` (160 single-bucket
+/// shards -> update should rewrite only a small subset of shards) and
+/// `n97-w50.ryxdi` (97 buckets over 11 non-bucket-exclusive shards -> update
+/// may fall back to rewriting all of them, which is still correct). Neither
+/// fixture is checked into git, so this is `#[ignore]`d and each wrapper
+/// skips gracefully when its fixture is absent, per CLAUDE.md's guidance to
+/// cover both rather than picking one.
+///
+/// Run with: cargo test --test cli_integration_tests bucket_update_real_index -- --ignored --nocapture
+/// Returns `Some((shards_rewritten, total_shards))` on success, or `None` if
+/// the fixture was absent and the check was skipped.
+fn check_bucket_update_real_index(index_path: &Path) -> Result<Option<(u64, u64)>> {
+    if !index_path.exists() {
+        eprintln!(
+            "Skipping: perf-assessment data not available at {}",
+            index_path.display()
+        );
+        return Ok(None);
+    }
+
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let add_file = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    assert!(add_file.exists(), "examples/phiX174.fasta must exist");
+
+    let binary = get_binary_path();
+    let dir = tempdir()?;
+
+    let output = Command::new(&binary)
+        .args(["index", "stats", "-i", index_path.to_str().unwrap()])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "index stats failed on {}: {}",
+        index_path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stats_before = String::from_utf8_lossy(&output.stdout).to_string();
+    let total_shards = parse_labeled_int(&stats_before, "Shards:");
+    let buckets_before = parse_labeled_int(&stats_before, "Buckets:");
+    let minimizers_before = parse_labeled_int(&stats_before, "Total minimizers:");
+
+    let output_path = dir.path().join("updated.ryxdi");
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "bucket-update",
+            "-i",
+            index_path.to_str().unwrap(),
+            "--bucket",
+            "1",
+            "--add",
+            add_file.to_str().unwrap(),
+            "-o",
+            output_path.to_str().unwrap(),
+            "--max-memory",
+            "4G",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "bucket-update failed on {}: {}",
+        index_path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    eprintln!("{}:\n{}", index_path.display(), stdout);
+
+    let novel = parse_labeled_int(&stdout, "New minimizers added:");
+    let shards_rewritten = parse_labeled_int(&stdout, "Shards rewritten:");
+    assert!(
+        novel > 0,
+        "phiX174 should contribute at least one novel minimizer to bucket 1 of {}",
+        index_path.display()
+    );
+    assert!(
+        shards_rewritten <= total_shards,
+        "cannot rewrite more shards ({}) than the index has ({})",
+        shards_rewritten,
+        total_shards
+    );
+
+    let output = Command::new(&binary)
+        .args(["index", "stats", "-i", output_path.to_str().unwrap()])
+        .output()?;
+    assert!(output.status.success());
+    let stats_after = String::from_utf8_lossy(&output.stdout).to_string();
+    let buckets_after = parse_labeled_int(&stats_after, "Buckets:");
+    let minimizers_after = parse_labeled_int(&stats_after, "Total minimizers:");
+
+    assert_eq!(
+        buckets_after, buckets_before,
+        "bucket-update must not add or remove buckets"
+    );
+    assert!(
+        minimizers_after >= minimizers_before,
+        "bucket-update only adds minimizers, total must not shrink: {} -> {}",
+        minimizers_before,
+        minimizers_after
+    );
+
+    Ok(Some((shards_rewritten, total_shards)))
+}
+
+#[test]
+#[ignore]
+fn test_bucket_update_real_index_n100_w200() -> Result<()> {
+    let Some((shards_rewritten, total_shards)) =
+        check_bucket_update_real_index(Path::new("perf-assessment/parquet-index/n100-w200.ryxdi"))?
+    else {
+        return Ok(());
+    };
+
+    // This fixture is bucket-exclusive by construction (see CLAUDE.md): the
+    // update should rewrite only the target bucket's own shard(s), not all
+    // 8 shards.
+    assert!(
+        shards_rewritten < total_shards,
+        "expected a partial rewrite on a bucket-exclusive index: rewrote {} of {} shards",
+        shards_rewritten,
+        total_shards
+    );
+
+    Ok(())
+}
+
+#[test]
+#[ignore]
+fn test_bucket_update_real_index_n97_w50() -> Result<()> {
+    // 97 buckets over only 11 non-bucket-exclusive shards: a bucket's range
+    // may legitimately span most or all shards, so no partial-rewrite
+    // assertion here -- check_bucket_update_real_index's scale-independent
+    // checks (novel minimizers added, other buckets untouched) are the ones
+    // that matter for this fixture.
+    check_bucket_update_real_index(Path::new("perf-assessment/parquet-index/n97-w50.ryxdi"))?;
+    Ok(())
+}
+
 /// Test merge with --subtract-from-primary flag
 #[test]
 fn test_cli_merge_with_subtraction() -> Result<()> {

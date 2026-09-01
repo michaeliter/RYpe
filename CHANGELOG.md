@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Inverted index for memory-efficient classification
 - C API for FFI integration
 - CLI tool for index management and classification
+- `rype index bucket-update`: add new sequences to one existing bucket of a Parquet index (deduping against the bucket's existing minimizers) without rebuilding the other buckets, with `-o <new.ryxdi>` and `--in-place` output modes
 
 ### Changed
 

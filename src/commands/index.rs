@@ -1607,6 +1607,137 @@ fn move_bucket_shards_into_main_index(
     Ok(())
 }
 
+/// Add new FASTX files to one existing bucket of a `.ryxdi` index, writing the
+/// result to `output_path` — the `rype index bucket-update` handler.
+///
+/// Reuses [`build_bucket_streaming_isolated`] to extract a sorted, deduped delta
+/// from `add_files` (tagged with the target bucket's own `bucket_id`, using the
+/// source index's own `k`/`w`/`salt`), then hands off to
+/// [`parquet_index::apply_bucket_addition`] to merge that delta against only the
+/// shards that actually touch the target bucket, carrying every other shard over
+/// untouched. See the module docs on `apply_bucket_addition` for the full design.
+#[allow(clippy::too_many_arguments)]
+pub fn run_bucket_update(
+    index_path: &Path,
+    target_bucket_id: u32,
+    add_files: &[PathBuf],
+    output_path: Option<&Path>,
+    in_place: bool,
+    max_memory: Option<usize>,
+    options: &parquet_index::ParquetWriteOptions,
+) -> Result<parquet_index::BucketUpdateStats> {
+    use rype::memory::detect_available_memory;
+
+    if add_files.is_empty() {
+        return Err(anyhow!("--add requires at least one file"));
+    }
+
+    let manifest = parquet_index::ParquetManifest::load(index_path)
+        .with_context(|| format!("Failed to load index manifest at {}", index_path.display()))?;
+    let (bucket_names, _, _) =
+        parquet_index::read_buckets_parquet(index_path).with_context(|| {
+            format!(
+                "Failed to read bucket metadata from {}",
+                index_path.display()
+            )
+        })?;
+    let bucket_name = bucket_names
+        .get(&target_bucket_id)
+        .ok_or_else(|| {
+            anyhow!(
+                "Bucket {} not found in index {}",
+                target_bucket_id,
+                index_path.display()
+            )
+        })?
+        .clone();
+
+    let available = max_memory.unwrap_or_else(|| detect_available_memory().bytes);
+    let chunk_config = calculate_chunk_config(available);
+    let shard_size = ((available as f64 * 0.4) as usize).max(parquet_index::MIN_SHARD_BYTES);
+
+    // Scratch directory for the extracted delta, placed next to the target
+    // (the requested output for -o mode, the index itself for --in-place) so
+    // it lands on the same filesystem (avoids surprising cross-device copies
+    // if the system temp dir is a different, possibly smaller, mount).
+    let scratch_neighbor = if in_place {
+        index_path
+    } else {
+        output_path.expect("output_path required unless in_place")
+    };
+    let delta_dir_name = format!(
+        ".tmp_bucket_update_delta_{}",
+        scratch_neighbor
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("index")
+    );
+    let delta_dir = scratch_neighbor
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(delta_dir_name);
+    if delta_dir.exists() {
+        std::fs::remove_dir_all(&delta_dir).with_context(|| {
+            format!(
+                "Failed to clear stale temp directory {}",
+                delta_dir.display()
+            )
+        })?;
+    }
+    parquet_index::create_index_directory(&delta_dir)?;
+
+    let delta_result = build_bucket_streaming_isolated(
+        &delta_dir,
+        target_bucket_id,
+        &bucket_name,
+        add_files,
+        Path::new("."),
+        manifest.k,
+        manifest.w,
+        manifest.salt,
+        chunk_config.target_chunk_bytes,
+        shard_size,
+        Some(options),
+        None,
+    );
+
+    let delta_result = match delta_result {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&delta_dir);
+            return Err(e);
+        }
+    };
+
+    let result = if in_place {
+        parquet_index::apply_bucket_addition_in_place(
+            index_path,
+            target_bucket_id,
+            &delta_dir,
+            &delta_result.shard_infos,
+            &delta_result.sources,
+            shard_size,
+            options,
+        )
+        .with_context(|| "Failed to apply bucket update")
+    } else {
+        parquet_index::apply_bucket_addition(
+            index_path,
+            target_bucket_id,
+            &delta_dir,
+            &delta_result.shard_infos,
+            &delta_result.sources,
+            output_path.expect("output_path required unless in_place"),
+            shard_size,
+            options,
+        )
+        .with_context(|| "Failed to apply bucket update")
+    };
+
+    let _ = std::fs::remove_dir_all(&delta_dir);
+    result
+}
+
 /// Build a single bucket with orientation using streaming shard creation.
 ///
 /// Strategy:

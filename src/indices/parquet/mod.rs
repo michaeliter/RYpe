@@ -20,6 +20,7 @@ mod manifest;
 pub mod merge;
 mod options;
 mod streaming;
+mod update;
 
 /// Format version for the Parquet-based index.
 /// Increment when making breaking changes to the format.
@@ -53,3 +54,4 @@ pub use streaming::{
     compute_source_hash, create_parquet_inverted_index, ShardAccumulator, MIN_SHARD_BYTES,
 };
 pub use streaming::{consolidate_shards, consolidate_shards_streaming};
+pub use update::{apply_bucket_addition, apply_bucket_addition_in_place, BucketUpdateStats};

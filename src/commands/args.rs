@@ -188,6 +188,78 @@ pub enum IndexCommands {
         reference: PathBuf,
     },
 
+    /// Add new sequences to one existing bucket without rebuilding the index
+    #[command(after_help = "BUCKET UPDATE:
+  Extracts minimizers from --add files, deduplicates them against the target
+  bucket's existing contents, and writes the union back to just that bucket.
+  Every other bucket's shard files are carried over unchanged (hard-linked
+  where possible), so cost scales with the target bucket plus the new files,
+  not the whole index.
+
+  Sequences shorter than the index's k-mer size produce no minimizers and
+  are silently excluded. The source index's k, w, and salt are reused for
+  extraction; there is no way to override them here.
+
+EXAMPLES:
+  # Add newly-discovered viral genomes to the existing 'Viral' bucket
+  rype index bucket-update -i index.ryxdi --bucket Viral \\
+      --add new_virus1.fasta --add new_virus2.fasta -o index_v2.ryxdi
+
+  # Same, by numeric bucket ID
+  rype index bucket-update -i index.ryxdi --bucket 3 --add new.fasta.gz -o updated.ryxdi")]
+    BucketUpdate {
+        /// Path to existing index directory (.ryxdi)
+        #[arg(short, long)]
+        index: PathBuf,
+
+        /// Bucket identifier: numeric ID (e.g., '1') or exact bucket name (case-sensitive).
+        /// Numeric IDs take precedence - if a bucket is named '42', use its numeric ID instead.
+        #[arg(long, required = true)]
+        bucket: String,
+
+        /// New reference file(s) to add to the bucket (FASTA/FASTQ, optionally gzipped).
+        /// Can specify multiple times: --add file1.fa --add file2.fa
+        #[arg(long, required = true)]
+        add: Vec<PathBuf>,
+
+        /// Output path for the updated index (.ryxdi directory will be created).
+        /// Conflicts with --in-place.
+        #[arg(short, long, conflicts_with = "in_place")]
+        output: Option<PathBuf>,
+
+        /// Update the index directory in place instead of writing a new one.
+        /// Not yet implemented.
+        #[arg(long, conflicts_with = "output")]
+        in_place: bool,
+
+        /// Maximum memory to use (e.g., "8G", "512M", "auto").
+        /// Controls extraction chunk sizes and the merge shard budget.
+        /// Default: auto-detect from system/cgroups/SLURM.
+        #[arg(long, default_value = "auto", value_parser = parse_max_memory_arg)]
+        max_memory: usize,
+
+        /// Row group size (rows per group). Larger = better compression.
+        #[arg(long, default_value_t = 100_000)]
+        row_group_size: usize,
+
+        /// Use Zstd compression instead of Snappy for Parquet files.
+        #[arg(long)]
+        zstd: bool,
+
+        /// Enable bloom filters for faster lookups.
+        #[arg(long)]
+        bloom_filter: bool,
+
+        /// Bloom filter false positive probability (0.0-1.0).
+        /// Only used with --bloom-filter.
+        #[arg(long, default_value = "0.05", value_parser = parse_bloom_fpp)]
+        bloom_fpp: f64,
+
+        /// Print timing diagnostics to stderr for performance analysis.
+        #[arg(long)]
+        timing: bool,
+    },
+
     /// Build index from a TOML configuration file (see CONFIG FORMAT below)
     #[command(after_help = "CONFIG FORMAT (from-config):
   [index]

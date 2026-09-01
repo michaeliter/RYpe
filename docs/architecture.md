@@ -46,3 +46,16 @@ DELTA_BINARY_PACKED encoding gives strong compression on sorted minimizer column
 3. **Negative filtering** (`-N` flag): a second index whose minimizers subtract from per-bucket scores. Indices must share `k`, `w`, and `salt` to be combinable.
 
 The C API wraps steps 2–3 for FFI consumers.
+
+## Updating an index
+
+An index directory is otherwise immutable, but two commands rewrite one in place rather than requiring a from-scratch rebuild:
+
+- **`rype index merge`**: combines multiple indices' buckets into one output index (optionally subtracting one index's minimizers from another first). It renumbers buckets and does not union same-named buckets across inputs — it's a structural combine, not an update to existing bucket contents.
+- **`rype index bucket-update`**: adds new sequences to one *existing* bucket of one index — the "a database upgrade added new viral genomes, extend the viral bucket without rebuilding the microbial and eukaryotic ones" case. It relies on a property of `index from-config`-built multi-bucket indices, verified rather than assumed: every shard file belongs to exactly one bucket, which the Parquet `bucket_id` column's row-group statistics prove from the footer alone, with no need to read row data. Updating one bucket therefore only rewrites shards whose statistics overlap that bucket's id; every other shard is carried over untouched (hard-linked, falling back to a copy across filesystems). New minimizers are deduped against the bucket's existing contents by a streaming k-way merge, the same merge core `consolidate_shards_streaming` uses during a normal build.
+
+  For indices where shards aren't bucket-exclusive (e.g. `index create`'s range-partitioned shards), the same footer-statistics check naturally degrades to "every shard is relevant," so the update becomes a full-index rewrite rather than silently missing minimizers.
+
+  `-o <new.ryxdi>` (default) assembles the result in a fresh directory. `--in-place` instead writes new shards directly into the source index's own `inverted/` directory under previously-unused shard ids, then commits by atomically renaming a `manifest.toml.tmp` over `manifest.toml` — the single crash-safe commit point, matching how `ParquetManifest` guarantees callers never observe a partially-written manifest. Superseded shards are only deleted after that rename succeeds, so a crash mid-update leaves a few harmless orphan shard files next to a valid, unchanged index.
+
+  Two known limitations are surfaced (via a warning), not silently papered over: per-file sequence-length statistics for the updated bucket go stale (the underlying per-file lengths aren't persisted, so median/stdev can't be recomputed from the new files alone), and orientation (`--orient`) isn't recorded in the manifest, so newly added sequences are extracted unoriented.

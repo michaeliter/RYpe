@@ -1111,7 +1111,7 @@ fn drop_seen_minimizers(entries: &mut Vec<(u64, u32)>, seen: &[u64]) -> u64 {
 /// Write (minimizer, bucket_id) pairs to a Parquet shard file.
 ///
 /// Entries must be sorted by (minimizer, bucket_id) before calling.
-fn write_shard_from_pairs(
+pub(crate) fn write_shard_from_pairs(
     path: &Path,
     entries: &[(u64, u32)],
     options: &ParquetWriteOptions,
@@ -1189,7 +1189,7 @@ impl ShardWriter {
 /// this reader holds at most one `RecordBatch` in memory
 /// (~`PARQUET_BATCH_SIZE × 12 B`). It is intended for streaming k-way merges
 /// where multiple shards are iterated in parallel.
-struct StreamingShardReader {
+pub(crate) struct StreamingShardReader {
     iter: parquet::arrow::arrow_reader::ParquetRecordBatchReader,
     current: Option<RecordBatch>,
     row_idx: usize,
@@ -1198,7 +1198,7 @@ struct StreamingShardReader {
 }
 
 impl StreamingShardReader {
-    fn open(path: &Path) -> Result<Self> {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
         let file = std::fs::File::open(path)
@@ -1214,7 +1214,7 @@ impl StreamingShardReader {
         })
     }
 
-    fn next_pair(&mut self) -> Result<Option<(u64, u32)>> {
+    pub(crate) fn next_pair(&mut self) -> Result<Option<(u64, u32)>> {
         use arrow::array::{UInt32Array, UInt64Array};
 
         loop {
@@ -1317,6 +1317,107 @@ fn rename_final_shards(
     Ok(())
 }
 
+/// Result of a [`merge_shard_paths_into`] pass.
+pub(crate) struct MergeCounts {
+    /// Number of unique `(minimizer, bucket_id)` pairs written, per bucket.
+    pub(crate) bucket_counts: HashMap<u32, u64>,
+    pub(crate) total_unique: u64,
+}
+
+/// K-way merge `(minimizer, bucket_id)` pairs streamed from `paths` into `acc`,
+/// deduping on exact pair equality.
+///
+/// This is the shared core behind [`consolidate_shards_streaming`] and the
+/// bucket-update merge (`indices::parquet::update`): both need to fold several
+/// sorted shard files into one deduplicated, sorted stream, the only
+/// difference being which paths they pass in and which directories those
+/// paths live under.
+pub(crate) fn merge_shard_paths_into(
+    paths: &[PathBuf],
+    acc: &mut ShardAccumulator,
+) -> Result<MergeCounts> {
+    let n = paths.len();
+
+    // Phase 1: open streaming readers; seed heap with first pair of each.
+    let mut readers: Vec<StreamingShardReader> = Vec::with_capacity(n);
+    let mut heap: BinaryHeap<Reverse<(u64, u32, usize)>> = BinaryHeap::new();
+    for (idx, path) in paths.iter().enumerate() {
+        let mut reader = StreamingShardReader::open(path)?;
+        if let Some((m, b)) = reader.next_pair()? {
+            heap.push(Reverse((m, b, idx)));
+        }
+        readers.push(reader);
+    }
+    log::info!("  Opened {} streaming shard readers", n);
+
+    /// How often (in unique pairs merged) to emit a progress log. Tuned to
+    /// one log line per ~1-5s at typical merge throughput.
+    const MERGE_PROGRESS_INTERVAL: u64 = 50_000_000;
+
+    let mut last_written: Option<(u64, u32)> = None;
+    let mut bucket_counts: HashMap<u32, u64> = HashMap::new();
+    let mut total_unique: u64 = 0;
+    let mut total_popped: u64 = 0;
+    let t_merge = std::time::Instant::now();
+
+    while let Some(Reverse((m, b, idx))) = heap.pop() {
+        total_popped += 1;
+        if last_written != Some((m, b)) {
+            // Push a single pair directly — ShardAccumulator's internal Vec is
+            // already the canonical batching buffer; a second pending Vec here
+            // just duplicates that layer without benefit.
+            acc.add_entries(std::slice::from_ref(&(m, b)));
+            last_written = Some((m, b));
+            total_unique += 1;
+            *bucket_counts.entry(b).or_insert(0) += 1;
+            while acc.should_flush() {
+                if let Some(info) = acc.flush_shard()? {
+                    log::info!(
+                        "  Flushed final shard #{} ({} entries, range [{}, {}])",
+                        info.shard_id,
+                        info.num_entries,
+                        info.min_minimizer,
+                        info.max_minimizer
+                    );
+                }
+            }
+            if total_unique % MERGE_PROGRESS_INTERVAL == 0 {
+                let elapsed = t_merge.elapsed();
+                let rate = total_popped as f64 / elapsed.as_secs_f64().max(0.001);
+                log::info!(
+                    "  Merge progress: {} unique / {} popped ({:.1}% dedup, {:.1}M pairs/s)",
+                    total_unique,
+                    total_popped,
+                    100.0 * (1.0 - total_unique as f64 / total_popped.max(1) as f64),
+                    rate / 1_000_000.0,
+                );
+            }
+        }
+        if let Some(next) = readers[idx].next_pair()? {
+            heap.push(Reverse((next.0, next.1, idx)));
+        }
+    }
+
+    let merge_elapsed = t_merge.elapsed();
+    log::info!(
+        "  Merge phase complete: {} unique pairs from {} popped in {:.2}s ({:.1}M pairs/s input)",
+        total_unique,
+        total_popped,
+        merge_elapsed.as_secs_f64(),
+        total_popped as f64 / merge_elapsed.as_secs_f64().max(0.001) / 1_000_000.0,
+    );
+
+    // Readers (and their open file handles) are dropped here, at function
+    // return, before the caller touches the intermediate shard paths. On
+    // Unix, deleting a file with open descriptors is legal; on Windows it can
+    // fail with a sharing violation — so callers must not delete `paths`
+    // until this function has returned.
+    Ok(MergeCounts {
+        bucket_counts,
+        total_unique,
+    })
+}
+
 /// Streaming consolidation of intermediate shards into final deduplicated,
 /// non-overlapping shards via a k-way merge.
 ///
@@ -1370,88 +1471,24 @@ pub fn consolidate_shards_streaming(
         max_shard_bytes / (1024 * 1024),
     );
 
-    // Phase 1: open streaming readers; seed heap with first pair of each.
-    let mut readers: Vec<StreamingShardReader> = Vec::with_capacity(n);
-    let mut heap: BinaryHeap<Reverse<(u64, u32, usize)>> = BinaryHeap::new();
-    for (idx, info) in intermediate_shards.iter().enumerate() {
-        let path = inverted_dir.join(files::inverted_shard(info.shard_id));
-        let mut reader = StreamingShardReader::open(&path)?;
-        if let Some((m, b)) = reader.next_pair()? {
-            heap.push(Reverse((m, b, idx)));
-        }
-        readers.push(reader);
-    }
-    log::info!("  Opened {} streaming shard readers", n);
-
-    // Phase 2: k-way merge → write via ShardAccumulator at offset shard ids.
+    // Phase 1-2: open streaming readers, k-way merge, write via ShardAccumulator
+    // at offset shard ids. Readers are closed when `merge_shard_paths_into`
+    // returns, before Phase 4 below touches the intermediate paths — see that
+    // function's note on why this ordering matters on Windows.
+    let paths: Vec<PathBuf> = intermediate_shards
+        .iter()
+        .map(|info| inverted_dir.join(files::inverted_shard(info.shard_id)))
+        .collect();
     let mut accumulator =
         ShardAccumulator::with_start_shard_id(output_dir, max_shard_bytes, offset, Some(options));
-
-    /// How often (in unique pairs merged) to emit a progress log. Tuned to
-    /// one log line per ~1-5s at typical merge throughput.
-    const MERGE_PROGRESS_INTERVAL: u64 = 50_000_000;
-
-    let mut last_written: Option<(u64, u32)> = None;
-    let mut total_unique: u64 = 0;
-    let mut total_popped: u64 = 0;
-    let t_merge = std::time::Instant::now();
-
-    while let Some(Reverse((m, b, idx))) = heap.pop() {
-        total_popped += 1;
-        if last_written != Some((m, b)) {
-            // Push a single pair directly — ShardAccumulator's internal Vec is
-            // already the canonical batching buffer; a second pending Vec here
-            // just duplicates that layer without benefit.
-            accumulator.add_entries(std::slice::from_ref(&(m, b)));
-            last_written = Some((m, b));
-            total_unique += 1;
-            while accumulator.should_flush() {
-                if let Some(info) = accumulator.flush_shard()? {
-                    log::info!(
-                        "  Flushed final shard #{} ({} entries, range [{}, {}])",
-                        info.shard_id,
-                        info.num_entries,
-                        info.min_minimizer,
-                        info.max_minimizer
-                    );
-                }
-            }
-            if total_unique % MERGE_PROGRESS_INTERVAL == 0 {
-                let elapsed = t_merge.elapsed();
-                let rate = total_popped as f64 / elapsed.as_secs_f64().max(0.001);
-                log::info!(
-                    "  Merge progress: {} unique / {} popped ({:.1}% dedup, {:.1}M pairs/s)",
-                    total_unique,
-                    total_popped,
-                    100.0 * (1.0 - total_unique as f64 / total_popped.max(1) as f64),
-                    rate / 1_000_000.0,
-                );
-            }
-        }
-        if let Some(next) = readers[idx].next_pair()? {
-            heap.push(Reverse((next.0, next.1, idx)));
-        }
-    }
-
-    let merge_elapsed = t_merge.elapsed();
-    log::info!(
-        "  Merge phase complete: {} unique pairs from {} popped in {:.2}s ({:.1}M pairs/s input)",
-        total_unique,
-        total_popped,
-        merge_elapsed.as_secs_f64(),
-        total_popped as f64 / merge_elapsed.as_secs_f64().max(0.001) / 1_000_000.0,
-    );
+    let counts = merge_shard_paths_into(&paths, &mut accumulator)?;
+    let total_unique = counts.total_unique;
 
     // accumulator.finish() flushes the trailing partial shard; the per-flush
-    // log above covers every shard produced inside the loop, and the summary
-    // "Consolidation complete" log below covers the final shard count.
+    // log inside merge_shard_paths_into covers every shard produced during the
+    // merge, and the summary "Consolidation complete" log below covers the
+    // final shard count.
     let mut offset_shard_infos = accumulator.finish()?;
-
-    // Phase 3: drop readers (close files) before touching intermediate paths.
-    // On Unix, deleting a file with open descriptors is legal; on Windows it
-    // can fail with a sharing violation. Dropping the readers explicitly here
-    // makes the ordering portable rather than relying on end-of-scope drop.
-    drop(readers);
 
     // Phase 4: delete intermediates.
     // ORDERING DEPENDENCY: all final writes above must be complete before any

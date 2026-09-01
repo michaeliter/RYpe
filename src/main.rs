@@ -10,9 +10,9 @@ mod logging;
 
 use commands::{
     build_parquet_index_from_config, create_parquet_index_from_refs, inspect_matches,
-    load_index_metadata, resolve_bucket_id, run_aggregate, run_classify, run_log_ratio,
-    ClassifyAggregateArgs, ClassifyCommands, ClassifyLogRatioArgs, ClassifyRunArgs, Cli, Commands,
-    CommonClassifyArgs, IndexCommands, InspectCommands,
+    load_index_metadata, resolve_bucket_id, run_aggregate, run_bucket_update, run_classify,
+    run_log_ratio, ClassifyAggregateArgs, ClassifyCommands, ClassifyLogRatioArgs, ClassifyRunArgs,
+    Cli, Commands, CommonClassifyArgs, IndexCommands, InspectCommands,
 };
 
 // CLI argument definitions moved to commands/args.rs
@@ -195,6 +195,88 @@ fn main() -> Result<()> {
                      This feature is pending development. For now, re-create the index \
                      from scratch with all reference files."
                 ));
+            }
+
+            IndexCommands::BucketUpdate {
+                index,
+                bucket,
+                add,
+                output,
+                in_place,
+                max_memory,
+                row_group_size,
+                zstd,
+                bloom_filter,
+                bloom_fpp,
+                timing,
+            } => {
+                if timing {
+                    ENABLE_TIMING.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                if !rype::is_parquet_index(&index) {
+                    return Err(anyhow!(
+                        "Index not found or not in Parquet format: {}",
+                        index.display()
+                    ));
+                }
+
+                let output_path = if in_place {
+                    None
+                } else {
+                    Some(
+                        output
+                            .ok_or_else(|| {
+                                anyhow!("bucket-update requires -o/--output (or --in-place)")
+                            })?
+                            .with_extension("ryxdi"),
+                    )
+                };
+
+                let metadata = load_index_metadata(&index)?;
+                let target_bucket_id = resolve_bucket_id(&bucket, &metadata.bucket_names)?;
+
+                let write_options = parquet_index::ParquetWriteOptions {
+                    row_group_size,
+                    compression: if zstd {
+                        parquet_index::ParquetCompression::Zstd
+                    } else {
+                        parquet_index::ParquetCompression::Snappy
+                    },
+                    bloom_filter_enabled: bloom_filter,
+                    bloom_filter_fpp: bloom_fpp,
+                    write_page_statistics: true,
+                };
+
+                let max_memory_opt = if max_memory == 0 {
+                    None
+                } else {
+                    Some(max_memory)
+                };
+
+                let stats = run_bucket_update(
+                    &index,
+                    target_bucket_id,
+                    &add,
+                    output_path.as_deref(),
+                    in_place,
+                    max_memory_opt,
+                    &write_options,
+                )?;
+
+                println!("Bucket update complete:");
+                match &output_path {
+                    Some(path) => println!("  Output: {}", path.display()),
+                    None => println!("  Updated in place: {}", index.display()),
+                }
+                println!("  Bucket: {} (ID {})", bucket, target_bucket_id);
+                println!("  New minimizers added: {}", stats.novel_minimizers);
+                println!("  Already present (deduped): {}", stats.already_present);
+                println!(
+                    "  Shards rewritten: {}, carried over: {}",
+                    stats.shards_rewritten, stats.shards_carried_over
+                );
+                println!("  Total minimizer entries: {}", stats.total_minimizers);
             }
 
             IndexCommands::FromConfig {

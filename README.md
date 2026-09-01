@@ -92,6 +92,7 @@ rype index stats -i index.ryxdi
 | `create` | Build index from FASTA/FASTQ files |
 | `from-config` | Build index from TOML configuration file |
 | `merge` | Merge two indices (with optional subtraction) |
+| `bucket-update` | Add new sequences to one existing bucket, without rebuilding the rest of the index |
 | `stats` | Show index statistics |
 | `bucket-source-detail` | Show source details for a specific bucket |
 | `summarize` | Show detailed minimizer statistics (legacy non-Parquet indices only) |
