@@ -12,9 +12,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::manifest::{InvertedManifest, InvertedShardInfo, ParquetManifest};
-use super::merge::read_shard_pairs;
 use super::options::ParquetWriteOptions;
-use super::streaming::{merge_shard_paths_into, ShardAccumulator};
+use super::streaming::{merge_shard_paths_into, ShardAccumulator, StreamingShardReader};
 use super::{files, read_buckets_parquet, write_buckets_parquet, FORMAT_MAGIC, FORMAT_VERSION};
 
 /// Read the `[min, max]` range of the `bucket_id` column of a shard file from
@@ -101,8 +100,14 @@ fn shard_bucket_counts(
         counts.insert(range.0, num_entries);
         return Ok(counts);
     }
+    // Stream row-by-row (Arrow batches under the hood) rather than collecting
+    // the whole shard into a Vec first: a mixed-bucket shard can be
+    // arbitrarily large (non-bucket-exclusive layouts put many buckets'
+    // worth of rows in one file), and this count-only pass has no need to
+    // hold more than one batch in memory at a time.
     let mut counts: HashMap<u32, u64> = HashMap::new();
-    for (_, bucket_id) in read_shard_pairs(path)? {
+    let mut reader = StreamingShardReader::open(path)?;
+    while let Some((_, bucket_id)) = reader.next_pair()? {
         *counts.entry(bucket_id).or_insert(0) += 1;
     }
     Ok(counts)
@@ -527,6 +532,7 @@ pub fn apply_bucket_addition_in_place(
 #[cfg(test)]
 mod tests {
     use super::super::manifest::ParquetShardFormat;
+    use super::super::merge::read_shard_pairs;
     use super::super::streaming::write_shard_from_pairs;
     use super::*;
     use tempfile::TempDir;
