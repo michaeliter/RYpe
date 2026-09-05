@@ -221,7 +221,7 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
     }
 
     let manifest = sharded.manifest();
-    let (idx_k, idx_w, idx_salt) = (manifest.k, manifest.w, manifest.salt);
+    let (idx_k, idx_sketch, idx_salt) = (manifest.k, manifest.sketch, manifest.salt);
 
     // The accumulator scales with minimizer count, but the classification-pass
     // HitAccumulator scales with read count — a pass with few but long reads
@@ -329,7 +329,7 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
             *pass_num += 1;
         } else {
             let t_extract = std::time::Instant::now();
-            let extracted = extract_batch_minimizers(idx_k, idx_w, idx_salt, None, batch_refs);
+            let extracted = extract_batch_minimizers(idx_k, idx_sketch, idx_salt, None, batch_refs);
             log_timing("batch: extract", t_extract.elapsed().as_millis());
             acc.extend_extracted(headers, extracted);
 
@@ -1072,8 +1072,13 @@ pub fn classify_numerator_and_partition(
 
     // Extract minimizers once — cached for reuse
     let t_extract = std::time::Instant::now();
-    let extracted =
-        rype::extract_batch_minimizers(manifest.k, manifest.w, manifest.salt, None, batch_refs);
+    let extracted = rype::extract_batch_minimizers(
+        manifest.k,
+        manifest.sketch,
+        manifest.salt,
+        None,
+        batch_refs,
+    );
     log_timing("batch: extraction", t_extract.elapsed().as_millis());
 
     let query_ids: Vec<i64> = batch_refs.iter().map(|(id, _, _)| *id).collect();

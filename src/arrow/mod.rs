@@ -286,7 +286,7 @@ fn classify_arrow_batch_sharded_internal(
     let t_extract = std::time::Instant::now();
     let extracted = crate::extract_batch_minimizers(
         manifest.k,
-        manifest.w,
+        manifest.sketch,
         manifest.salt,
         negative_mins,
         &records,
@@ -408,8 +408,13 @@ mod tests {
             (3, query_seq.as_slice(), None),
         ];
         let manifest = index.manifest();
-        let extracted =
-            crate::extract_batch_minimizers(manifest.k, manifest.w, manifest.salt, None, &records);
+        let extracted = crate::extract_batch_minimizers(
+            manifest.k,
+            manifest.sketch,
+            manifest.salt,
+            None,
+            &records,
+        );
 
         // Three reads, two ids.
         let err = classify_arrow_from_extracted(&index, extracted.clone(), &[1, 2], 0.0, false)

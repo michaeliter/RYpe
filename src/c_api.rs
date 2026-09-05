@@ -2165,7 +2165,7 @@ mod arrow_ffi {
         fn push_batch(
             &mut self,
             k: usize,
-            w: usize,
+            sketch: crate::Sketch,
             salt: u64,
             records: &[crate::QueryRecord],
         ) -> Result<(), String>;
@@ -2194,7 +2194,7 @@ mod arrow_ffi {
         fn push_batch(
             &mut self,
             k: usize,
-            w: usize,
+            sketch: crate::Sketch,
             salt: u64,
             records: &[crate::QueryRecord],
         ) -> Result<(), String> {
@@ -2208,8 +2208,9 @@ mod arrow_ffi {
                 ));
             }
             self.query_ids.extend(records.iter().map(|(id, _, _)| *id));
-            self.extracted
-                .extend(crate::extract_batch_minimizers(k, w, salt, None, records));
+            self.extracted.extend(crate::extract_batch_minimizers(
+                k, sketch, salt, None, records,
+            ));
             Ok(())
         }
 
@@ -2245,7 +2246,7 @@ mod arrow_ffi {
         fn push_batch(
             &mut self,
             k: usize,
-            w: usize,
+            sketch: crate::Sketch,
             salt: u64,
             records: &[crate::QueryRecord],
         ) -> Result<(), String> {
@@ -2259,7 +2260,7 @@ mod arrow_ffi {
                 ));
             }
             let ids: Vec<i64> = records.iter().map(|(id, _, _)| *id).collect();
-            let extracted = crate::extract_batch_minimizers(k, w, salt, None, records);
+            let extracted = crate::extract_batch_minimizers(k, sketch, salt, None, records);
             self.acc.extend_extracted(ids, extracted);
             Ok(())
         }
@@ -2280,9 +2281,9 @@ mod arrow_ffi {
         /// can filter/consume it in place (e.g. negative-set filtering) and
         /// free it before building the output batch.
         classify_fn: F,
-        /// Minimizer parameters, taken from the index manifest at setup.
+        /// Sketch parameters, taken from the index manifest at setup.
         k: usize,
-        w: usize,
+        sketch: crate::Sketch,
         salt: u64,
         /// Reads to accumulate before classifying. 0 classifies each input
         /// batch on its own, which is the one-batch-in/one-batch-out
@@ -2303,7 +2304,7 @@ mod arrow_ffi {
             output_schema: SchemaRef,
             classify_fn: F,
             k: usize,
-            w: usize,
+            sketch: crate::Sketch,
             salt: u64,
             classify_rows: usize,
         ) -> Self {
@@ -2312,7 +2313,7 @@ mod arrow_ffi {
                 output_schema,
                 classify_fn,
                 k,
-                w,
+                sketch,
                 salt,
                 classify_rows,
                 input_done: false,
@@ -2351,7 +2352,8 @@ mod arrow_ffi {
                         }
                     };
                     if !records.is_empty() {
-                        if let Err(msg) = sink.push_batch(self.k, self.w, self.salt, &records) {
+                        if let Err(msg) = sink.push_batch(self.k, self.sketch, self.salt, &records)
+                        {
                             self.input_done = true;
                             return Some(Err(arrow::error::ArrowError::ComputeError(msg)));
                         }
@@ -2431,7 +2433,7 @@ mod arrow_ffi {
         output_schema: SchemaRef,
         classify_fn: F,
         k: usize,
-        w: usize,
+        sketch: crate::Sketch,
         salt: u64,
         classify_rows: usize,
     ) -> Result<(), String>
@@ -2451,7 +2453,7 @@ mod arrow_ffi {
                 output_schema,
                 classify_fn,
                 k,
-                w,
+                sketch,
                 salt,
                 classify_rows,
             );
@@ -2472,7 +2474,7 @@ mod arrow_ffi {
         output_schema: SchemaRef,
         classify_fn: F,
         k: usize,
-        w: usize,
+        sketch: crate::Sketch,
         salt: u64,
         classify_rows: usize,
     ) -> Result<(), String>
@@ -2492,7 +2494,7 @@ mod arrow_ffi {
                 output_schema,
                 classify_fn,
                 k,
-                w,
+                sketch,
                 salt,
                 classify_rows,
             );
@@ -2587,7 +2589,7 @@ mod arrow_ffi {
         }
 
         let manifest = unsafe { &*index_ptr }.0.manifest();
-        let (k, w, salt) = (manifest.k, manifest.w, manifest.salt);
+        let (k, sketch, salt) = (manifest.k, manifest.sketch, manifest.salt);
 
         let classify_fn =
             move |(mut query_idx, query_ids): (crate::QueryInvertedIndex, Vec<i64>)| {
@@ -2616,7 +2618,7 @@ mod arrow_ffi {
             crate::arrow::result_schema(),
             classify_fn,
             k,
-            w,
+            sketch,
             salt,
             classify_rows,
         ) {
@@ -3279,7 +3281,7 @@ mod arrow_ffi {
         // take the minimizer parameters the accumulating reader extracts with.
         let num = &*numerator;
         let denom = &*denominator;
-        let (k, w, salt) = match crate::validate_log_ratio_indices(&num.0, &denom.0) {
+        let (k, sketch, salt) = match crate::validate_log_ratio_indices(&num.0, &denom.0) {
             Ok(params) => params,
             Err(e) => {
                 set_last_error(format!("{}", e));
@@ -3347,7 +3349,7 @@ mod arrow_ffi {
             crate::arrow::log_ratio_result_schema(),
             classify_fn,
             k,
-            w,
+            sketch,
             salt,
             classify_rows,
         ) {

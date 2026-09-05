@@ -6321,7 +6321,8 @@ fn test_multi_pass_byte_budget_run_yields_expected_pass_count() -> Result<()> {
         let start_id = (batch_idx * READS_PER_BATCH) as i64;
         let batch = make_batch(start_id);
         let ids: Vec<i64> = (start_id..start_id + READS_PER_BATCH as i64).collect();
-        let extracted = rype::extract_batch_minimizers(k, w, salt, None, &batch);
+        let extracted =
+            rype::extract_batch_minimizers(k, rype::Sketch::Minimizer { w }, salt, None, &batch);
         probe_acc.extend_extracted(ids, extracted);
     }
     let three_batch_bytes = probe_acc.approx_bytes();
@@ -6339,7 +6340,8 @@ fn test_multi_pass_byte_budget_run_yields_expected_pass_count() -> Result<()> {
         let start_id = (batch_idx * READS_PER_BATCH) as i64;
         let batch = make_batch(start_id);
         let ids: Vec<i64> = (start_id..start_id + READS_PER_BATCH as i64).collect();
-        let extracted = rype::extract_batch_minimizers(k, w, salt, None, &batch);
+        let extracted =
+            rype::extract_batch_minimizers(k, rype::Sketch::Minimizer { w }, salt, None, &batch);
         acc.extend_extracted(ids, extracted);
 
         if acc.should_flush() {

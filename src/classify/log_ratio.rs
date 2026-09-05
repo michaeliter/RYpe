@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{anyhow, Result};
 
 use crate::types::{HitResult, IndexMetadata, QueryRecord};
-use crate::ShardedInvertedIndex;
+use crate::{ShardedInvertedIndex, Sketch};
 
 /// Indicates whether a log-ratio result was determined via a fast path
 /// (skipping the denominator classification) or computed exactly.
@@ -168,11 +168,11 @@ pub fn partition_by_numerator_score(
 /// Validate that two sharded indices are compatible for log-ratio classification.
 ///
 /// Checks that both are single-bucket indices with matching k, w, and salt.
-/// Returns `(k, w, salt)` on success.
+/// Returns `(k, sketch, salt)` on success.
 pub fn validate_log_ratio_indices(
     numerator: &ShardedInvertedIndex,
     denominator: &ShardedInvertedIndex,
-) -> Result<(usize, usize, u64)> {
+) -> Result<(usize, Sketch, u64)> {
     let num_manifest = numerator.manifest();
     let denom_manifest = denominator.manifest();
 
@@ -206,7 +206,7 @@ pub fn validate_log_ratio_indices(
         ));
     }
 
-    Ok((num_manifest.k, num_manifest.w, num_manifest.salt))
+    Ok((num_manifest.k, num_manifest.sketch, num_manifest.salt))
 }
 
 /// Classify a batch of reads using log-ratio (numerator vs denominator).
@@ -235,10 +235,10 @@ pub fn classify_log_ratio_batch(
         return Ok(Vec::new());
     }
 
-    let (k, w, salt) = validate_log_ratio_indices(numerator, denominator)?;
+    let (k, sketch, salt) = validate_log_ratio_indices(numerator, denominator)?;
 
     let original_ids: Vec<i64> = records.iter().map(|r| r.0).collect();
-    let extracted = crate::extract_batch_minimizers(k, w, salt, None, records);
+    let extracted = crate::extract_batch_minimizers(k, sketch, salt, None, records);
 
     classify_log_ratio_from_extracted(
         numerator,

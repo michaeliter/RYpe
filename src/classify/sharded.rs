@@ -17,6 +17,7 @@ use crate::constants::{
     FOLD_REDUCE_MAX_READS, PARALLEL_RG_COLLECT_CHUNK_SIZE,
 };
 use crate::core::extraction::get_paired_minimizers_into;
+use crate::core::sketch::Sketch;
 use crate::core::workspace::MinimizerWorkspace;
 use crate::indices::sharded::{ShardManifest, ShardedInvertedIndex};
 use crate::indices::{InvertedIndex, QueryInvertedIndex};
@@ -73,10 +74,10 @@ fn fmt_duration_secs(secs: f64) -> String {
 
 /// Estimate minimizers per query from the first record in a batch.
 ///
-/// Uses the formula: ((query_length - k) / w + 1) * 2 (for both strands).
+/// Delegates to `Sketch::estimate_selected` for the scheme's density law.
 /// Falls back to ESTIMATED_MINIMIZERS_PER_SEQUENCE if the batch is empty or
 /// sequences are too short.
-fn estimate_minimizers_from_records(records: &[QueryRecord], k: usize, w: usize) -> usize {
+fn estimate_minimizers_from_records(records: &[QueryRecord], k: usize, sketch: Sketch) -> usize {
     if records.is_empty() {
         return ESTIMATED_MINIMIZERS_PER_SEQUENCE;
     }
@@ -88,9 +89,9 @@ fn estimate_minimizers_from_records(records: &[QueryRecord], k: usize, w: usize)
         return ESTIMATED_MINIMIZERS_PER_SEQUENCE;
     }
 
-    // Estimate: (len - k) / w + 1 minimizers per strand, times 2 for both strands
-    let estimate = ((query_len - k) / w + 1) * 2;
-    estimate.max(ESTIMATED_MINIMIZERS_PER_SEQUENCE)
+    sketch
+        .estimate_selected(query_len, k)
+        .max(ESTIMATED_MINIMIZERS_PER_SEQUENCE)
 }
 
 /// Extract minimizers from a batch of query records in parallel.
@@ -101,7 +102,7 @@ fn estimate_minimizers_from_records(records: &[QueryRecord], k: usize, w: usize)
 ///
 /// # Arguments
 /// * `k` - K-mer size
-/// * `w` - Window size
+/// * `sketch` - Sketch scheme (minimizer window or open-syncmer `s`)
 /// * `salt` - Hash salt
 /// * `negative_mins` - Optional set of minimizers to exclude before returning
 /// * `records` - Batch of query records
@@ -110,7 +111,7 @@ fn estimate_minimizers_from_records(records: &[QueryRecord], k: usize, w: usize)
 /// Vec of (forward_minimizers, rc_minimizers) per query, in the same order as `records`.
 pub fn extract_batch_minimizers(
     k: usize,
-    w: usize,
+    sketch: Sketch,
     salt: u64,
     negative_mins: Option<&HashSet<u64>>,
     records: &[QueryRecord],
@@ -118,13 +119,13 @@ pub fn extract_batch_minimizers(
     if records.is_empty() {
         return Vec::new();
     }
-    let estimated_mins = estimate_minimizers_from_records(records, k, w);
+    let estimated_mins = estimate_minimizers_from_records(records, k, sketch);
     records
         .par_iter()
         .map_init(
             || MinimizerWorkspace::with_estimate(estimated_mins),
             |ws, (_, s1, s2)| {
-                let (ha, hb) = get_paired_minimizers_into(s1, *s2, k, w, salt, ws);
+                let (ha, hb) = get_paired_minimizers_into(s1, *s2, k, sketch, salt, ws);
                 filter_negative_mins(ha, hb, negative_mins)
             },
         )
@@ -476,7 +477,7 @@ pub fn classify_batch_sharded_merge_join(
     let t_extract = Instant::now();
     let extracted = extract_batch_minimizers(
         manifest.k,
-        manifest.w,
+        manifest.sketch,
         manifest.salt,
         negative_mins,
         records,
@@ -838,7 +839,7 @@ pub fn classify_batch_sharded_parallel_rg(
     let t_extract = Instant::now();
     let extracted = extract_batch_minimizers(
         manifest.k,
-        manifest.w,
+        manifest.sketch,
         manifest.salt,
         negative_mins,
         records,
@@ -896,7 +897,8 @@ pub fn classify_with_sharded_negative(
     let manifest = positive_index.manifest();
 
     // Step 1: Extract minimizers once (no negative filtering yet)
-    let extracted = extract_batch_minimizers(manifest.k, manifest.w, manifest.salt, None, records);
+    let extracted =
+        extract_batch_minimizers(manifest.k, manifest.sketch, manifest.salt, None, records);
 
     // Step 2: Build sorted unique minimizers for querying negative index
     let mut all_minimizers: Vec<u64> = extracted
@@ -1154,7 +1156,7 @@ mod tests {
     #[test]
     fn test_estimate_minimizers_from_records_empty() {
         let records: Vec<QueryRecord> = vec![];
-        let estimate = estimate_minimizers_from_records(&records, 32, 10);
+        let estimate = estimate_minimizers_from_records(&records, 32, Sketch::Minimizer { w: 10 });
         assert_eq!(estimate, ESTIMATED_MINIMIZERS_PER_SEQUENCE);
     }
 
@@ -1162,7 +1164,7 @@ mod tests {
     fn test_estimate_minimizers_from_records_short_sequence() {
         let short_seq = b"ACGT"; // 4 bases, less than k=32
         let records: Vec<QueryRecord> = vec![(1, short_seq.as_slice(), None)];
-        let estimate = estimate_minimizers_from_records(&records, 32, 10);
+        let estimate = estimate_minimizers_from_records(&records, 32, Sketch::Minimizer { w: 10 });
         assert_eq!(estimate, ESTIMATED_MINIMIZERS_PER_SEQUENCE);
     }
 
@@ -1170,7 +1172,7 @@ mod tests {
     fn test_estimate_minimizers_from_records_long_sequence() {
         let long_seq = generate_sequence(200, 0);
         let records: Vec<QueryRecord> = vec![(1, long_seq.as_slice(), None)];
-        let estimate = estimate_minimizers_from_records(&records, 32, 10);
+        let estimate = estimate_minimizers_from_records(&records, 32, Sketch::Minimizer { w: 10 });
         // Should be approximately ((200 - 32) / 10 + 1) * 2 = 36
         assert!(
             estimate >= 30 && estimate <= 50,
@@ -1345,7 +1347,7 @@ mod tests {
         let manifest = index.manifest();
         let extracted = extract_batch_minimizers(
             manifest.k,
-            manifest.w,
+            manifest.sketch,
             manifest.salt,
             None,
             &[
@@ -1404,7 +1406,7 @@ mod tests {
         let manifest = index.manifest();
         let extracted = extract_batch_minimizers(
             manifest.k,
-            manifest.w,
+            manifest.sketch,
             manifest.salt,
             None,
             &[
@@ -1487,7 +1489,7 @@ mod tests {
         let query_ids: Vec<i64> = (0..records.len() as i64).collect();
 
         let extracted =
-            extract_batch_minimizers(manifest.k, manifest.w, manifest.salt, None, &records);
+            extract_batch_minimizers(manifest.k, manifest.sketch, manifest.salt, None, &records);
         let query_idx = QueryInvertedIndex::build(&extracted);
         assert!(
             query_idx.num_reads() > FOLD_REDUCE_MAX_READS,

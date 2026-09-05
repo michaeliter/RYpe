@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use super::inverted::InvertedIndex;
 use crate::types::IndexMetadata;
+use crate::Sketch;
 
 /// Information about a single shard in a sharded inverted index.
 #[derive(Debug, Clone)]
@@ -49,6 +50,10 @@ pub struct ShardInfo {
 pub struct ShardManifest {
     pub k: usize,
     pub w: usize,
+    /// Sketch scheme this index was built with. Derived from `w` at load time
+    /// (`ParquetManifest` does not yet carry a scheme), so this is currently
+    /// always `Sketch::Minimizer { w }` until syncmer manifests exist.
+    pub sketch: Sketch,
     pub salt: u64,
     pub source_hash: u64,
     /// Total minimizer entries across all shards (includes duplicates across shards).
@@ -169,6 +174,9 @@ impl ShardedInvertedIndex {
         let manifest = ShardManifest {
             k: parquet_manifest.k,
             w: parquet_manifest.w,
+            sketch: Sketch::Minimizer {
+                w: parquet_manifest.w,
+            },
             salt: parquet_manifest.salt,
             source_hash: parquet_manifest.source_hash,
             total_minimizers: inverted.total_entries.min(usize::MAX as u64) as usize,
@@ -219,6 +227,11 @@ impl ShardedInvertedIndex {
     /// Returns the window size.
     pub fn w(&self) -> usize {
         self.manifest.w
+    }
+
+    /// Returns the sketch scheme this index was built with.
+    pub fn sketch(&self) -> Sketch {
+        self.manifest.sketch
     }
 
     /// Returns the salt value.

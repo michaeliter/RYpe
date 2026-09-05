@@ -30,7 +30,7 @@ use std::sync::Arc;
 use super::error::ArrowClassifyError;
 use super::input::batch_to_records_with_columns;
 use super::schema::COL_ID;
-use crate::MinimizerWorkspace;
+use crate::{IntoSketch, MinimizerWorkspace};
 
 // Column names for extraction output
 const COL_FWD_SET: &str = "fwd_set";
@@ -96,7 +96,7 @@ fn append_u64_list(builder: &mut ListBuilder<UInt64Builder>, values: &[u64]) {
 pub fn extract_minimizer_set_batch(
     batch: &RecordBatch,
     k: usize,
-    w: usize,
+    sketch: impl IntoSketch,
     salt: u64,
 ) -> Result<RecordBatch, ArrowClassifyError> {
     let schema = minimizer_set_schema();
@@ -113,11 +113,12 @@ pub fn extract_minimizer_set_batch(
     let mut fwd_builder = ListBuilder::new(UInt64Builder::new());
     let mut rc_builder = ListBuilder::new(UInt64Builder::new());
 
+    let sketch = sketch.into_sketch();
     let mut ws = MinimizerWorkspace::new();
 
     for (id, seq, _pair) in &records {
         ids.push(*id);
-        let (fwd, rc) = crate::extract_minimizer_set(seq, k, w, salt, &mut ws);
+        let (fwd, rc) = crate::extract_minimizer_set(seq, k, sketch, salt, &mut ws);
         append_u64_list(&mut fwd_builder, &fwd);
         append_u64_list(&mut rc_builder, &rc);
     }
@@ -147,7 +148,7 @@ pub fn extract_minimizer_set_batch(
 pub fn extract_strand_minimizers_batch(
     batch: &RecordBatch,
     k: usize,
-    w: usize,
+    sketch: impl IntoSketch,
     salt: u64,
 ) -> Result<RecordBatch, ArrowClassifyError> {
     let schema = strand_minimizers_schema();
@@ -165,11 +166,12 @@ pub fn extract_strand_minimizers_batch(
     let mut rc_hashes_builder = ListBuilder::new(UInt64Builder::new());
     let mut rc_positions_builder = ListBuilder::new(UInt64Builder::new());
 
+    let sketch = sketch.into_sketch();
     let mut ws = MinimizerWorkspace::new();
 
     for (id, seq, _pair) in &records {
         ids.push(*id);
-        let (fwd, rc) = crate::extract_strand_minimizers(seq, k, w, salt, &mut ws);
+        let (fwd, rc) = crate::extract_strand_minimizers(seq, k, sketch, salt, &mut ws);
 
         append_u64_list(&mut fwd_hashes_builder, &fwd.hashes);
         // Convert positions from usize to u64
