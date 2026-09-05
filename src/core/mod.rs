@@ -9,9 +9,11 @@
 
 pub mod encoding;
 pub mod extraction;
+pub(crate) mod hash;
 pub mod merge;
 pub mod orientation;
 pub mod ring_buffer;
+pub mod sketch;
 pub mod workspace;
 
 // Re-export commonly used items at the core module level
@@ -20,6 +22,7 @@ pub use extraction::{
     count_hits, extract_dual_strand_into, extract_into, extract_minimizer_set,
     extract_strand_minimizers, get_paired_minimizers_into, Strand, StrandMinimizers,
 };
+pub use sketch::{IntoSketch, Sketch, SketchSchemeTag};
 pub use workspace::MinimizerWorkspace;
 
 // Re-export merge utilities

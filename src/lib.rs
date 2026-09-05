@@ -95,6 +95,9 @@ pub use core::{
     extract_strand_minimizers, StrandMinimizers,
 };
 
+// Sketch scheme types (minimizer vs. open-syncmer selection)
+pub use core::{IntoSketch, Sketch, SketchSchemeTag};
+
 // Orientation utilities (for bucket building)
 pub use core::{choose_orientation, choose_orientation_sampled, Orientation, ORIENTATION_FIRST_N};
 
