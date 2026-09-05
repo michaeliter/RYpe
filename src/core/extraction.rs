@@ -903,6 +903,34 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_into_boundary_k_plus_w_minus_2_is_empty() {
+        // k=16, w=4: the warm-up gate is `valid_bases_count >= k+w-1 == 19`.
+        // One base short of that must yield zero minimizers.
+        let mut ws = MinimizerWorkspace::new();
+        let seq = b"ACGTACGTACGTACGTAC"; // 18 bases
+        assert_eq!(seq.len(), 16 + 4 - 2);
+        extract_into(seq, 16, 4, 0, &mut ws);
+        assert!(
+            ws.buffer.is_empty(),
+            "k+w-2 bases must yield zero minimizers, one short of the warm-up gate"
+        );
+    }
+
+    #[test]
+    fn test_extract_into_boundary_k_plus_w_minus_1_has_exactly_one() {
+        // Exactly enough bases for the warm-up gate to fire once.
+        let mut ws = MinimizerWorkspace::new();
+        let seq = b"ACGTACGTACGTACGTACG"; // 19 bases
+        assert_eq!(seq.len(), 16 + 4 - 1);
+        extract_into(seq, 16, 4, 0, &mut ws);
+        assert_eq!(
+            ws.buffer.len(),
+            1,
+            "k+w-1 bases must yield exactly one minimizer"
+        );
+    }
+
+    #[test]
     fn test_n_handling_separator() {
         let mut ws = MinimizerWorkspace::new();
         let seq_a: Vec<u8> = (0..80)
@@ -1777,6 +1805,43 @@ mod tests {
             let seq = vec![b'A'; 40];
             extract_into(&seq, 16, Sketch::OpenSyncmer { s: 5 }, 0, &mut ws);
             assert!(ws.buffer.is_empty());
+        }
+
+        /// Value-shaped and positional syncmer extractors are two separately
+        /// implemented loops (`extract_dual_strand_into_syncmer` and
+        /// `extract_strand_minimizers_syncmer`); unlike the minimizer scheme,
+        /// which can legitimately disagree on count (value-shaped extractors
+        /// collapse consecutive equal values, the positional extractor does
+        /// not), syncmer selection is position-local so consecutive
+        /// selections always have distinct values -- the two must therefore
+        /// select the exact same k-mer value set, not just overlap.
+        #[test]
+        fn test_syncmer_strand_minimizers_matches_dual_strand_exactly() {
+            let mut ws = MinimizerWorkspace::new();
+            let sketch = Sketch::OpenSyncmer { s: 15 };
+            for seed in 0..5u64 {
+                let seq = pseudo_random_seq(5_000, seed);
+                let (fwd_sm, rc_sm) = extract_strand_minimizers(&seq, 32, sketch, 0, &mut ws);
+                let (fwd_ds, rc_ds) = extract_dual_strand_into(&seq, 32, sketch, 0, &mut ws);
+
+                let mut fwd_sm_vals = fwd_sm.hashes.clone();
+                let mut rc_sm_vals = rc_sm.hashes.clone();
+                let mut fwd_ds_vals = fwd_ds.clone();
+                let mut rc_ds_vals = rc_ds.clone();
+                fwd_sm_vals.sort_unstable();
+                rc_sm_vals.sort_unstable();
+                fwd_ds_vals.sort_unstable();
+                rc_ds_vals.sort_unstable();
+
+                assert_eq!(
+                    fwd_sm_vals, fwd_ds_vals,
+                    "seed {seed}: forward value sets diverged"
+                );
+                assert_eq!(
+                    rc_sm_vals, rc_ds_vals,
+                    "seed {seed}: rc value sets diverged"
+                );
+            }
         }
     }
 
