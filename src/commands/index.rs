@@ -13,7 +13,7 @@ use rype::config::{parse_config, resolve_path, validate_config};
 use rype::parquet_index;
 use rype::{
     choose_orientation_sampled, extract_dual_strand_into, extract_into, kway_merge_dedup,
-    log_timing, merge_sorted_into, MinimizerWorkspace, Orientation, BUCKET_SOURCE_DELIM,
+    log_timing, merge_sorted_into, MinimizerWorkspace, Orientation, Sketch, BUCKET_SOURCE_DELIM,
 };
 
 use std::collections::HashSet;
@@ -87,7 +87,7 @@ pub fn create_parquet_index_from_refs(
     output: &Path,
     references: &[PathBuf],
     k: usize,
-    w: usize,
+    sketch: Sketch,
     salt: u64,
     separate_buckets: bool,
     max_shard_bytes: Option<usize>,
@@ -97,10 +97,10 @@ pub fn create_parquet_index_from_refs(
     use std::collections::HashMap;
 
     log::info!(
-        "Creating Parquet inverted index at {:?} (K={}, W={}, salt={:#x})",
+        "Creating Parquet inverted index at {:?} (K={}, {}, salt={:#x})",
         output,
         k,
-        w,
+        sketch,
         salt
     );
 
@@ -128,7 +128,7 @@ pub fn create_parquet_index_from_refs(
                 let bucket_id = next_id;
                 next_id += 1;
 
-                extract_into(&seq, k, w, salt, &mut ws);
+                extract_into(&seq, k, sketch, salt, &mut ws);
                 let mut minimizers = std::mem::take(&mut ws.buffer);
                 minimizers.sort_unstable();
                 minimizers.dedup();
@@ -160,7 +160,7 @@ pub fn create_parquet_index_from_refs(
 
                 file_total_bases += seq.len() as u64;
 
-                extract_into(&seq, k, w, salt, &mut ws);
+                extract_into(&seq, k, sketch, salt, &mut ws);
                 all_minimizers.extend_from_slice(&ws.buffer);
 
                 let source_label = format!("{}{}{}", filename, BUCKET_SOURCE_DELIM, name);
@@ -212,7 +212,7 @@ pub fn create_parquet_index_from_refs(
         output,
         buckets,
         k,
-        w,
+        sketch,
         salt,
         max_shard_bytes,
         options,
@@ -239,7 +239,7 @@ pub fn create_parquet_index_from_refs(
 /// * `files` - Paths to FASTA/FASTQ files
 /// * `config_dir` - Base directory for resolving relative paths
 /// * `k` - K-mer size
-/// * `w` - Window size
+/// * `sketch` - Sketch scheme (minimizer window or open-syncmer `s`)
 /// * `salt` - Hash salt
 /// * `orient_sequences` - If true, orient sequences to maximize minimizer overlap
 ///
@@ -258,7 +258,7 @@ fn extract_bucket_minimizers(
     files: &[PathBuf],
     config_dir: &Path,
     k: usize,
-    w: usize,
+    sketch: Sketch,
     salt: u64,
     orient_sequences: bool,
 ) -> Result<(Vec<u64>, Vec<String>, Vec<u64>)> {
@@ -294,14 +294,14 @@ fn extract_bucket_minimizers(
 
             if is_first_sequence || !orient_sequences {
                 // Forward-only: extract, sort, merge in-place
-                extract_into(&seq, k, w, salt, &mut ws);
+                extract_into(&seq, k, sketch, salt, &mut ws);
                 let mut new_mins = std::mem::take(&mut ws.buffer);
                 new_mins.sort_unstable();
                 merge_sorted_into(&mut bucket_mins, &new_mins);
                 is_first_sequence = false;
             } else {
                 // Oriented: extract both strands, sort both, choose best, merge in-place
-                let (mut fwd, mut rc) = extract_dual_strand_into(&seq, k, w, salt, &mut ws);
+                let (mut fwd, mut rc) = extract_dual_strand_into(&seq, k, sketch, salt, &mut ws);
                 fwd.sort_unstable();
                 rc.sort_unstable();
 
@@ -371,7 +371,7 @@ fn build_single_bucket_parallel(
     files: &[PathBuf],
     config_dir: &Path,
     k: usize,
-    w: usize,
+    sketch: Sketch,
     salt: u64,
 ) -> Result<(String, Vec<u64>, Vec<String>)> {
     log::info!(
@@ -388,7 +388,7 @@ fn build_single_bucket_parallel(
 
     // Estimate workspace size from average sequence length
     let avg_len = sequences.iter().map(|(s, _)| s.len()).sum::<usize>() / sequences.len().max(1);
-    let estimated_mins = MinimizerWorkspace::estimate_for_length(avg_len, k, w);
+    let estimated_mins = MinimizerWorkspace::estimate_for_length(avg_len, k, sketch);
 
     // Parallel extraction with per-thread workspace
     // Note: we don't dedup here - kway_merge_dedup handles deduplication efficiently
@@ -397,7 +397,7 @@ fn build_single_bucket_parallel(
         .map_init(
             move || MinimizerWorkspace::with_estimate(estimated_mins),
             |ws, (seq, _source)| {
-                extract_into(seq, k, w, salt, ws);
+                extract_into(seq, k, sketch, salt, ws);
                 let mut mins = std::mem::take(&mut ws.buffer);
                 mins.sort_unstable();
                 mins
@@ -430,7 +430,7 @@ fn build_single_bucket_parallel_oriented(
     files: &[PathBuf],
     config_dir: &Path,
     k: usize,
-    w: usize,
+    sketch: Sketch,
     salt: u64,
 ) -> Result<(String, Vec<u64>, Vec<String>)> {
     log::info!(
@@ -445,7 +445,7 @@ fn build_single_bucket_parallel_oriented(
 
     // Phase 1: Process first file sequentially to establish baseline
     let (baseline_mins, baseline_sources, _baseline_file_bases) =
-        extract_baseline_from_first_file(&files[0], config_dir, k, w, salt)?;
+        extract_baseline_from_first_file(&files[0], config_dir, k, sketch, salt)?;
 
     if files.len() == 1 {
         // Only one file, we're done
@@ -475,7 +475,7 @@ fn build_single_bucket_parallel_oriented(
         .map(|(s, _)| s.len())
         .sum::<usize>()
         / remaining_sequences.len().max(1);
-    let estimated_mins = MinimizerWorkspace::estimate_for_length(avg_len, k, w);
+    let estimated_mins = MinimizerWorkspace::estimate_for_length(avg_len, k, sketch);
 
     // Phase 3: Parallel extraction with orientation against baseline
     // Note: we don't dedup here - kway_merge_dedup handles deduplication efficiently
@@ -484,7 +484,7 @@ fn build_single_bucket_parallel_oriented(
         .map_init(
             move || MinimizerWorkspace::with_estimate(estimated_mins),
             |ws, (seq, _source)| {
-                let (mut fwd, mut rc) = extract_dual_strand_into(seq, k, w, salt, ws);
+                let (mut fwd, mut rc) = extract_dual_strand_into(seq, k, sketch, salt, ws);
                 fwd.sort_unstable();
                 rc.sort_unstable();
 
@@ -524,7 +524,7 @@ fn extract_baseline_from_first_file(
     file_path: &Path,
     config_dir: &Path,
     k: usize,
-    w: usize,
+    sketch: Sketch,
     salt: u64,
 ) -> Result<(Vec<u64>, Vec<String>, u64)> {
     use rype::config::resolve_path;
@@ -553,7 +553,7 @@ fn extract_baseline_from_first_file(
         let seq = rec.seq();
         file_total_bases += seq.len() as u64;
 
-        extract_into(&seq, k, w, salt, &mut ws);
+        extract_into(&seq, k, sketch, salt, &mut ws);
         let mut new_mins = std::mem::take(&mut ws.buffer);
         new_mins.sort_unstable();
         merge_sorted_into(&mut baseline_mins, &new_mins);
@@ -762,7 +762,7 @@ impl SequenceChunkIterator {
 /// * `files` - Paths to FASTA/FASTQ files
 /// * `config_dir` - Base directory for resolving relative paths
 /// * `k` - K-mer size
-/// * `w` - Window size
+/// * `sketch` - Sketch scheme (minimizer window or open-syncmer `s`)
 /// * `salt` - Hash salt
 /// * `max_memory` - Available memory budget (None = auto-detect)
 ///
@@ -774,7 +774,7 @@ fn build_single_bucket_parallel_chunked(
     files: &[PathBuf],
     config_dir: &Path,
     k: usize,
-    w: usize,
+    sketch: Sketch,
     salt: u64,
     max_memory: Option<usize>,
 ) -> Result<(String, Vec<u64>, Vec<String>)> {
@@ -826,7 +826,7 @@ fn build_single_bucket_parallel_chunked(
 
         // Estimate workspace size from this chunk's sequences
         let avg_len = chunk_size / chunk.len().max(1);
-        let estimated_mins = MinimizerWorkspace::estimate_for_length(avg_len, k, w);
+        let estimated_mins = MinimizerWorkspace::estimate_for_length(avg_len, k, sketch);
 
         // Parallel extraction within chunk
         let chunk_mins: Vec<Vec<u64>> = chunk
@@ -834,7 +834,7 @@ fn build_single_bucket_parallel_chunked(
             .map_init(
                 move || MinimizerWorkspace::with_estimate(estimated_mins),
                 |ws, (seq, _source)| {
-                    extract_into(seq, k, w, salt, ws);
+                    extract_into(seq, k, sketch, salt, ws);
                     let mut mins = std::mem::take(&mut ws.buffer);
                     mins.sort_unstable();
                     mins
@@ -881,7 +881,7 @@ fn build_single_bucket_parallel_oriented_chunked(
     files: &[PathBuf],
     config_dir: &Path,
     k: usize,
-    w: usize,
+    sketch: Sketch,
     salt: u64,
     max_memory: Option<usize>,
 ) -> Result<(String, Vec<u64>, Vec<String>)> {
@@ -899,7 +899,7 @@ fn build_single_bucket_parallel_oriented_chunked(
 
     // Phase 1: Process first file sequentially to establish baseline
     let (baseline_mins, baseline_sources, _baseline_file_bases) =
-        extract_baseline_from_first_file(&files[0], config_dir, k, w, salt)?;
+        extract_baseline_from_first_file(&files[0], config_dir, k, sketch, salt)?;
 
     if files.len() == 1 {
         log::info!(
@@ -951,7 +951,7 @@ fn build_single_bucket_parallel_oriented_chunked(
 
         // Estimate workspace size
         let avg_len = chunk_size / chunk.len().max(1);
-        let estimated_mins = MinimizerWorkspace::estimate_for_length(avg_len, k, w);
+        let estimated_mins = MinimizerWorkspace::estimate_for_length(avg_len, k, sketch);
 
         // Clone reference to merged_mins for parallel access
         // (orientation compares against current accumulated baseline)
@@ -963,7 +963,7 @@ fn build_single_bucket_parallel_oriented_chunked(
             .map_init(
                 move || MinimizerWorkspace::with_estimate(estimated_mins),
                 |ws, (seq, _source)| {
-                    let (mut fwd, mut rc) = extract_dual_strand_into(seq, k, w, salt, ws);
+                    let (mut fwd, mut rc) = extract_dual_strand_into(seq, k, sketch, salt, ws);
                     fwd.sort_unstable();
                     rc.sort_unstable();
 
@@ -1053,7 +1053,7 @@ fn consolidate_streaming_shards(
 /// * `files` - Paths to FASTA/FASTQ files
 /// * `config_dir` - Base directory for resolving relative paths
 /// * `k` - K-mer size
-/// * `w` - Window size
+/// * `sketch` - Sketch scheme (minimizer window or open-syncmer `s`)
 /// * `salt` - Hash salt
 /// * `max_memory` - Available memory budget (None = auto-detect)
 /// * `options` - Parquet write options
@@ -1065,7 +1065,7 @@ fn build_single_bucket_streaming(
     files: &[PathBuf],
     config_dir: &Path,
     k: usize,
-    w: usize,
+    sketch: Sketch,
     salt: u64,
     max_memory: Option<usize>,
     options: Option<&rype::parquet_index::ParquetWriteOptions>,
@@ -1150,7 +1150,7 @@ fn build_single_bucket_streaming(
 
         // Estimate workspace size from this chunk's sequences
         let avg_len = chunk_size / chunk.len().max(1);
-        let estimated_mins = MinimizerWorkspace::estimate_for_length(avg_len, k, w);
+        let estimated_mins = MinimizerWorkspace::estimate_for_length(avg_len, k, sketch);
 
         // Parallel extraction within chunk
         let chunk_mins: Vec<Vec<u64>> = chunk
@@ -1158,7 +1158,7 @@ fn build_single_bucket_streaming(
             .map_init(
                 move || MinimizerWorkspace::with_estimate(estimated_mins),
                 |ws, (seq, _source)| {
-                    extract_into(seq, k, w, salt, ws);
+                    extract_into(seq, k, sketch, salt, ws);
                     let mut mins = std::mem::take(&mut ws.buffer);
                     mins.sort_unstable();
                     mins
@@ -1302,7 +1302,7 @@ fn build_single_bucket_streaming_oriented(
     files: &[PathBuf],
     config_dir: &Path,
     k: usize,
-    w: usize,
+    sketch: Sketch,
     salt: u64,
     max_memory: Option<usize>,
     options: Option<&rype::parquet_index::ParquetWriteOptions>,
@@ -1332,7 +1332,7 @@ fn build_single_bucket_streaming_oriented(
 
     // Phase 1: Extract baseline from first file
     let (baseline_mins, baseline_sources, baseline_file_bases) =
-        extract_baseline_from_first_file(&files[0], config_dir, k, w, salt)?;
+        extract_baseline_from_first_file(&files[0], config_dir, k, sketch, salt)?;
     let mut file_length_map: std::collections::HashMap<String, u64> =
         std::collections::HashMap::new();
     // Track baseline file length (extract filename from first source label)
@@ -1428,7 +1428,7 @@ fn build_single_bucket_streaming_oriented(
             }
 
             let avg_len = chunk_size / chunk.len().max(1);
-            let estimated_mins = MinimizerWorkspace::estimate_for_length(avg_len, k, w);
+            let estimated_mins = MinimizerWorkspace::estimate_for_length(avg_len, k, sketch);
 
             // Parallel extraction with orientation
             let chunk_mins: Vec<Vec<u64>> = chunk
@@ -1436,7 +1436,7 @@ fn build_single_bucket_streaming_oriented(
                 .map_init(
                     move || MinimizerWorkspace::with_estimate(estimated_mins),
                     |ws, (seq, _source)| {
-                        let (mut fwd, mut rc) = extract_dual_strand_into(seq, k, w, salt, ws);
+                        let (mut fwd, mut rc) = extract_dual_strand_into(seq, k, sketch, salt, ws);
                         fwd.sort_unstable();
                         rc.sort_unstable();
 
@@ -1582,7 +1582,7 @@ fn build_single_bucket(
     files: &[PathBuf],
     config_dir: &Path,
     k: usize,
-    w: usize,
+    sketch: Sketch,
     salt: u64,
     orient_sequences: bool,
 ) -> Result<(String, Vec<u64>, Vec<String>)> {
@@ -1594,7 +1594,7 @@ fn build_single_bucket(
 
     // Delegate to extract_bucket_minimizers for the actual work
     let (minimizers, sources, _file_lengths) =
-        extract_bucket_minimizers(files, config_dir, k, w, salt, orient_sequences)?;
+        extract_bucket_minimizers(files, config_dir, k, sketch, salt, orient_sequences)?;
 
     log::info!(
         "Completed bucket '{}': {} minimizers",
@@ -1769,7 +1769,9 @@ pub fn build_parquet_index_from_config(
             files,
             config_dir,
             cfg.index.k,
-            cfg.index.window,
+            rype::Sketch::Minimizer {
+                w: cfg.index.window,
+            },
             cfg.index.salt,
             cli_max_memory,
             options,
@@ -1782,7 +1784,9 @@ pub fn build_parquet_index_from_config(
             files,
             config_dir,
             cfg.index.k,
-            cfg.index.window,
+            rype::Sketch::Minimizer {
+                w: cfg.index.window,
+            },
             cfg.index.salt,
             cli_max_memory,
             options,
@@ -2045,7 +2049,7 @@ pub fn build_parquet_index_from_config_streaming(
                         files,
                         config_dir,
                         cfg.index.k,
-                        cfg.index.window,
+                        rype::Sketch::Minimizer { w: cfg.index.window },
                         cfg.index.salt,
                         orient_sequences,
                     );
@@ -2286,8 +2290,8 @@ output = "{}"
             "TestBucket",
             &[fasta_path],
             dir,
-            32, // k
-            10, // w
+            32,                                // k
+            rype::Sketch::Minimizer { w: 10 }, // w
             0x5555555555555555,
             false, // orient_sequences
         )
@@ -2321,7 +2325,7 @@ output = "{}"
             &[fasta_path],
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             false,
         )
@@ -2445,7 +2449,7 @@ output = "{}"
             &[fasta_path],
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             false, // orient disabled
         )
@@ -2476,7 +2480,7 @@ output = "{}"
             &[fasta_path],
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             true, // orient enabled
         )
@@ -2529,7 +2533,7 @@ output = "{}"
             &[fasta_path.clone()],
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             false,
         )
@@ -2541,7 +2545,7 @@ output = "{}"
             &[fasta_path],
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             true,
         )
@@ -2579,7 +2583,7 @@ output = "{}"
             &[fasta_path.clone()],
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             false,
         )
@@ -2590,7 +2594,7 @@ output = "{}"
             &[fasta_path],
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             true,
         )
@@ -2644,10 +2648,10 @@ output = "{}"
         let (minimizers, _sources, _file_lengths) = extract_bucket_minimizers(
             &[fasta_path],
             dir,
-            32,                 // k
-            10,                 // w
-            0x5555555555555555, // salt
-            false,              // orient_sequences
+            32,                                // k
+            rype::Sketch::Minimizer { w: 10 }, // w
+            0x5555555555555555,                // salt
+            false,                             // orient_sequences
         )
         .unwrap();
 
@@ -2672,7 +2676,7 @@ output = "{}"
             &[fasta1, fasta2],
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             false, // orient_sequences
         )
@@ -2704,7 +2708,7 @@ output = "{}"
             &[fasta_path],
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             false, // orient_sequences
         )
@@ -2751,16 +2755,22 @@ output = "{}"
             &[fasta_path.clone()],
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             false,
         )
         .unwrap();
 
         // Extract with orientation
-        let (mins_with_orient, _, _) =
-            extract_bucket_minimizers(&[fasta_path], dir, 32, 10, 0x5555555555555555, true)
-                .unwrap();
+        let (mins_with_orient, _, _) = extract_bucket_minimizers(
+            &[fasta_path],
+            dir,
+            32,
+            rype::Sketch::Minimizer { w: 10 },
+            0x5555555555555555,
+            true,
+        )
+        .unwrap();
 
         // Both should be sorted and deduplicated
         let mut sorted_no = mins_no_orient.clone();
@@ -4023,8 +4033,15 @@ files = ["short.fa", "long.fa"]
         let salt = 0x5555555555555555u64;
 
         // Run 1: Use existing build_single_bucket_parallel (unlimited memory)
-        let (_, mins_non_chunked, sources_non_chunked) =
-            build_single_bucket_parallel("TestBucket", &files, dir, k, w, salt).unwrap();
+        let (_, mins_non_chunked, sources_non_chunked) = build_single_bucket_parallel(
+            "TestBucket",
+            &files,
+            dir,
+            k,
+            rype::Sketch::Minimizer { w },
+            salt,
+        )
+        .unwrap();
 
         // Run 2: Use chunked extraction with small chunk budget
         let (_, mins_chunked, sources_chunked) = build_single_bucket_parallel_chunked(
@@ -4032,7 +4049,7 @@ files = ["short.fa", "long.fa"]
             &files,
             dir,
             k,
-            w,
+            rype::Sketch::Minimizer { w },
             salt,
             Some(500), // Very small budget to force multiple chunks
         )
@@ -4069,8 +4086,15 @@ files = ["short.fa", "long.fa"]
         let salt = 0x5555555555555555u64;
 
         // Run 1: Use existing oriented extraction (unlimited memory)
-        let (_, mins_non_chunked, _) =
-            build_single_bucket_parallel_oriented("TestBucket", &files, dir, k, w, salt).unwrap();
+        let (_, mins_non_chunked, _) = build_single_bucket_parallel_oriented(
+            "TestBucket",
+            &files,
+            dir,
+            k,
+            rype::Sketch::Minimizer { w },
+            salt,
+        )
+        .unwrap();
 
         // Run 2: Use chunked oriented extraction with small chunk budget
         let (_, mins_chunked, _) = build_single_bucket_parallel_oriented_chunked(
@@ -4078,7 +4102,7 @@ files = ["short.fa", "long.fa"]
             &files,
             dir,
             k,
-            w,
+            rype::Sketch::Minimizer { w },
             salt,
             Some(500), // Very small budget to force multiple chunks
         )
@@ -4105,7 +4129,7 @@ files = ["short.fa", "long.fa"]
             &[file],
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             Some(100), // Very small budget
         )
@@ -4141,7 +4165,7 @@ files = ["short.fa", "long.fa"]
             &[empty_path, nonempty],
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             Some(1000),
         )
@@ -4253,7 +4277,7 @@ files = ["short.fa", "long.fa"]
             &files,
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             Some(64 * 1024 * 1024), // 64MB max_memory
             None,
@@ -4329,7 +4353,7 @@ files = ["short.fa", "long.fa"]
             &files,
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             Some(3 * 1024 * 1024), // 3MB max_memory → ~1.2MB shard size
             None,
@@ -4389,7 +4413,7 @@ files = ["short.fa", "long.fa"]
             &files,
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             Some(3 * 1024 * 1024),
             None,
@@ -4467,7 +4491,7 @@ files = ["short.fa", "long.fa"]
             &files,
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             Some(3 * 1024 * 1024),
             None,
@@ -4539,7 +4563,7 @@ files = ["short.fa", "long.fa"]
             &files,
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             Some(64 * 1024 * 1024),
             None,
@@ -4569,7 +4593,7 @@ files = ["short.fa", "long.fa"]
             &[],
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             None,
             None,
@@ -4589,7 +4613,7 @@ files = ["short.fa", "long.fa"]
             &[],
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             None,
             None,
@@ -4625,7 +4649,7 @@ files = ["short.fa", "long.fa"]
             &[path],
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             None,
             None,
@@ -4685,7 +4709,7 @@ files = ["short.fa", "long.fa"]
             &files,
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             Some(3 * 1024 * 1024), // 3MB max_memory → ~1.2MB shard size
             None,
@@ -4800,7 +4824,7 @@ files = ["short.fa", "long.fa"]
             &[phix_path.clone()],
             &project_root,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             false,
         )
@@ -4837,7 +4861,7 @@ files = ["short.fa", "long.fa"]
             &[combined_path.clone()],
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             Some(100 * 1024 * 1024),
             None,
@@ -4852,7 +4876,7 @@ files = ["short.fa", "long.fa"]
             &[combined_path],
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             Some(100 * 1024 * 1024),
             None,
@@ -4890,7 +4914,7 @@ files = ["short.fa", "long.fa"]
             &[phix_path.clone()],
             &project_root,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             false,
         )
@@ -4921,7 +4945,7 @@ files = ["short.fa", "long.fa"]
             &[combined_path.clone()],
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             Some(100 * 1024 * 1024),
             None,
@@ -4936,7 +4960,7 @@ files = ["short.fa", "long.fa"]
             &[combined_path],
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             Some(100 * 1024 * 1024),
             None,
@@ -4975,7 +4999,7 @@ files = ["short.fa", "long.fa"]
             &[phix_path.clone()],
             &project_root,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             false,
         )
@@ -5005,7 +5029,7 @@ files = ["short.fa", "long.fa"]
             &[combined_path],
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             Some(100 * 1024 * 1024),
             None,
@@ -5041,7 +5065,7 @@ files = ["short.fa", "long.fa"]
             &[phix_path.clone()],
             &project_root,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             false,
         )
@@ -5070,7 +5094,7 @@ files = ["short.fa", "long.fa"]
             &[combined_path],
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             Some(100 * 1024 * 1024),
             None,
@@ -5148,7 +5172,7 @@ files = ["short.fa", "long.fa"]
             &[phix_path.clone()],
             &project_root,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             false,
         )
@@ -5176,7 +5200,7 @@ files = ["short.fa", "long.fa"]
             &[combined_path],
             dir,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0x5555555555555555,
             Some(100 * 1024 * 1024),
             None,

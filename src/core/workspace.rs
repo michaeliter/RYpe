@@ -4,6 +4,7 @@
 //! pre-allocated buffers that can be reused across multiple extraction calls.
 
 use super::ring_buffer::RingBuffer;
+use super::sketch::IntoSketch;
 use crate::constants::{
     DEFAULT_DEQUE_CAPACITY, ESTIMATED_MINIMIZERS_PER_SEQUENCE, RING_BUFFER_SIZE,
 };
@@ -66,13 +67,13 @@ impl MinimizerWorkspace {
 
     /// Estimate the number of minimizers for a sequence of given length.
     ///
-    /// Uses the formula: `((seq_len - k) / w + 1) * 2` for both strands.
-    /// Falls back to `ESTIMATED_MINIMIZERS_PER_SEQUENCE` for short sequences.
+    /// Delegates to `Sketch::estimate_selected` for the scheme's density law,
+    /// then floors the result at `ESTIMATED_MINIMIZERS_PER_SEQUENCE`.
     ///
     /// # Arguments
     /// * `seq_len` - Length of the sequence in bases
     /// * `k` - K-mer size
-    /// * `w` - Window size for minimizer selection
+    /// * `sketch` - Sketch scheme (minimizer window or open-syncmer `s`)
     ///
     /// # Returns
     /// Estimated number of minimizers, at least `ESTIMATED_MINIMIZERS_PER_SEQUENCE`.
@@ -86,12 +87,11 @@ impl MinimizerWorkspace {
     /// // ((200 - 32) / 10 + 1) * 2 = 36
     /// assert!(estimate >= 32);
     /// ```
-    pub fn estimate_for_length(seq_len: usize, k: usize, w: usize) -> usize {
-        if seq_len <= k {
-            ESTIMATED_MINIMIZERS_PER_SEQUENCE
-        } else {
-            (((seq_len - k) / w + 1) * 2).max(ESTIMATED_MINIMIZERS_PER_SEQUENCE)
-        }
+    pub fn estimate_for_length(seq_len: usize, k: usize, sketch: impl IntoSketch) -> usize {
+        sketch
+            .into_sketch()
+            .estimate_selected(seq_len, k)
+            .max(ESTIMATED_MINIMIZERS_PER_SEQUENCE)
     }
 }
 

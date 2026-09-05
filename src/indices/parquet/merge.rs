@@ -924,7 +924,17 @@ mod tests {
             minimizers,
         };
 
-        create_parquet_inverted_index(dir, vec![bucket], k, w, salt, None, None, None).unwrap();
+        create_parquet_inverted_index(
+            dir,
+            vec![bucket],
+            k,
+            crate::Sketch::Minimizer { w },
+            salt,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         ShardedInvertedIndex::open(dir).unwrap()
     }
@@ -1088,7 +1098,17 @@ mod tests {
             })
             .collect();
 
-        create_parquet_inverted_index(dir, bucket_data, k, w, salt, None, None, None).unwrap();
+        create_parquet_inverted_index(
+            dir,
+            bucket_data,
+            k,
+            crate::Sketch::Minimizer { w },
+            salt,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         ShardedInvertedIndex::open(dir).unwrap()
     }
@@ -1884,7 +1904,17 @@ mod tests {
 
     /// Helper to create an empty test index (0 buckets).
     fn create_empty_index(dir: &std::path::Path, k: usize, w: usize, salt: u64) {
-        create_parquet_inverted_index(dir, vec![], k, w, salt, None, None, None).unwrap();
+        create_parquet_inverted_index(
+            dir,
+            vec![],
+            k,
+            crate::Sketch::Minimizer { w },
+            salt,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2011,8 +2041,17 @@ mod tests {
                 minimizers: mins_b.clone(),
             },
         ];
-        create_parquet_inverted_index(&primary_path, primary_buckets, k, w, salt, None, None, None)
-            .unwrap();
+        create_parquet_inverted_index(
+            &primary_path,
+            primary_buckets,
+            k,
+            crate::Sketch::Minimizer { w },
+            salt,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         // Create secondary index with buckets C and D
         let secondary_buckets = vec![
@@ -2033,7 +2072,7 @@ mod tests {
             &secondary_path,
             secondary_buckets,
             k,
-            w,
+            crate::Sketch::Minimizer { w },
             salt,
             None,
             None,
@@ -2465,8 +2504,17 @@ mod tests {
             sources: vec!["primary.fa".to_string()],
             minimizers: mins_primary.clone(),
         }];
-        create_parquet_inverted_index(&primary_path, primary_buckets, k, w, salt, None, None, None)
-            .unwrap();
+        create_parquet_inverted_index(
+            &primary_path,
+            primary_buckets,
+            k,
+            crate::Sketch::Minimizer { w },
+            salt,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         // Create secondary index
         let secondary_buckets = vec![BucketData {
@@ -2479,7 +2527,7 @@ mod tests {
             &secondary_path,
             secondary_buckets,
             k,
-            w,
+            crate::Sketch::Minimizer { w },
             salt,
             None,
             None,
@@ -2601,8 +2649,17 @@ mod tests {
             sources: vec!["primary.fa".to_string()],
             minimizers: mins_primary.clone(),
         }];
-        create_parquet_inverted_index(&primary_path, primary_buckets, k, w, salt, None, None, None)
-            .unwrap();
+        create_parquet_inverted_index(
+            &primary_path,
+            primary_buckets,
+            k,
+            crate::Sketch::Minimizer { w },
+            salt,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         // Create secondary index with two buckets:
         // - bucket 1: has overlap with primary (will have minimizers removed)
@@ -2625,7 +2682,7 @@ mod tests {
             &secondary_path,
             secondary_buckets,
             k,
-            w,
+            crate::Sketch::Minimizer { w },
             salt,
             None,
             None,

@@ -362,7 +362,7 @@ mod tests {
             &index_path,
             buckets,
             16,
-            5,
+            crate::Sketch::Minimizer { w: 5 },
             0x12345,
             None,
             Some(&options),

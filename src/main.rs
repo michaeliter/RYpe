@@ -69,7 +69,7 @@ fn main() -> Result<()> {
                     &output,
                     &reference,
                     kmer_size,
-                    window,
+                    rype::Sketch::Minimizer { w: window },
                     salt,
                     separate_buckets,
                     max_shard_size,

@@ -132,7 +132,7 @@ fn test_readme_c_example_compiles_and_runs() {
             &index_path,
             buckets,
             32,
-            10,
+            rype::Sketch::Minimizer { w: 10 },
             0,
             None,
             Some(&options),

@@ -245,7 +245,7 @@ fn build_index(dir: &std::path::Path, name: &str, seeds: &[u64]) -> Result<std::
         &index_path,
         buckets,
         K,
-        W,
+        rype::Sketch::Minimizer { w: W },
         SALT,
         None,
         Some(&ParquetWriteOptions::default()),

@@ -81,7 +81,16 @@ fn test_parquet_schema_is_correct() -> Result<()> {
     let index_path = dir.path().join("test.ryxdi");
 
     let buckets = create_test_buckets();
-    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None, None)?;
+    create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        64,
+        rype::Sketch::Minimizer { w: 50 },
+        12345,
+        None,
+        None,
+        None,
+    )?;
 
     // Read the shard and verify schema
     let shard_path = index_path.join("inverted").join("shard.0.parquet");
@@ -122,7 +131,16 @@ fn test_parquet_data_is_sorted() -> Result<()> {
     let index_path = dir.path().join("test.ryxdi");
 
     let buckets = create_test_buckets();
-    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None, None)?;
+    create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        64,
+        rype::Sketch::Minimizer { w: 50 },
+        12345,
+        None,
+        None,
+        None,
+    )?;
 
     // Read all pairs from the shard
     let shard_path = index_path.join("inverted").join("shard.0.parquet");
@@ -150,7 +168,16 @@ fn test_parquet_no_duplicate_pairs() -> Result<()> {
     let index_path = dir.path().join("test.ryxdi");
 
     let buckets = create_test_buckets();
-    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None, None)?;
+    create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        64,
+        rype::Sketch::Minimizer { w: 50 },
+        12345,
+        None,
+        None,
+        None,
+    )?;
 
     // Read all pairs from the shard
     let shard_path = index_path.join("inverted").join("shard.0.parquet");
@@ -179,8 +206,16 @@ fn test_parquet_manifest_counts_match_data() -> Result<()> {
     // Total entries = sum of all minimizers (each becomes one row)
     let expected_total_entries = expected_total_minimizers;
 
-    let manifest =
-        create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None, None)?;
+    let manifest = create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        64,
+        rype::Sketch::Minimizer { w: 50 },
+        12345,
+        None,
+        None,
+        None,
+    )?;
 
     // Verify manifest totals
     assert_eq!(
@@ -212,7 +247,16 @@ fn test_parquet_shared_minimizers_have_multiple_bucket_ids() -> Result<()> {
     let index_path = dir.path().join("test.ryxdi");
 
     let buckets = create_test_buckets();
-    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None, None)?;
+    create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        64,
+        rype::Sketch::Minimizer { w: 50 },
+        12345,
+        None,
+        None,
+        None,
+    )?;
 
     // Read all pairs from the shard
     let shard_path = index_path.join("inverted").join("shard.0.parquet");
@@ -267,7 +311,16 @@ fn test_parquet_manifest_shard_ranges() -> Result<()> {
     let index_path = dir.path().join("test.ryxdi");
 
     let buckets = create_test_buckets();
-    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None, None)?;
+    create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        64,
+        rype::Sketch::Minimizer { w: 50 },
+        12345,
+        None,
+        None,
+        None,
+    )?;
 
     // Load manifest and verify shard ranges
     let manifest = ParquetManifest::load(&index_path)?;
@@ -291,7 +344,16 @@ fn test_parquet_directory_structure() -> Result<()> {
     let index_path = dir.path().join("test.ryxdi");
 
     let buckets = create_test_buckets();
-    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None, None)?;
+    create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        64,
+        rype::Sketch::Minimizer { w: 50 },
+        12345,
+        None,
+        None,
+        None,
+    )?;
 
     // Verify directory structure
     assert!(index_path.is_dir(), "Index should be a directory");
@@ -324,7 +386,16 @@ fn test_is_parquet_index_detection() -> Result<()> {
     let index_path = dir.path().join("test.ryxdi");
 
     let buckets = create_test_buckets();
-    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None, None)?;
+    create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        64,
+        rype::Sketch::Minimizer { w: 50 },
+        12345,
+        None,
+        None,
+        None,
+    )?;
 
     // Should be detected as a Parquet index
     assert!(is_parquet_index(&index_path), "Should detect Parquet index");
@@ -359,8 +430,16 @@ fn test_parquet_empty_buckets_handled() -> Result<()> {
         },
     ];
 
-    let manifest =
-        create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None, None)?;
+    let manifest = create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        64,
+        rype::Sketch::Minimizer { w: 50 },
+        12345,
+        None,
+        None,
+        None,
+    )?;
 
     assert_eq!(manifest.total_minimizers, 0);
     let inverted = manifest.inverted.expect("Should have inverted manifest");
@@ -375,7 +454,16 @@ fn test_parquet_bucket_metadata_preserved() -> Result<()> {
     let index_path = dir.path().join("test.ryxdi");
 
     let buckets = create_test_buckets();
-    create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None, None)?;
+    create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        64,
+        rype::Sketch::Minimizer { w: 50 },
+        12345,
+        None,
+        None,
+        None,
+    )?;
 
     // Load manifest and verify bucket count
     let manifest = ParquetManifest::load(&index_path)?;
@@ -405,8 +493,16 @@ fn test_parquet_validation_rejects_unsorted_buckets() {
         minimizers: vec![300, 100, 200], // NOT sorted!
     }];
 
-    let result =
-        create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None, None);
+    let result = create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        64,
+        rype::Sketch::Minimizer { w: 50 },
+        12345,
+        None,
+        None,
+        None,
+    );
     assert!(result.is_err(), "Should reject unsorted bucket data");
     // The error chain includes context - check the full debug output
     let err = format!("{:?}", result.unwrap_err());
@@ -430,8 +526,16 @@ fn test_parquet_validation_rejects_duplicate_minimizers() {
         minimizers: vec![100, 200, 200, 300], // Duplicate 200!
     }];
 
-    let result =
-        create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None, None);
+    let result = create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        64,
+        rype::Sketch::Minimizer { w: 50 },
+        12345,
+        None,
+        None,
+        None,
+    );
     assert!(
         result.is_err(),
         "Should reject bucket with duplicate minimizers"
@@ -462,8 +566,16 @@ fn test_source_hash_validation() -> Result<()> {
     let expected_hash = compute_source_hash(&bucket_minimizer_counts);
 
     // Create index
-    let manifest =
-        create_parquet_inverted_index(&index_path, buckets, 64, 50, 12345, None, None, None)?;
+    let manifest = create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        64,
+        rype::Sketch::Minimizer { w: 50 },
+        12345,
+        None,
+        None,
+        None,
+    )?;
 
     // Verify the manifest's source_hash matches our expected value
     assert_eq!(
@@ -555,13 +667,22 @@ fn test_sampling_is_deterministic() -> Result<()> {
         &index_path1,
         buckets.clone(),
         64,
-        50,
+        rype::Sketch::Minimizer { w: 50 },
         12345,
         None,
         None,
         None,
     )?;
-    create_parquet_inverted_index(&index_path2, buckets, 64, 50, 12345, None, None, None)?;
+    create_parquet_inverted_index(
+        &index_path2,
+        buckets,
+        64,
+        rype::Sketch::Minimizer { w: 50 },
+        12345,
+        None,
+        None,
+        None,
+    )?;
 
     // Read pairs from both shards
     let shard_path1 = index_path1.join("inverted").join("shard.0.parquet");
@@ -616,7 +737,7 @@ fn test_parallel_shard_files_correctly_named() -> Result<()> {
         &index_path,
         buckets,
         64,
-        50,
+        rype::Sketch::Minimizer { w: 50 },
         12345,
         None,
         Some(&options),
@@ -703,7 +824,7 @@ fn test_parallel_output_globally_sorted() -> Result<()> {
         &index_path,
         buckets,
         64,
-        50,
+        rype::Sketch::Minimizer { w: 50 },
         12345,
         None,
         Some(&options),

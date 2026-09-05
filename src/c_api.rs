@@ -2928,7 +2928,7 @@ mod arrow_ffi {
             chunk_reader,
             mapping_reader,
             k,
-            w,
+            crate::Sketch::Minimizer { w },
             salt,
             orient != 0,
             max_memory,

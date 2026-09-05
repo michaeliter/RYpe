@@ -86,7 +86,7 @@ pub fn build_index_from_arrow(
     chunks: impl Iterator<Item = Result<RecordBatch, ArrowError>>,
     mapping: impl Iterator<Item = Result<RecordBatch, ArrowError>>,
     k: usize,
-    w: usize,
+    sketch: crate::Sketch,
     salt: u64,
     orient: bool,
     max_memory: Option<usize>,
@@ -103,7 +103,7 @@ pub fn build_index_from_arrow(
         chunks,
         mapping,
         k,
-        w,
+        sketch,
         salt,
         orient,
         available,
@@ -120,7 +120,7 @@ fn build_index_from_arrow_inner(
     chunks: impl Iterator<Item = Result<RecordBatch, ArrowError>>,
     mapping: impl Iterator<Item = Result<RecordBatch, ArrowError>>,
     k: usize,
-    w: usize,
+    sketch: crate::Sketch,
     salt: u64,
     orient: bool,
     available: usize,
@@ -193,7 +193,7 @@ fn build_index_from_arrow_inner(
                     &mut baselines,
                     orient,
                     k,
-                    w,
+                    sketch,
                     salt,
                     add_batch_entries,
                     &mut acc,
@@ -217,7 +217,7 @@ fn build_index_from_arrow_inner(
             &mut baselines,
             orient,
             k,
-            w,
+            sketch,
             salt,
             add_batch_entries,
             &mut acc,
@@ -301,7 +301,7 @@ fn build_index_from_arrow_inner(
         magic: FORMAT_MAGIC.to_string(),
         format_version: FORMAT_VERSION,
         k,
-        w,
+        w: sketch.w_or_zero(),
         salt,
         source_hash,
         num_buckets,
@@ -379,7 +379,7 @@ fn flush_feature_batch(
     baselines: &mut std::collections::HashMap<u32, Vec<u64>>,
     orient: bool,
     k: usize,
-    w: usize,
+    sketch: crate::Sketch,
     salt: u64,
     add_batch_entries: usize,
     acc: &mut crate::parquet_index::ShardAccumulator,
@@ -416,7 +416,7 @@ fn flush_feature_batch(
     let seed_mins: Vec<(i64, u32, usize, Vec<u64>)> = seeds
         .par_iter()
         .map_init(MinimizerWorkspace::new, |ws, (fid, bid, seq)| {
-            extract_into(seq, k, w, salt, ws);
+            extract_into(seq, k, sketch, salt, ws);
             ws.buffer.sort_unstable();
             ws.buffer.dedup();
             (*fid, *bid, seq.len(), ws.buffer.clone())
@@ -447,7 +447,7 @@ fn flush_feature_batch(
         .par_iter()
         .map_init(MinimizerWorkspace::new, |ws, (fid, bid, seq)| {
             if orient {
-                let (mut fwd, mut rc) = extract_dual_strand_into(seq, k, w, salt, ws);
+                let (mut fwd, mut rc) = extract_dual_strand_into(seq, k, sketch, salt, ws);
                 fwd.sort_unstable();
                 rc.sort_unstable();
                 let baseline = baselines_ref
@@ -461,7 +461,7 @@ fn flush_feature_batch(
                 chosen.dedup();
                 (*fid, *bid, seq.len(), chosen)
             } else {
-                extract_into(seq, k, w, salt, ws);
+                extract_into(seq, k, sketch, salt, ws);
                 ws.buffer.sort_unstable();
                 ws.buffer.dedup();
                 (*fid, *bid, seq.len(), ws.buffer.clone())
@@ -1187,7 +1187,7 @@ mod tests {
             chunks.into_iter().map(Ok),
             mapping.into_iter().map(Ok),
             k,
-            w,
+            crate::Sketch::Minimizer { w },
             salt,
             orient,
             Some(64 << 20),
@@ -1211,7 +1211,7 @@ mod tests {
             chunks.into_iter().map(Ok),
             mapping.into_iter().map(Ok),
             k,
-            w,
+            crate::Sketch::Minimizer { w },
             salt,
             false,
             Some(64 << 20),
@@ -1249,7 +1249,7 @@ mod tests {
             chunks.into_iter().map(Ok),
             mapping.into_iter().map(Ok),
             k,
-            w,
+            crate::Sketch::Minimizer { w },
             salt,
             false,
             Some(64 << 20),
@@ -1279,7 +1279,7 @@ mod tests {
             chunks.into_iter().map(Ok),
             mapping.into_iter().map(Ok),
             k,
-            w,
+            crate::Sketch::Minimizer { w },
             salt,
             false,
             Some(64 << 20),
@@ -1311,7 +1311,7 @@ mod tests {
             chunks.into_iter().map(Ok),
             mapping.into_iter().map(Ok),
             20, // invalid: must be 16, 32, or 64
-            5,
+            crate::Sketch::Minimizer { w: 5 },
             0,
             false,
             Some(64 << 20),
@@ -1443,7 +1443,7 @@ mod tests {
                 chunks.into_iter().map(Ok),
                 mapping.into_iter().map(Ok),
                 k,
-                w,
+                crate::Sketch::Minimizer { w },
                 salt,
                 true, // orient
                 64 << 20,
@@ -1513,7 +1513,7 @@ mod tests {
             chunks.into_iter().map(Ok),
             mapping.into_iter().map(Ok),
             k,
-            w,
+            crate::Sketch::Minimizer { w },
             salt,
             false,           // orient
             2 << 20,         // available

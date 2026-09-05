@@ -57,7 +57,7 @@ fn flush_sort_pool() -> &'static rayon::ThreadPool {
 /// * `output_dir` - Directory to create (e.g., "index.ryxdi")
 /// * `buckets` - Bucket data with sorted, deduplicated minimizers (VALIDATED)
 /// * `k` - K-mer size
-/// * `w` - Window size
+/// * `sketch` - Sketch scheme (minimizer window or open-syncmer `s`)
 /// * `salt` - Hash salt
 /// * `max_shard_bytes` - Optional max shard size in bytes (target, not exact limit)
 /// * `options` - Optional Parquet write options (compression, bloom filters, etc.)
@@ -72,7 +72,7 @@ pub fn create_parquet_inverted_index(
     output_dir: &Path,
     buckets: Vec<BucketData>,
     k: usize,
-    w: usize,
+    sketch: crate::Sketch,
     salt: u64,
     max_shard_bytes: Option<usize>,
     options: Option<&ParquetWriteOptions>,
@@ -134,7 +134,7 @@ pub fn create_parquet_inverted_index(
         magic: FORMAT_MAGIC.to_string(),
         format_version: FORMAT_VERSION,
         k,
-        w,
+        w: sketch.w_or_zero(),
         salt,
         source_hash,
         num_buckets: bucket_names.len() as u32,
@@ -1537,9 +1537,17 @@ mod tests {
             },
         ];
 
-        let _streaming_manifest =
-            create_parquet_inverted_index(&streaming_dir, buckets, k, w, salt, None, None, None)
-                .unwrap();
+        let _streaming_manifest = create_parquet_inverted_index(
+            &streaming_dir,
+            buckets,
+            k,
+            crate::Sketch::Minimizer { w },
+            salt,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         // Open the created index
         let streaming_sharded = ShardedInvertedIndex::open(&streaming_dir).unwrap();
@@ -1617,7 +1625,7 @@ mod tests {
             &index_dir,
             buckets.clone(),
             k,
-            w,
+            crate::Sketch::Minimizer { w },
             salt,
             None,
             Some(&options),
@@ -1669,7 +1677,7 @@ mod tests {
             &index_dir,
             buckets.clone(),
             k,
-            w,
+            crate::Sketch::Minimizer { w },
             salt,
             None,
             Some(&options),

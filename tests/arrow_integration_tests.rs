@@ -102,7 +102,7 @@ fn create_test_parquet_index() -> (tempfile::TempDir, ShardedInvertedIndex) {
         &index_path,
         buckets,
         16,
-        5,
+        rype::Sketch::Minimizer { w: 5 },
         0x12345,
         None,
         Some(&options),

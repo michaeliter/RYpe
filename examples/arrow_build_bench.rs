@@ -141,7 +141,7 @@ fn main() {
         chunks,
         mapping,
         k,
-        w,
+        rype::Sketch::Minimizer { w },
         salt,
         orient,
         max_memory,
