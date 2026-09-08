@@ -431,6 +431,238 @@ fn test_cli_syncmer_index_create_and_classify() -> Result<()> {
     Ok(())
 }
 
+/// Phase 5 exit criterion: `index from-config` with `smer` set in the TOML
+/// `[index]` section builds a working open-syncmer index (not just the `-S`
+/// CLI flag on `index create`).
+#[test]
+fn test_cli_from_config_syncmer() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let config_path = dir.path().join("config.toml");
+    let config_content = format!(
+        r#"
+[index]
+k = 32
+smer = 8
+salt = 0x5555555555555555
+output = "sync.ryxdi"
+
+[buckets.TestBucket]
+files = ["{}"]
+"#,
+        phix_path.to_str().unwrap()
+    );
+    fs::write(&config_path, config_content)?;
+
+    let output = Command::new(&binary)
+        .args(["index", "from-config", "-c", config_path.to_str().unwrap()])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "from-config with smer failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let index_path = dir.path().join("sync.ryxdi");
+    assert!(index_path.exists(), "Index directory should exist");
+
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        "@query1\nGAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )?;
+
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "-t",
+            "0.0",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Classification against from-config syncmer index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    Ok(())
+}
+
+/// Phase 5 exit criterion: merging two open-syncmer indices (built with the
+/// same k/s/salt) works, and the merged index classifies reads from both
+/// source genomes correctly.
+#[test]
+fn test_cli_merge_syncmer_indices() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let puc19_path = std::path::Path::new(manifest_dir).join("examples/pUC19.fasta");
+    if !phix_path.exists() || !puc19_path.exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let primary_path = dir.path().join("primary.ryxdi");
+    let secondary_path = dir.path().join("secondary.ryxdi");
+    let merged_path = dir.path().join("merged.ryxdi");
+
+    for (out_path, ref_path) in [(&primary_path, &phix_path), (&secondary_path, &puc19_path)] {
+        let output = Command::new(&binary)
+            .args([
+                "index",
+                "create",
+                "-o",
+                out_path.to_str().unwrap(),
+                "-r",
+                ref_path.to_str().unwrap(),
+                "-k",
+                "32",
+                "-S",
+                "8",
+            ])
+            .output()?;
+        assert!(
+            output.status.success(),
+            "Syncmer index creation for {:?} failed: {}",
+            ref_path,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "merge",
+            "--index-primary",
+            primary_path.to_str().unwrap(),
+            "--index-secondary",
+            secondary_path.to_str().unwrap(),
+            "-o",
+            merged_path.to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Merge of two syncmer indices failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // A genuine substring of each source genome, so both should score high
+    // against the merged index.
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        "@from_phix\nGAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n@from_puc19\nGTAAGCGGATGCCGGGAGCAGACAAGCCCGTCAGGGCGCGTCAGCGGGTGTTGGCGGGTGTCGGGGCTGG\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )?;
+
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            merged_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "-t",
+            "0.0",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Classification against merged syncmer index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "Expected a header + 2 data rows, got: {stdout}"
+    );
+    for line in &lines[1..] {
+        let score: f64 = line
+            .rsplit('\t')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap_or_else(|e| panic!("Could not parse score from '{line}': {e}"));
+        assert!(
+            score > 0.9,
+            "Expected a high hit rate against the merged syncmer index, got {score} for line '{line}'"
+        );
+    }
+
+    Ok(())
+}
+
+/// No-rebuild guarantee: minimizer manifests must not gain the new `scheme`/
+/// `s` keys, so a pre-existing `.ryxdi` (or a pre-syncmer `rype` build reading
+/// one written by today's code) stays byte-compatible.
+#[test]
+fn test_cli_minimizer_manifest_omits_scheme_keys() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let index_path = dir.path().join("min.ryxdi");
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let manifest_contents = fs::read_to_string(index_path.join("manifest.toml"))?;
+    assert!(
+        !manifest_contents.contains("scheme"),
+        "Minimizer manifest should omit the 'scheme' key for byte-compat, got:\n{manifest_contents}"
+    );
+    assert!(
+        !manifest_contents
+            .lines()
+            .any(|l| l.trim_start().starts_with("s ")),
+        "Minimizer manifest should omit the 's' key for byte-compat, got:\n{manifest_contents}"
+    );
+
+    Ok(())
+}
+
 /// Test index stats command
 #[test]
 fn test_cli_index_stats() -> Result<()> {

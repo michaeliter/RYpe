@@ -198,7 +198,8 @@ pub enum IndexCommands {
     #[command(after_help = "CONFIG FORMAT (from-config):
   [index]
   k = 64                           # K-mer size (16, 32, or 64)
-  window = 50                      # Minimizer window size
+  window = 50                      # Minimizer window size (mutually exclusive with smer)
+  # smer = 15                      # s-mer size: selects open-syncmer sketching instead
   salt = 0x5555555555555555        # Hash salt (hex)
   output = \"index.ryxdi\"           # Output path (directory will be created)
   orient_sequences = true          # Optional: orient sequences for better overlap
@@ -216,7 +217,7 @@ CLI OPTIONS OVERRIDE CONFIG FILE:
 SUBTRACTION MODE (--subtract-from):
   Removes minimizers present in an existing index from all buckets during build.
   Useful for host depletion: build a non-host index in one step.
-  The subtraction index must have matching k, w, and salt values.
+  The subtraction index must have matching k, sketch scheme/params, and salt.
 
   Example: rype index from-config -c config.toml --subtract-from host.ryxdi")]
     FromConfig {

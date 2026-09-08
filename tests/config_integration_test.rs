@@ -68,7 +68,7 @@ files = ["ref3.fa"]
     rype::config::validate_config(&cfg, dir.path())?;
 
     // Verify config parsed correctly
-    assert_eq!(cfg.index.window, 50);
+    assert_eq!(cfg.index.window, Some(50));
     assert_eq!(cfg.buckets.len(), 2);
     assert!(cfg.buckets.contains_key("BucketA"));
     assert!(cfg.buckets.contains_key("BucketB"));

@@ -1,4 +1,5 @@
 use crate::error::{Result, RypeError};
+use crate::Sketch;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
@@ -14,7 +15,13 @@ pub struct ConfigFile {
 pub struct IndexSettings {
     #[serde(default = "default_k")]
     pub k: usize,
-    pub window: usize,
+    /// Minimizer window size. Mutually exclusive with `smer`.
+    #[serde(default)]
+    pub window: Option<usize>,
+    /// s-mer size; presence selects open-syncmer sketching. Mutually
+    /// exclusive with `window`.
+    #[serde(default)]
+    pub smer: Option<usize>,
     pub salt: u64,
     pub output: PathBuf,
     /// Maximum shard size in bytes for main index sharding (optional)
@@ -31,6 +38,30 @@ pub struct IndexSettings {
 
 fn default_k() -> usize {
     64
+}
+
+impl IndexSettings {
+    /// Resolve `window`/`smer` into a `Sketch`, validating numeric bounds.
+    pub fn sketch(&self) -> Result<Sketch> {
+        let sketch = match (self.window, self.smer) {
+            (Some(_), Some(_)) => {
+                return Err(RypeError::validation(
+                    "Config error: 'window' and 'smer' are mutually exclusive (minimizer \
+                     density is 2/(w+1), open-syncmer density is 1/(k-s+1) -- pick one scheme)",
+                ));
+            }
+            (Some(w), None) => Sketch::Minimizer { w },
+            (None, Some(s)) => Sketch::OpenSyncmer { s },
+            (None, None) => {
+                return Err(RypeError::validation(
+                    "Config error: index.window is required (or index.smer for open-syncmer \
+                     sketching)",
+                ));
+            }
+        };
+        sketch.validate(self.k)?;
+        Ok(sketch)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,7 +264,7 @@ files = ["test.fa"]
         assert!(result.is_ok());
 
         let config = result.unwrap();
-        assert_eq!(config.index.window, 50);
+        assert_eq!(config.index.window, Some(50));
         assert_eq!(config.buckets.len(), 1);
         assert!(config.buckets.contains_key("TestBucket"));
     }

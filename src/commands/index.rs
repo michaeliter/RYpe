@@ -48,29 +48,32 @@ fn validate_unique_bucket_names<'a>(names: impl Iterator<Item = &'a str>) -> Res
 
 /// Validate that a subtraction index is compatible with the config being built.
 ///
-/// Checks that k, w, and salt match between the config and the subtraction index.
+/// Checks that k, sketch scheme/params, and salt match between the config and
+/// the subtraction index.
 fn validate_subtraction_compatibility(
-    cfg: &rype::config::ConfigFile,
+    k: usize,
+    sketch: rype::Sketch,
+    salt: u64,
     subtract_index: &rype::ShardedInvertedIndex,
 ) -> Result<()> {
-    if subtract_index.k() != cfg.index.k {
+    if subtract_index.k() != k {
         return Err(anyhow!(
             "k mismatch: config has k={}, subtraction index has k={}",
-            cfg.index.k,
+            k,
             subtract_index.k()
         ));
     }
-    if subtract_index.w() != cfg.index.window {
+    if subtract_index.sketch() != sketch {
         return Err(anyhow!(
-            "w mismatch: config has w={}, subtraction index has w={}",
-            cfg.index.window,
-            subtract_index.w()
+            "sketch mismatch: config has {}, subtraction index has {}",
+            sketch,
+            subtract_index.sketch()
         ));
     }
-    if subtract_index.salt() != cfg.index.salt {
+    if subtract_index.salt() != salt {
         return Err(anyhow!(
             "salt mismatch: config has salt={:#x}, subtraction index has salt={:#x}",
-            cfg.index.salt,
+            salt,
             subtract_index.salt()
         ));
     }
@@ -1627,6 +1630,7 @@ pub fn build_parquet_index_from_config(
     );
 
     let cfg = parse_config(config_path)?;
+    let sketch = cfg.index.sketch()?;
     let config_dir = config_path
         .parent()
         .ok_or_else(|| anyhow!("Invalid config path"))?;
@@ -1660,7 +1664,7 @@ pub fn build_parquet_index_from_config(
             )
         })?;
 
-        validate_subtraction_compatibility(&cfg, &subtract_index)?;
+        validate_subtraction_compatibility(cfg.index.k, sketch, cfg.index.salt, &subtract_index)?;
 
         let excl = load_all_minimizers(&subtract_index)?;
 
@@ -1695,10 +1699,10 @@ pub fn build_parquet_index_from_config(
     let output_path = resolve_path(config_dir, &output_path);
 
     log::info!(
-        "Creating Parquet inverted index at {:?} (K={}, W={}, salt={:#x})",
+        "Creating Parquet inverted index at {:?} (K={}, {}, salt={:#x})",
         output_path,
         cfg.index.k,
-        cfg.index.window,
+        sketch,
         cfg.index.salt
     );
 
@@ -1769,9 +1773,7 @@ pub fn build_parquet_index_from_config(
             files,
             config_dir,
             cfg.index.k,
-            rype::Sketch::Minimizer {
-                w: cfg.index.window,
-            },
+            sketch,
             cfg.index.salt,
             cli_max_memory,
             options,
@@ -1784,9 +1786,7 @@ pub fn build_parquet_index_from_config(
             files,
             config_dir,
             cfg.index.k,
-            rype::Sketch::Minimizer {
-                w: cfg.index.window,
-            },
+            sketch,
             cfg.index.salt,
             cli_max_memory,
             options,
@@ -1839,13 +1839,7 @@ pub fn build_parquet_index_from_config(
             has_overlapping_shards: false,
             shards: result.shard_infos,
         }),
-        ..ParquetManifest::new_with_sketch(
-            cfg.index.k,
-            rype::Sketch::Minimizer {
-                w: cfg.index.window,
-            },
-            cfg.index.salt,
-        )
+        ..ParquetManifest::new_with_sketch(cfg.index.k, sketch, cfg.index.salt)
     };
     manifest.save(&output_path)?;
 
@@ -1902,6 +1896,7 @@ pub fn build_parquet_index_from_config_streaming(
     );
 
     let cfg = parse_config(config_path)?;
+    let sketch = cfg.index.sketch()?;
     let config_dir = config_path
         .parent()
         .ok_or_else(|| anyhow!("Invalid config path"))?;
@@ -1943,10 +1938,10 @@ pub fn build_parquet_index_from_config_streaming(
     let output_path = resolve_path(config_dir, &output_path);
 
     log::info!(
-        "Creating Parquet inverted index (streaming) at {:?} (K={}, W={}, salt={:#x})",
+        "Creating Parquet inverted index (streaming) at {:?} (K={}, {}, salt={:#x})",
         output_path,
         cfg.index.k,
-        cfg.index.window,
+        sketch,
         cfg.index.salt
     );
 
@@ -2051,7 +2046,7 @@ pub fn build_parquet_index_from_config_streaming(
                         files,
                         config_dir,
                         cfg.index.k,
-                        rype::Sketch::Minimizer { w: cfg.index.window },
+                        sketch,
                         cfg.index.salt,
                         orient_sequences,
                     );
@@ -2205,13 +2200,7 @@ pub fn build_parquet_index_from_config_streaming(
             has_overlapping_shards: true,
             shards: shard_infos,
         }),
-        ..ParquetManifest::new_with_sketch(
-            cfg.index.k,
-            rype::Sketch::Minimizer {
-                w: cfg.index.window,
-            },
-            cfg.index.salt,
-        )
+        ..ParquetManifest::new_with_sketch(cfg.index.k, sketch, cfg.index.salt)
     };
 
     manifest.save(&output_path)?;
