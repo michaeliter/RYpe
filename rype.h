@@ -302,12 +302,39 @@ size_t rype_index_k(const RypeIndex* index);
  *
  * @param index  Non-NULL RypeIndex pointer
  * @return       Window size for minimizer selection, or 0 if index is NULL
+ *               or built with open-syncmer sketching (see rype_index_scheme)
  *
  * ## Thread Safety
  *
  * Thread-safe (read-only access).
  */
 size_t rype_index_w(const RypeIndex* index);
+
+/**
+ * Get the sketch scheme an index was built with
+ *
+ * @param index  Non-NULL RypeIndex pointer
+ * @return       0 = minimizer, 1 = open-syncmer, or 0 if index is NULL
+ *
+ * ## Thread Safety
+ *
+ * Thread-safe (read-only access).
+ */
+int rype_index_scheme(const RypeIndex* index);
+
+/**
+ * Get the s-mer size of an index
+ *
+ * @param index  Non-NULL RypeIndex pointer
+ * @return       s-mer size for open-syncmer selection, or 0 if index is
+ *               NULL or built with minimizer sketching (see
+ *               rype_index_scheme)
+ *
+ * ## Thread Safety
+ *
+ * Thread-safe (read-only access).
+ */
+size_t rype_index_s(const RypeIndex* index);
 
 /**
  * Get the salt value of an index

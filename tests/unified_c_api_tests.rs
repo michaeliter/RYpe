@@ -10,9 +10,10 @@ use rype::c_api::{
     rype_calculate_batch_config, rype_classify, rype_classify_best_hit, rype_classify_log_ratio,
     rype_classify_with_negative, rype_enable_timing, rype_estimate_pass_count, rype_get_last_error,
     rype_index_free, rype_index_is_sharded, rype_index_k, rype_index_load, rype_index_num_buckets,
-    rype_index_num_shards, rype_index_salt, rype_index_w, rype_log_ratio_results_free,
-    rype_negative_set_create, rype_negative_set_free, rype_negative_set_size,
-    rype_recommend_batch_size, rype_results_free, rype_validate_log_ratio_indices, RypeQuery,
+    rype_index_num_shards, rype_index_s, rype_index_salt, rype_index_scheme, rype_index_w,
+    rype_log_ratio_results_free, rype_negative_set_create, rype_negative_set_free,
+    rype_negative_set_size, rype_recommend_batch_size, rype_results_free,
+    rype_validate_log_ratio_indices, RypeQuery,
 };
 use rype::{
     extract_into, BucketData, IndexMetadata, InvertedIndex, MinimizerWorkspace, ParquetWriteOptions,
@@ -115,6 +116,16 @@ fn test_unified_load_parquet_index() -> Result<()> {
     // Verify accessors
     assert_eq!(rype_index_k(loaded), 32);
     assert_eq!(rype_index_w(loaded), 10);
+    assert_eq!(
+        rype_index_scheme(loaded),
+        0,
+        "minimizer index should report scheme 0"
+    );
+    assert_eq!(
+        rype_index_s(loaded),
+        0,
+        "s is meaningless for a minimizer index"
+    );
     assert_eq!(rype_index_salt(loaded), 0x12345);
     assert_eq!(rype_index_num_buckets(loaded), 2);
     assert_eq!(rype_index_is_sharded(loaded), 1); // Parquet is always "sharded"
@@ -422,6 +433,8 @@ fn test_unified_index_accessors_null_safety() {
     // All accessors should return 0 for NULL index
     assert_eq!(rype_index_k(ptr::null()), 0);
     assert_eq!(rype_index_w(ptr::null()), 0);
+    assert_eq!(rype_index_scheme(ptr::null()), 0);
+    assert_eq!(rype_index_s(ptr::null()), 0);
     assert_eq!(rype_index_salt(ptr::null()), 0);
     assert_eq!(rype_index_num_buckets(ptr::null()), 0);
     assert_eq!(rype_index_is_sharded(ptr::null()), 0);
@@ -429,6 +442,85 @@ fn test_unified_index_accessors_null_safety() {
 
     // bucket_name should return NULL for NULL index
     assert!(rype_bucket_name(ptr::null(), 1).is_null());
+}
+
+#[test]
+fn test_unified_load_syncmer_index() -> Result<()> {
+    let dir = tempdir()?;
+    let index_path = dir.path().join("sync.ryxdi");
+
+    // `generate_sequence`'s ACGT-repeat is perfectly periodic with period 4,
+    // which (with s=8, a multiple of 4) makes every s-mer within a k-mer's
+    // window bit-identical -- no syncmer ever lands at the target offset, so
+    // nothing gets selected. Use a non-periodic sequence instead.
+    fn pseudo_random_seq(len: usize, seed: u64) -> Vec<u8> {
+        let bases = [b'A', b'C', b'G', b'T'];
+        let mut x = seed ^ 0x9E37_79B9_7F4A_7C15;
+        (0..len)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(0x2545_F491_4F6C_DD1D)
+                    .wrapping_add(0x9E37_79B9_7F4A_7C15);
+                bases[((x >> 33) & 3) as usize]
+            })
+            .collect()
+    }
+
+    let k = 32;
+    let s = 8;
+    let salt = 0x12345u64;
+    let seq = pseudo_random_seq(200, 0);
+
+    let mut ws = MinimizerWorkspace::new();
+    extract_into(&seq, k, rype::Sketch::OpenSyncmer { s }, salt, &mut ws);
+    let mut mins: Vec<u64> = ws.buffer.drain(..).collect();
+    mins.sort();
+    mins.dedup();
+    assert!(!mins.is_empty(), "test fixture should select some syncmers");
+
+    let buckets = vec![BucketData {
+        bucket_id: 0,
+        bucket_name: "bucket1".to_string(),
+        sources: vec!["test::sync".to_string()],
+        minimizers: mins,
+    }];
+    rype::create_parquet_inverted_index(
+        &index_path,
+        buckets,
+        k,
+        rype::Sketch::OpenSyncmer { s },
+        salt,
+        None,
+        Some(&ParquetWriteOptions::default()),
+        None,
+    )?;
+
+    let path_cstr = CString::new(index_path.to_str().unwrap())?;
+    let loaded = rype_index_load(path_cstr.as_ptr());
+    if loaded.is_null() {
+        let err = unsafe {
+            std::ffi::CStr::from_ptr(rype_get_last_error())
+                .to_string_lossy()
+                .into_owned()
+        };
+        panic!("Should load syncmer index, error: {err}");
+    }
+
+    assert_eq!(rype_index_k(loaded), 32);
+    assert_eq!(
+        rype_index_w(loaded),
+        0,
+        "w is meaningless for a syncmer index"
+    );
+    assert_eq!(
+        rype_index_scheme(loaded),
+        1,
+        "syncmer index should report scheme 1"
+    );
+    assert_eq!(rype_index_s(loaded), 8);
+
+    rype_index_free(loaded);
+    Ok(())
 }
 
 #[test]

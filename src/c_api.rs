@@ -351,6 +351,33 @@ pub extern "C" fn rype_index_w(index_ptr: *const RypeIndex) -> size_t {
     index.w()
 }
 
+/// Sketch scheme this index was built with: 0 = minimizer, 1 = open-syncmer.
+/// Returns 0 (minimizer) if index is NULL or misaligned.
+#[no_mangle]
+pub extern "C" fn rype_index_scheme(index_ptr: *const RypeIndex) -> c_int {
+    if !is_nonnull_aligned(index_ptr) {
+        return 0;
+    }
+    let index = unsafe { &*index_ptr };
+    match index.sketch() {
+        crate::Sketch::Minimizer { .. } => 0,
+        crate::Sketch::OpenSyncmer { .. } => 1,
+    }
+}
+
+/// Returns the s-mer size for an open-syncmer index, or 0 for a minimizer
+/// index -- consistent with `rype_index_w`'s "0 if NULL" convention, `w` is
+/// meaningless (and 0) for open-syncmer indices, so this mirrors that: `s`
+/// is meaningless (and 0) for minimizer indices.
+#[no_mangle]
+pub extern "C" fn rype_index_s(index_ptr: *const RypeIndex) -> size_t {
+    if !is_nonnull_aligned(index_ptr) {
+        return 0;
+    }
+    let index = unsafe { &*index_ptr };
+    index.sketch().s().unwrap_or(0)
+}
+
 /// Returns the salt of the index, or 0 if index is NULL or misaligned.
 #[no_mangle]
 pub extern "C" fn rype_index_salt(index_ptr: *const RypeIndex) -> u64 {
@@ -1479,6 +1506,15 @@ fn validate_extraction_params(
     if seq_len == 0 {
         return Err("seq_len is zero".to_string());
     }
+    validate_k_and_w(k, w)
+}
+
+/// Shared `k`/`w` validation for every FFI extraction entry point (raw
+/// sequence and Arrow-batch alike). These entry points are minimizer-only
+/// (see the module doc on syncmer support being classify-only for now), so
+/// `w` here always means `Sketch::Minimizer { w }`, never a syncmer's
+/// meaningless-`w` sentinel -- it must be nonzero.
+fn validate_k_and_w(k: size_t, w: size_t) -> Result<(), String> {
     if !matches!(k, 16 | 32 | 64) {
         return Err(format!("Invalid k: {} (must be 16, 32, or 64)", k));
     }
@@ -3128,12 +3164,8 @@ mod arrow_ffi {
             set_last_error("out_stream is NULL".to_string());
             return -1;
         }
-        if !matches!(k, 16 | 32 | 64) {
-            set_last_error(format!("Invalid k: {} (must be 16, 32, or 64)", k));
-            return -1;
-        }
-        if w == 0 {
-            set_last_error("w is zero".to_string());
+        if let Err(e) = validate_k_and_w(k, w) {
+            set_last_error(e);
             return -1;
         }
 
@@ -3196,12 +3228,8 @@ mod arrow_ffi {
             set_last_error("out_stream is NULL".to_string());
             return -1;
         }
-        if !matches!(k, 16 | 32 | 64) {
-            set_last_error(format!("Invalid k: {} (must be 16, 32, or 64)", k));
-            return -1;
-        }
-        if w == 0 {
-            set_last_error("w is zero".to_string());
+        if let Err(e) = validate_k_and_w(k, w) {
+            set_last_error(e);
             return -1;
         }
 
