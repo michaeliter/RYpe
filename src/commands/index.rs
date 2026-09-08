@@ -1746,7 +1746,7 @@ pub fn build_parquet_index_from_config(
     // This bounds BOTH input AND output memory via ShardAccumulator
     use rype::parquet_index::{
         compute_source_hash, create_index_directory, write_buckets_parquet, InvertedManifest,
-        ParquetManifest, ParquetShardFormat, FORMAT_MAGIC, FORMAT_VERSION,
+        ParquetManifest, ParquetShardFormat,
     };
     use std::collections::HashMap;
 
@@ -1827,11 +1827,6 @@ pub fn build_parquet_index_from_config(
     // Write manifest
     let total_entries: u64 = result.shard_infos.iter().map(|s| s.num_entries).sum();
     let manifest = ParquetManifest {
-        magic: FORMAT_MAGIC.to_string(),
-        format_version: FORMAT_VERSION,
-        k: cfg.index.k,
-        w: cfg.index.window,
-        salt: cfg.index.salt,
         source_hash,
         num_buckets: 1,
         total_minimizers: result.total_minimizers,
@@ -1844,6 +1839,13 @@ pub fn build_parquet_index_from_config(
             has_overlapping_shards: false,
             shards: result.shard_infos,
         }),
+        ..ParquetManifest::new_with_sketch(
+            cfg.index.k,
+            rype::Sketch::Minimizer {
+                w: cfg.index.window,
+            },
+            cfg.index.salt,
+        )
     };
     manifest.save(&output_path)?;
 
@@ -1889,7 +1891,7 @@ pub fn build_parquet_index_from_config_streaming(
 ) -> Result<()> {
     use rype::parquet_index::{
         compute_source_hash, create_index_directory, write_buckets_parquet, InvertedManifest,
-        ParquetManifest, ParquetShardFormat, ShardAccumulator, FORMAT_MAGIC, FORMAT_VERSION,
+        ParquetManifest, ParquetShardFormat, ShardAccumulator,
     };
 
     let t_total = Instant::now();
@@ -2193,11 +2195,6 @@ pub fn build_parquet_index_from_config_streaming(
 
     // Build manifest
     let manifest = ParquetManifest {
-        magic: FORMAT_MAGIC.to_string(),
-        format_version: FORMAT_VERSION,
-        k: cfg.index.k,
-        w: cfg.index.window,
-        salt: cfg.index.salt,
         source_hash,
         num_buckets: bucket_names_map.len() as u32,
         total_minimizers,
@@ -2208,6 +2205,13 @@ pub fn build_parquet_index_from_config_streaming(
             has_overlapping_shards: true,
             shards: shard_infos,
         }),
+        ..ParquetManifest::new_with_sketch(
+            cfg.index.k,
+            rype::Sketch::Minimizer {
+                w: cfg.index.window,
+            },
+            cfg.index.salt,
+        )
     };
 
     manifest.save(&output_path)?;
@@ -4760,7 +4764,7 @@ files = ["short.fa", "long.fa"]
     ) -> Result<()> {
         use rype::parquet_index::{
             compute_source_hash, write_buckets_parquet, InvertedManifest, ParquetManifest,
-            ParquetShardFormat, FORMAT_MAGIC, FORMAT_VERSION,
+            ParquetShardFormat,
         };
         use std::collections::HashMap;
 
@@ -4781,11 +4785,6 @@ files = ["short.fa", "long.fa"]
         // Write manifest
         let total_entries: u64 = result.shard_infos.iter().map(|s| s.num_entries).sum();
         let manifest = ParquetManifest {
-            magic: FORMAT_MAGIC.to_string(),
-            format_version: FORMAT_VERSION,
-            k,
-            w,
-            salt,
             source_hash,
             num_buckets: 1,
             total_minimizers: result.total_minimizers,
@@ -4797,6 +4796,7 @@ files = ["short.fa", "long.fa"]
                 has_overlapping_shards: false,
                 shards: result.shard_infos.clone(),
             }),
+            ..ParquetManifest::new_with_sketch(k, rype::Sketch::Minimizer { w }, salt)
         };
         manifest.save(output_dir)?;
 

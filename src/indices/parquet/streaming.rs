@@ -18,12 +18,12 @@ use std::sync::{Arc, OnceLock};
 use crate::constants::{MIN_ENTRIES_PER_PARALLEL_PARTITION, PARQUET_BATCH_SIZE};
 
 use super::buckets::write_buckets_parquet;
+use super::files;
 use super::manifest::{
     create_index_directory, BucketData, InvertedManifest, InvertedShardInfo, ParquetManifest,
     ParquetShardFormat,
 };
 use super::options::ParquetWriteOptions;
-use super::{files, FORMAT_MAGIC, FORMAT_VERSION};
 
 /// K-way merge heap entry: (Reverse((minimizer, bucket_id)), bucket_index, position)
 type MergeHeapEntry = (Reverse<(u64, u32)>, usize, usize);
@@ -131,11 +131,6 @@ pub fn create_parquet_inverted_index(
 
     // Build manifest with explicit format field
     let manifest = ParquetManifest {
-        magic: FORMAT_MAGIC.to_string(),
-        format_version: FORMAT_VERSION,
-        k,
-        w: sketch.w_or_zero(),
-        salt,
         source_hash,
         num_buckets: bucket_names.len() as u32,
         total_minimizers,
@@ -146,6 +141,7 @@ pub fn create_parquet_inverted_index(
             has_overlapping_shards,
             shards: shard_infos,
         }),
+        ..ParquetManifest::new_with_sketch(k, sketch, salt)
     };
 
     manifest.save(output_dir)?;

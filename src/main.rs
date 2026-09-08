@@ -34,6 +34,7 @@ fn main() -> Result<()> {
                 reference,
                 kmer_size,
                 window,
+                smer_size,
                 salt,
                 separate_buckets,
                 max_shard_size,
@@ -52,6 +53,15 @@ fn main() -> Result<()> {
                     return Err(anyhow!("K must be 16, 32, or 64 (got {})", kmer_size));
                 }
 
+                const DEFAULT_WINDOW: usize = 50;
+                let sketch = match smer_size {
+                    Some(s) => rype::Sketch::OpenSyncmer { s },
+                    None => rype::Sketch::Minimizer {
+                        w: window.unwrap_or(DEFAULT_WINDOW),
+                    },
+                };
+                sketch.validate(kmer_size)?;
+
                 // Create Parquet inverted index directly
                 let parquet_options = parquet_index::ParquetWriteOptions {
                     row_group_size,
@@ -69,7 +79,7 @@ fn main() -> Result<()> {
                     &output,
                     &reference,
                     kmer_size,
-                    rype::Sketch::Minimizer { w: window },
+                    sketch,
                     salt,
                     separate_buckets,
                     max_shard_size,
@@ -91,8 +101,19 @@ fn main() -> Result<()> {
                 let manifest = sharded.manifest();
 
                 println!("Index Stats for {:?}", index);
+                println!(
+                    "  Scheme: {}",
+                    match manifest.sketch {
+                        rype::Sketch::Minimizer { .. } => "minimizer",
+                        rype::Sketch::OpenSyncmer { .. } => "open-syncmer",
+                    }
+                );
                 println!("  K: {}", manifest.k);
-                println!("  Window (w): {}", manifest.w);
+                match manifest.sketch {
+                    rype::Sketch::Minimizer { w } => println!("  Window (w): {}", w),
+                    rype::Sketch::OpenSyncmer { s } => println!("  s-mer size (s): {}", s),
+                }
+                println!("  Format version: {}", manifest.format_version);
                 println!("  Salt: 0x{:x}", manifest.salt);
                 println!("  Buckets: {}", manifest.bucket_names.len());
                 println!("  Shards: {}", manifest.shards.len());

@@ -21,9 +21,26 @@ pub mod merge;
 mod options;
 mod streaming;
 
-/// Format version for the Parquet-based index.
-/// Increment when making breaking changes to the format.
-pub const FORMAT_VERSION: u32 = 1;
+/// Maximum format version this build can read.
+pub const FORMAT_VERSION_MAX: u32 = 2;
+
+/// Format version written for `Sketch::Minimizer` indices. Readable by every
+/// build ever shipped -- must never change.
+pub const FORMAT_VERSION_MINIMIZER: u32 = 1;
+
+/// Format version written for `Sketch::OpenSyncmer` indices. Rejected by
+/// builds that predate syncmer support (their `FORMAT_VERSION_MAX` is 1).
+pub const FORMAT_VERSION_OPEN_SYNCMER: u32 = 2;
+
+/// The format version to write for a given sketch scheme. The single owner
+/// of the scheme -> format_version mapping, so a minimizer index's
+/// `format_version` never changes just because `FORMAT_VERSION_MAX` grows.
+pub const fn format_version_for(sk: crate::Sketch) -> u32 {
+    match sk {
+        crate::Sketch::Minimizer { .. } => FORMAT_VERSION_MINIMIZER,
+        crate::Sketch::OpenSyncmer { .. } => FORMAT_VERSION_OPEN_SYNCMER,
+    }
+}
 
 /// Magic bytes to identify Parquet-based index directories.
 /// Written to manifest.toml for format detection.

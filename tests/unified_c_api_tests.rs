@@ -516,6 +516,7 @@ fn test_inverted_index_build_from_bucket_map() {
     let metadata = IndexMetadata {
         k: 32,
         w: 10,
+        sketch: rype::Sketch::Minimizer { w: 10 },
         salt: 0x12345,
         bucket_names,
         bucket_sources: HashMap::new(),

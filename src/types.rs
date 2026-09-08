@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use crate::Sketch;
+
 /// ID (i64), Sequence Reference, Optional Pair Sequence Reference
 pub type QueryRecord<'a> = (i64, &'a [u8], Option<&'a [u8]>);
 
@@ -10,6 +12,8 @@ pub type QueryRecord<'a> = (i64, &'a [u8], Option<&'a [u8]>);
 pub struct IndexMetadata {
     pub k: usize,
     pub w: usize,
+    /// Sketch scheme this index was built with.
+    pub sketch: Sketch,
     pub salt: u64,
     pub bucket_names: HashMap<u32, String>,
     pub bucket_sources: HashMap<u32, Vec<String>>,

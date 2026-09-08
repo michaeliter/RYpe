@@ -370,6 +370,7 @@ impl InvertedIndex {
 mod tests {
     use super::*;
     use crate::types::IndexMetadata;
+    use crate::Sketch;
     use anyhow::Result;
     use std::collections::HashMap;
     use tempfile::TempDir;
@@ -394,6 +395,7 @@ mod tests {
         let metadata = IndexMetadata {
             k,
             w,
+            sketch: Sketch::Minimizer { w },
             salt,
             bucket_names,
             bucket_sources: HashMap::new(),

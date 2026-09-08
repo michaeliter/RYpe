@@ -7,6 +7,7 @@
 
 use crate::constants::DENSE_ACCUMULATOR_MAX_BUCKETS;
 use crate::error::{Result, RypeError};
+use crate::Sketch;
 
 /// Parse a byte size string with optional suffix.
 ///
@@ -362,21 +363,15 @@ impl ReadMemoryProfile {
     /// * `avg_read_length` - Average length of individual reads
     /// * `is_paired` - Whether reads are paired-end
     /// * `k` - K-mer size (for estimating minimizers)
-    /// * `w` - Window size (for estimating minimizers)
-    pub fn new(avg_read_length: usize, is_paired: bool, k: usize, w: usize) -> Self {
+    /// * `sketch` - Sketch scheme (for estimating minimizers)
+    pub fn new(avg_read_length: usize, is_paired: bool, k: usize, sketch: Sketch) -> Self {
         let avg_query_length = if is_paired {
             avg_read_length * 2
         } else {
             avg_read_length
         };
 
-        // Estimate minimizers: roughly (length - k + 1) / w for each strand
-        // Multiply by 2 for both strands, but many are duplicates
-        let minimizers_per_query = if avg_query_length > k {
-            ((avg_query_length - k + 1) / w).max(1) * 2
-        } else {
-            0
-        };
+        let minimizers_per_query = sketch.estimate_selected(avg_query_length, k).max(1);
 
         ReadMemoryProfile {
             avg_read_length,
@@ -387,8 +382,8 @@ impl ReadMemoryProfile {
     }
 
     /// Create a default profile for when sampling isn't possible.
-    pub fn default_profile(is_paired: bool, k: usize, w: usize) -> Self {
-        Self::new(5000, is_paired, k, w)
+    pub fn default_profile(is_paired: bool, k: usize, sketch: Sketch) -> Self {
+        Self::new(5000, is_paired, k, sketch)
     }
 
     /// Sample read lengths from input files to create an accurate profile.
@@ -402,7 +397,7 @@ impl ReadMemoryProfile {
     /// * `r2_path` - Optional path to R2 FASTQ/FASTA file (for paired-end, ignored for Parquet)
     /// * `sample_size` - Number of records to sample from each file
     /// * `k` - K-mer size
-    /// * `w` - Window size
+    /// * `sketch` - Sketch scheme
     /// * `is_parquet` - Whether the input is Parquet format (uses sequence1/sequence2 columns)
     /// * `trim_to` - Optional maximum read length (for `--trim-to` option)
     ///
@@ -414,7 +409,7 @@ impl ReadMemoryProfile {
         r2_path: Option<&std::path::Path>,
         sample_size: usize,
         k: usize,
-        w: usize,
+        sketch: Sketch,
         is_parquet: bool,
         trim_to: Option<usize>,
     ) -> Option<Self> {
@@ -437,11 +432,7 @@ impl ReadMemoryProfile {
                 apply_trim_to_limit(avg_read_length, avg_query_length, is_paired, trim_to);
 
             // Estimate minimizers
-            let minimizers_per_query = if avg_query_length > k {
-                ((avg_query_length - k + 1) / w).max(1) * 2
-            } else {
-                0
-            };
+            let minimizers_per_query = sketch.estimate_selected(avg_query_length, k).max(1);
 
             return Some(ReadMemoryProfile {
                 avg_read_length,
@@ -476,11 +467,7 @@ impl ReadMemoryProfile {
             let (avg_read_length, avg_query_length) =
                 apply_trim_to_limit(avg_read_length, avg_query_length, is_paired, trim_to);
 
-            let minimizers_per_query = if avg_query_length > k {
-                ((avg_query_length - k + 1) / w).max(1) * 2
-            } else {
-                0
-            };
+            let minimizers_per_query = sketch.estimate_selected(avg_query_length, k).max(1);
 
             Some(ReadMemoryProfile {
                 avg_read_length,
@@ -493,7 +480,7 @@ impl ReadMemoryProfile {
         // Without the "fastx" feature, FASTX sampling is not available
         #[cfg(not(feature = "fastx"))]
         {
-            let _ = (r1_path, r2_path, sample_size, k, w, trim_to);
+            let _ = (r1_path, r2_path, sample_size, k, sketch, trim_to);
             None
         }
     }
@@ -1630,7 +1617,7 @@ mod tests {
     /// memory budget ends up OOMing.
     #[test]
     fn test_estimate_batch_memory_accounts_for_dense_accumulator() {
-        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+        let profile = ReadMemoryProfile::new(150, false, 64, Sketch::Minimizer { w: 50 });
         let batch = 100_000;
 
         let few = estimate_batch_memory(batch, &profile, 4, false).unwrap();
@@ -1676,7 +1663,7 @@ mod tests {
 
     #[test]
     fn test_estimate_batch_memory_scales_linearly() {
-        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+        let profile = ReadMemoryProfile::new(150, false, 64, Sketch::Minimizer { w: 50 });
 
         let mem_1k = estimate_batch_memory(1000, &profile, 100, false).unwrap();
         let mem_2k = estimate_batch_memory(2000, &profile, 100, false).unwrap();
@@ -1692,8 +1679,8 @@ mod tests {
 
     #[test]
     fn test_estimate_batch_memory_increases_with_read_length() {
-        let profile_short = ReadMemoryProfile::new(150, false, 64, 50);
-        let profile_long = ReadMemoryProfile::new(10000, false, 64, 50);
+        let profile_short = ReadMemoryProfile::new(150, false, 64, Sketch::Minimizer { w: 50 });
+        let profile_long = ReadMemoryProfile::new(10000, false, 64, Sketch::Minimizer { w: 50 });
 
         let mem_short = estimate_batch_memory(10000, &profile_short, 100, false).unwrap();
         let mem_long = estimate_batch_memory(10000, &profile_long, 100, false).unwrap();
@@ -1703,7 +1690,7 @@ mod tests {
 
     #[test]
     fn test_estimate_batch_memory_overflow_protection() {
-        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+        let profile = ReadMemoryProfile::new(150, false, 64, Sketch::Minimizer { w: 50 });
 
         // Very large batch size that would overflow
         let result = estimate_batch_memory(usize::MAX, &profile, 100, false);
@@ -1724,7 +1711,7 @@ mod tests {
 
     #[test]
     fn test_estimate_batch_memory_with_log_ratio_larger() {
-        let profile = ReadMemoryProfile::new(1000, false, 64, 50);
+        let profile = ReadMemoryProfile::new(1000, false, 64, Sketch::Minimizer { w: 50 });
 
         let mem_normal = estimate_batch_memory(10000, &profile, 100, false).unwrap();
         let mem_log_ratio = estimate_batch_memory(10000, &profile, 100, true).unwrap();
@@ -1739,7 +1726,7 @@ mod tests {
 
     #[test]
     fn test_estimate_batch_memory_log_ratio_scales() {
-        let profile = ReadMemoryProfile::new(1000, false, 64, 50);
+        let profile = ReadMemoryProfile::new(1000, false, 64, Sketch::Minimizer { w: 50 });
 
         let mem_10k = estimate_batch_memory(10000, &profile, 100, true).unwrap();
         let mem_20k = estimate_batch_memory(20000, &profile, 100, true).unwrap();
@@ -1756,7 +1743,7 @@ mod tests {
 
     #[test]
     fn test_calculate_batch_config_shrinks_for_log_ratio() {
-        let profile = ReadMemoryProfile::new(1000, false, 64, 50);
+        let profile = ReadMemoryProfile::new(1000, false, 64, Sketch::Minimizer { w: 50 });
 
         let config_normal = MemoryConfig {
             max_memory: 4 * 1024 * 1024 * 1024, // 4GB
@@ -1790,7 +1777,7 @@ mod tests {
         // The deferred buffer must budget for batch_size reads (not batch_size/2),
         // because flush only triggers at batch boundaries and a single batch can
         // defer 100% of its reads when the skip threshold is high.
-        let profile = ReadMemoryProfile::new(1000, false, 64, 50);
+        let profile = ReadMemoryProfile::new(1000, false, 64, Sketch::Minimizer { w: 50 });
         let batch_size: usize = 10_000;
         let num_buckets: usize = 100;
 
@@ -1816,7 +1803,7 @@ mod tests {
 
     #[test]
     fn test_calculate_batch_config_respects_limit() {
-        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+        let profile = ReadMemoryProfile::new(150, false, 64, Sketch::Minimizer { w: 50 });
         let config = MemoryConfig {
             max_memory: 1024 * 1024 * 1024, // 1GB
             num_threads: 4,
@@ -1841,7 +1828,7 @@ mod tests {
 
     #[test]
     fn test_calculate_batch_config_accounts_for_index() {
-        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+        let profile = ReadMemoryProfile::new(150, false, 64, Sketch::Minimizer { w: 50 });
 
         // Same total memory, different index sizes
         let config_small_index = MemoryConfig {
@@ -1880,7 +1867,7 @@ mod tests {
 
     #[test]
     fn test_calculate_batch_config_minimum_values() {
-        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+        let profile = ReadMemoryProfile::new(150, false, 64, Sketch::Minimizer { w: 50 });
 
         // Very constrained memory
         let config = MemoryConfig {
@@ -1903,7 +1890,7 @@ mod tests {
 
     #[test]
     fn test_calculate_batch_config_uses_threads() {
-        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+        let profile = ReadMemoryProfile::new(150, false, 64, Sketch::Minimizer { w: 50 });
 
         // Plenty of memory
         let config = MemoryConfig {
@@ -1927,8 +1914,8 @@ mod tests {
 
     #[test]
     fn test_read_memory_profile_paired() {
-        let profile_single = ReadMemoryProfile::new(150, false, 64, 50);
-        let profile_paired = ReadMemoryProfile::new(150, true, 64, 50);
+        let profile_single = ReadMemoryProfile::new(150, false, 64, Sketch::Minimizer { w: 50 });
+        let profile_paired = ReadMemoryProfile::new(150, true, 64, Sketch::Minimizer { w: 50 });
 
         assert_eq!(profile_single.avg_query_length, 150);
         assert_eq!(profile_paired.avg_query_length, 300);
@@ -1936,7 +1923,7 @@ mod tests {
 
     #[test]
     fn test_read_memory_profile_minimizers() {
-        let profile = ReadMemoryProfile::new(1000, false, 64, 50);
+        let profile = ReadMemoryProfile::new(1000, false, 64, Sketch::Minimizer { w: 50 });
 
         // Should estimate some minimizers for a 1000bp read
         assert!(profile.minimizers_per_query > 0);
@@ -1975,11 +1962,11 @@ mod tests {
         let profile = ReadMemoryProfile::from_files(
             file.path(),
             None,
-            10,    // sample size
-            64,    // k
-            50,    // w
-            false, // is_parquet
-            None,  // trim_to
+            10,                          // sample size
+            64,                          // k
+            Sketch::Minimizer { w: 50 }, // w
+            false,                       // is_parquet
+            None,                        // trim_to
         );
 
         assert!(profile.is_some());
@@ -2014,8 +2001,15 @@ mod tests {
         }
         r2.flush().unwrap();
 
-        let profile =
-            ReadMemoryProfile::from_files(r1.path(), Some(r2.path()), 10, 64, 50, false, None);
+        let profile = ReadMemoryProfile::from_files(
+            r1.path(),
+            Some(r2.path()),
+            10,
+            64,
+            Sketch::Minimizer { w: 50 },
+            false,
+            None,
+        );
 
         assert!(profile.is_some());
         let profile = profile.unwrap();
@@ -2033,7 +2027,7 @@ mod tests {
             None,
             10,
             64,
-            50,
+            Sketch::Minimizer { w: 50 },
             false,
             None,
         );
@@ -2081,11 +2075,11 @@ mod tests {
         let profile = ReadMemoryProfile::from_files(
             file.path(),
             None,
-            10,   // sample size
-            64,   // k
-            50,   // w
-            true, // is_parquet
-            None, // trim_to
+            10,                          // sample size
+            64,                          // k
+            Sketch::Minimizer { w: 50 }, // w
+            true,                        // is_parquet
+            None,                        // trim_to
         );
 
         assert!(profile.is_some());
@@ -2139,11 +2133,11 @@ mod tests {
         let profile = ReadMemoryProfile::from_files(
             file.path(),
             None,
-            10,   // sample size
-            64,   // k
-            50,   // w
-            true, // is_parquet
-            None, // trim_to
+            10,                          // sample size
+            64,                          // k
+            Sketch::Minimizer { w: 50 }, // w
+            true,                        // is_parquet
+            None,                        // trim_to
         );
 
         assert!(profile.is_some());
@@ -2163,7 +2157,7 @@ mod tests {
             None,
             10,
             64,
-            50,
+            Sketch::Minimizer { w: 50 },
             true, // is_parquet
             None, // trim_to
         );
@@ -2207,11 +2201,11 @@ mod tests {
         let profile = ReadMemoryProfile::from_files(
             file.path(),
             None,
-            10,   // sample size
-            64,   // k
-            50,   // w
-            true, // is_parquet
-            None, // trim_to
+            10,                          // sample size
+            64,                          // k
+            Sketch::Minimizer { w: 50 }, // w
+            true,                        // is_parquet
+            None,                        // trim_to
         );
 
         assert!(profile.is_some());
@@ -2280,14 +2274,30 @@ mod tests {
         file.flush().unwrap();
 
         // Without trim_to
-        let profile =
-            ReadMemoryProfile::from_files(file.path(), None, 10, 64, 50, false, None).unwrap();
+        let profile = ReadMemoryProfile::from_files(
+            file.path(),
+            None,
+            10,
+            64,
+            Sketch::Minimizer { w: 50 },
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(profile.avg_read_length, 1000);
         assert_eq!(profile.avg_query_length, 1000);
 
         // With trim_to=100
-        let profile =
-            ReadMemoryProfile::from_files(file.path(), None, 10, 64, 50, false, Some(100)).unwrap();
+        let profile = ReadMemoryProfile::from_files(
+            file.path(),
+            None,
+            10,
+            64,
+            Sketch::Minimizer { w: 50 },
+            false,
+            Some(100),
+        )
+        .unwrap();
         assert_eq!(profile.avg_read_length, 100);
         assert_eq!(profile.avg_query_length, 100);
     }
@@ -2328,14 +2338,30 @@ mod tests {
         writer.close().unwrap();
 
         // Without trim_to
-        let profile =
-            ReadMemoryProfile::from_files(file.path(), None, 10, 64, 50, true, None).unwrap();
+        let profile = ReadMemoryProfile::from_files(
+            file.path(),
+            None,
+            10,
+            64,
+            Sketch::Minimizer { w: 50 },
+            true,
+            None,
+        )
+        .unwrap();
         assert_eq!(profile.avg_read_length, 1000);
         assert_eq!(profile.avg_query_length, 1000);
 
         // With trim_to=100
-        let profile =
-            ReadMemoryProfile::from_files(file.path(), None, 10, 64, 50, true, Some(100)).unwrap();
+        let profile = ReadMemoryProfile::from_files(
+            file.path(),
+            None,
+            10,
+            64,
+            Sketch::Minimizer { w: 50 },
+            true,
+            Some(100),
+        )
+        .unwrap();
         assert_eq!(profile.avg_read_length, 100);
         assert_eq!(profile.avg_query_length, 100);
     }
@@ -2367,16 +2393,30 @@ mod tests {
         r2.flush().unwrap();
 
         // Without trim_to
-        let profile =
-            ReadMemoryProfile::from_files(r1.path(), Some(r2.path()), 10, 64, 50, false, None)
-                .unwrap();
+        let profile = ReadMemoryProfile::from_files(
+            r1.path(),
+            Some(r2.path()),
+            10,
+            64,
+            Sketch::Minimizer { w: 50 },
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(profile.avg_read_length, 1000);
         assert_eq!(profile.avg_query_length, 2000);
 
         // With trim_to=100: each read capped at 100, query = 200
-        let profile =
-            ReadMemoryProfile::from_files(r1.path(), Some(r2.path()), 10, 64, 50, false, Some(100))
-                .unwrap();
+        let profile = ReadMemoryProfile::from_files(
+            r1.path(),
+            Some(r2.path()),
+            10,
+            64,
+            Sketch::Minimizer { w: 50 },
+            false,
+            Some(100),
+        )
+        .unwrap();
         assert_eq!(profile.avg_read_length, 100);
         assert_eq!(profile.avg_query_length, 200);
     }
@@ -2423,16 +2463,32 @@ mod tests {
         writer.close().unwrap();
 
         // Without trim_to
-        let profile =
-            ReadMemoryProfile::from_files(file.path(), None, 10, 64, 50, true, None).unwrap();
+        let profile = ReadMemoryProfile::from_files(
+            file.path(),
+            None,
+            10,
+            64,
+            Sketch::Minimizer { w: 50 },
+            true,
+            None,
+        )
+        .unwrap();
         // avg_query_length = (1000+1000)*3 / 3 = 2000
         // avg_read_length = 6000 / 6 = 1000
         assert_eq!(profile.avg_read_length, 1000);
         assert_eq!(profile.avg_query_length, 2000);
 
         // With trim_to=100: each read capped at 100, query = 200
-        let profile =
-            ReadMemoryProfile::from_files(file.path(), None, 10, 64, 50, true, Some(100)).unwrap();
+        let profile = ReadMemoryProfile::from_files(
+            file.path(),
+            None,
+            10,
+            64,
+            Sketch::Minimizer { w: 50 },
+            true,
+            Some(100),
+        )
+        .unwrap();
         assert_eq!(profile.avg_read_length, 100);
         assert_eq!(profile.avg_query_length, 200);
     }
@@ -2445,7 +2501,7 @@ mod tests {
 
     #[test]
     fn test_batch_config_accounts_for_prefetch_buffer() {
-        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+        let profile = ReadMemoryProfile::new(150, false, 64, Sketch::Minimizer { w: 50 });
         let config = MemoryConfig {
             max_memory: 1024 * 1024 * 1024, // 1GB
             num_threads: 4,
@@ -2479,7 +2535,7 @@ mod tests {
 
     #[test]
     fn test_fastx_vs_parquet_uses_different_prefetch_slots() {
-        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+        let profile = ReadMemoryProfile::new(150, false, 64, Sketch::Minimizer { w: 50 });
 
         // FASTX uses 2 slots
         let config_fastx = MemoryConfig {
@@ -2533,7 +2589,7 @@ mod tests {
 
     #[test]
     fn test_owned_fastx_record_vs_arrow_bytes_estimation() {
-        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+        let profile = ReadMemoryProfile::new(150, false, 64, Sketch::Minimizer { w: 50 });
 
         // OwnedFastxRecord estimation for FASTX
         let owned_bytes = profile.estimate_owned_record_bytes(false);
@@ -2564,8 +2620,8 @@ mod tests {
 
     #[test]
     fn test_read_length_affects_buffer_bytes() {
-        let profile_short = ReadMemoryProfile::new(150, false, 64, 50);
-        let profile_long = ReadMemoryProfile::new(10000, false, 64, 50);
+        let profile_short = ReadMemoryProfile::new(150, false, 64, Sketch::Minimizer { w: 50 });
+        let profile_long = ReadMemoryProfile::new(10000, false, 64, Sketch::Minimizer { w: 50 });
 
         // Longer reads should have larger buffer bytes for both formats
         let short_owned = profile_short.estimate_owned_record_bytes(false);
@@ -2579,7 +2635,7 @@ mod tests {
 
     #[test]
     fn test_total_memory_with_io_buffers_within_budget() {
-        let profile = ReadMemoryProfile::new(5000, true, 64, 50); // paired long reads
+        let profile = ReadMemoryProfile::new(5000, true, 64, Sketch::Minimizer { w: 50 }); // paired long reads
         let config = MemoryConfig {
             max_memory: 8 * 1024 * 1024 * 1024, // 8GB
             num_threads: 8,
@@ -2608,8 +2664,8 @@ mod tests {
     #[test]
     fn test_estimate_arrow_bytes_per_row() {
         // Test the helper method that estimates Arrow buffer overhead
-        let profile_short = ReadMemoryProfile::new(150, false, 64, 50);
-        let profile_long = ReadMemoryProfile::new(10000, false, 64, 50);
+        let profile_short = ReadMemoryProfile::new(150, false, 64, Sketch::Minimizer { w: 50 });
+        let profile_long = ReadMemoryProfile::new(10000, false, 64, Sketch::Minimizer { w: 50 });
 
         let bytes_short = profile_short.estimate_arrow_bytes_per_row(false);
         let bytes_long = profile_long.estimate_arrow_bytes_per_row(false);
@@ -2644,7 +2700,7 @@ mod tests {
     #[test]
     fn test_binary_search_validates_result() {
         // Test that binary search returns valid results even in edge cases
-        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+        let profile = ReadMemoryProfile::new(150, false, 64, Sketch::Minimizer { w: 50 });
         let config = MemoryConfig {
             max_memory: 500 * 1024 * 1024, // 500MB - moderately constrained
             num_threads: 4,
@@ -2676,7 +2732,7 @@ mod tests {
 
     #[test]
     fn test_memory_config_validation() {
-        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+        let profile = ReadMemoryProfile::new(150, false, 64, Sketch::Minimizer { w: 50 });
 
         // Valid config should succeed
         let valid = MemoryConfig::new(
@@ -2812,7 +2868,7 @@ mod tests {
     /// After fix: batch_count=1, batch_size≈3.3M (4.2× larger).
     #[test]
     fn test_batch_count_is_one_for_sequential_processing() {
-        let profile = ReadMemoryProfile::new(5000, false, 64, 200);
+        let profile = ReadMemoryProfile::new(5000, false, 64, Sketch::Minimizer { w: 200 });
         let config = MemoryConfig {
             max_memory: 64 * 1024 * 1024 * 1024, // 64GB
             num_threads: 8,
@@ -2840,7 +2896,7 @@ mod tests {
     /// (via rayon), not how many batches are in memory simultaneously.
     #[test]
     fn test_batch_size_independent_of_thread_count() {
-        let profile = ReadMemoryProfile::new(5000, false, 64, 200);
+        let profile = ReadMemoryProfile::new(5000, false, 64, Sketch::Minimizer { w: 200 });
         let base = MemoryConfig {
             max_memory: 64 * 1024 * 1024 * 1024,
             num_threads: 1,
@@ -2884,7 +2940,7 @@ mod tests {
     /// reservation, batch_size should be smaller than without.
     #[test]
     fn test_shard_reservation_reduces_batch_size() {
-        let profile = ReadMemoryProfile::new(5000, false, 64, 200);
+        let profile = ReadMemoryProfile::new(5000, false, 64, Sketch::Minimizer { w: 200 });
 
         let config_no_reservation = MemoryConfig {
             max_memory: 8 * 1024 * 1024 * 1024, // 8GB (constrained so effect is visible)
@@ -2926,7 +2982,7 @@ mod tests {
 
     #[test]
     fn test_parquet_trimmed_uses_owned_format_for_io_buffer_estimate() {
-        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+        let profile = ReadMemoryProfile::new(150, false, 64, Sketch::Minimizer { w: 50 });
 
         let format_trimmed = InputFormat::Parquet {
             is_paired: false,
@@ -2952,7 +3008,7 @@ mod tests {
 
     #[test]
     fn test_parquet_untrimmed_uses_arrow_estimate() {
-        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+        let profile = ReadMemoryProfile::new(150, false, 64, Sketch::Minimizer { w: 50 });
 
         let format_untrimmed = InputFormat::Parquet {
             is_paired: false,
@@ -2994,7 +3050,7 @@ mod tests {
 
     #[test]
     fn test_parquet_trimmed_no_arrow_builder_overhead() {
-        let profile = ReadMemoryProfile::new(150, false, 64, 50);
+        let profile = ReadMemoryProfile::new(150, false, 64, Sketch::Minimizer { w: 50 });
         let batch_size = 10_000;
 
         // Untrimmed Parquet: should apply ARROW_BUILDER_OVERHEAD (1.5x)
@@ -3055,7 +3111,7 @@ mod tests {
 
     #[test]
     fn test_parquet_trimmed_paired_end_uses_paired_owned_estimate() {
-        let profile = ReadMemoryProfile::new(150, true, 64, 50);
+        let profile = ReadMemoryProfile::new(150, true, 64, Sketch::Minimizer { w: 50 });
 
         let format_trimmed_paired = InputFormat::Parquet {
             is_paired: true,

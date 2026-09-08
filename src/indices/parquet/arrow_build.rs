@@ -130,7 +130,7 @@ fn build_index_from_arrow_inner(
     use crate::parquet_index::{
         compute_source_hash, consolidate_shards_streaming, create_index_directory,
         write_buckets_parquet, InvertedManifest, ParquetManifest, ParquetShardFormat,
-        ShardAccumulator, FORMAT_MAGIC, FORMAT_VERSION, MIN_SHARD_BYTES,
+        ShardAccumulator, MIN_SHARD_BYTES,
     };
     use crate::BucketFileStats;
     use std::collections::HashMap;
@@ -298,11 +298,6 @@ fn build_index_from_arrow_inner(
     let num_buckets = bmap.num_buckets();
 
     let manifest = ParquetManifest {
-        magic: FORMAT_MAGIC.to_string(),
-        format_version: FORMAT_VERSION,
-        k,
-        w: sketch.w_or_zero(),
-        salt,
         source_hash,
         num_buckets,
         total_minimizers,
@@ -313,6 +308,7 @@ fn build_index_from_arrow_inner(
             has_overlapping_shards: false,
             shards: shard_infos,
         }),
+        ..ParquetManifest::new_with_sketch(k, sketch, salt)
     };
     manifest.save(output_dir)?;
 

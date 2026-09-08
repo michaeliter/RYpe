@@ -310,6 +310,7 @@ impl InvertedIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Sketch;
 
     fn build_test_inverted_index() -> InvertedIndex {
         let mut buckets: HashMap<u32, Vec<u64>> = HashMap::new();
@@ -320,6 +321,7 @@ mod tests {
         let metadata = IndexMetadata {
             k: 64,
             w: 50,
+            sketch: Sketch::Minimizer { w: 50 },
             salt: 0x1234,
             bucket_names: HashMap::new(),
             bucket_sources: HashMap::new(),
@@ -370,6 +372,7 @@ mod tests {
         let metadata = IndexMetadata {
             k: 64,
             w: 50,
+            sketch: Sketch::Minimizer { w: 50 },
             salt: 0,
             bucket_names: HashMap::new(),
             bucket_sources: HashMap::new(),
@@ -395,6 +398,7 @@ mod tests {
         let metadata = IndexMetadata {
             k: 64,
             w: 50,
+            sketch: Sketch::Minimizer { w: 50 },
             salt: 0,
             bucket_names: HashMap::new(),
             bucket_sources: HashMap::new(),
@@ -424,6 +428,7 @@ mod tests {
         let metadata = IndexMetadata {
             k: 64,
             w: 50,
+            sketch: Sketch::Minimizer { w: 50 },
             salt: 0,
             bucket_names: HashMap::new(),
             bucket_sources: HashMap::new(),

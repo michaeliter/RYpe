@@ -105,10 +105,16 @@ pub enum IndexCommands {
         #[arg(short = 'k', long, default_value_t = 64)]
         kmer_size: usize,
 
-        /// Minimizer window size. Larger values = smaller index, less sensitive.
-        /// Recommended: 30-100 for genomes, 20-50 for shorter sequences.
-        #[arg(short, long, default_value_t = 50)]
-        window: usize,
+        /// Minimizer window size [default: 50]. Larger values = smaller index,
+        /// less sensitive. Recommended: 30-100 for genomes, 20-50 for shorter
+        /// sequences. Mutually exclusive with --smer-size.
+        #[arg(short, long, conflicts_with = "smer_size")]
+        window: Option<usize>,
+
+        /// s-mer size; presence selects open-syncmer sketching instead of
+        /// minimizer. Must satisfy 0 < s < k. Recommended s=15 for k=64.
+        #[arg(short = 'S', long)]
+        smer_size: Option<usize>,
 
         /// XOR salt for hash randomization. Must match for index compatibility.
         /// Default is fine for most uses; change to create incompatible indices.

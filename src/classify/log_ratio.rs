@@ -487,6 +487,7 @@ mod tests {
         IndexMetadata {
             k,
             w,
+            sketch: Sketch::Minimizer { w },
             salt,
             bucket_names: HashMap::new(),
             bucket_sources: HashMap::new(),

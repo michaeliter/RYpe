@@ -15,7 +15,7 @@ use std::path::Path;
 use super::streaming::{compute_source_hash, ShardAccumulator, MIN_SHARD_BYTES};
 use super::{
     create_index_directory, write_buckets_parquet, InvertedManifest, InvertedShardInfo,
-    ParquetManifest, ParquetShardFormat, ParquetWriteOptions, FORMAT_MAGIC, FORMAT_VERSION,
+    ParquetManifest, ParquetShardFormat, ParquetWriteOptions,
 };
 
 /// Options for index merging.
@@ -471,11 +471,6 @@ fn finish_merge(
 
     // Build and save manifest
     let manifest = ParquetManifest {
-        magic: FORMAT_MAGIC.to_string(),
-        format_version: FORMAT_VERSION,
-        k: primary.k(),
-        w: primary.w(),
-        salt: primary.salt(),
         source_hash,
         num_buckets: remapped.bucket_names.len() as u32,
         total_minimizers: total_entries,
@@ -486,6 +481,7 @@ fn finish_merge(
             has_overlapping_shards,
             shards: shard_infos,
         }),
+        ..ParquetManifest::new_with_sketch(primary.k(), primary.sketch(), primary.salt())
     };
 
     manifest.save(output_path)?;

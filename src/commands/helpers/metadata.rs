@@ -92,6 +92,7 @@ pub fn load_index_metadata(path: &Path) -> Result<IndexMetadata> {
         return Ok(IndexMetadata {
             k: manifest.k,
             w: manifest.w,
+            sketch: manifest.sketch()?,
             salt: manifest.salt,
             bucket_names,
             bucket_sources,

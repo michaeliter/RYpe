@@ -231,13 +231,13 @@ pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSiz
         config.r2_path,
         1000, // sample size
         metadata.k,
-        metadata.w,
+        metadata.sketch,
         config.is_parquet_input,
         effective_trim_to,
     )
     .unwrap_or_else(|| {
         log::warn!("Could not sample read lengths, using default profile");
-        ReadMemoryProfile::default_profile(is_paired_hint, metadata.k, metadata.w)
+        ReadMemoryProfile::default_profile(is_paired_hint, metadata.k, metadata.sketch)
     });
 
     // Use is_paired from the read profile, which correctly detects pairing

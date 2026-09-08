@@ -4,12 +4,23 @@
 //! for Parquet-based inverted index directories.
 
 use crate::error::{Result, RypeError};
+use crate::{Sketch, SketchSchemeTag};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
 use super::options::hex_u64;
-use super::{files, FORMAT_MAGIC, FORMAT_VERSION};
+use super::{
+    files, format_version_for, FORMAT_MAGIC, FORMAT_VERSION_MAX, FORMAT_VERSION_OPEN_SYNCMER,
+};
+
+fn is_zero(w: &usize) -> bool {
+    *w == 0
+}
+
+fn is_minimizer(tag: &SketchSchemeTag) -> bool {
+    *tag == SketchSchemeTag::Minimizer
+}
 
 /// Manifest containing index metadata.
 ///
@@ -25,8 +36,21 @@ pub struct ParquetManifest {
     /// K-mer size (16, 32, or 64).
     pub k: usize,
 
-    /// Window size for minimizer selection.
+    /// Window size for minimizer selection. `0` means "not applicable" (an
+    /// open-syncmer index) and is omitted from the file; an absent key
+    /// still deserializes to `0` via `serde(default)`.
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub w: usize,
+
+    /// Sketch scheme this index was built with. Absent in a manifest file
+    /// means `Minimizer` -- this is what lets pre-existing `.ryxdi` indices
+    /// keep loading without a rebuild.
+    #[serde(default, skip_serializing_if = "is_minimizer")]
+    pub scheme: SketchSchemeTag,
+
+    /// s-mer size for open-syncmer indices. `None` for minimizer indices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s: Option<usize>,
 
     /// XOR salt applied to k-mer hashes (hex string for TOML).
     #[serde(with = "hex_u64")]
@@ -96,13 +120,18 @@ pub struct InvertedShardInfo {
 }
 
 impl ParquetManifest {
-    /// Create a new manifest with the given parameters.
-    pub fn new(k: usize, w: usize, salt: u64) -> Self {
+    /// Create a new manifest for the given sketch scheme. Sets
+    /// `format_version`/`w`/`scheme`/`s` atomically from `sk`, so they can
+    /// never disagree with each other the way independently-set struct
+    /// literal fields could.
+    pub fn new_with_sketch(k: usize, sk: Sketch, salt: u64) -> Self {
         Self {
             magic: FORMAT_MAGIC.to_string(),
-            format_version: FORMAT_VERSION,
+            format_version: format_version_for(sk),
             k,
-            w,
+            w: sk.w_or_zero(),
+            scheme: sk.tag(),
+            s: sk.s(),
             salt,
             source_hash: 0,
             num_buckets: 0,
@@ -111,8 +140,19 @@ impl ParquetManifest {
         }
     }
 
+    /// Reconstruct the [`Sketch`] this manifest was built with. Errors on an
+    /// incoherent combination (`OpenSyncmer` with `s` absent, `Minimizer`
+    /// with `s` present) -- see [`Sketch::from_fields`].
+    pub fn sketch(&self) -> Result<Sketch> {
+        Sketch::from_fields(self.w, self.scheme, self.s)
+    }
+
     /// Save manifest to the index directory.
     pub fn save(&self, index_dir: &Path) -> Result<()> {
+        // Coherence check: reject a hand-constructed manifest whose
+        // scheme/w/s don't agree, before it ever reaches disk.
+        self.sketch()?;
+
         let path = index_dir.join(files::MANIFEST);
         let toml_str = toml::to_string_pretty(self)
             .map_err(|e| RypeError::encoding(format!("serialize manifest: {}", e)))?;
@@ -139,12 +179,28 @@ impl ParquetManifest {
                 ),
             ));
         }
-        if manifest.format_version > FORMAT_VERSION {
+        if manifest.format_version > FORMAT_VERSION_MAX {
             return Err(RypeError::format(
                 path,
                 format!(
                     "unsupported format version: {} (max supported: {})",
-                    manifest.format_version, FORMAT_VERSION
+                    manifest.format_version, FORMAT_VERSION_MAX
+                ),
+            ));
+        }
+        // A non-minimizer scheme requires the format version that introduced
+        // it. Deliberately not exact equality: a future format_version 3
+        // that still uses minimizers must not trip this. Closes the one
+        // flaw a same-build writer could otherwise produce: `format_version:
+        // 1` (the pre-syncmer default) paired with `scheme: open_syncmer`.
+        if manifest.scheme != SketchSchemeTag::Minimizer
+            && manifest.format_version < FORMAT_VERSION_OPEN_SYNCMER
+        {
+            return Err(RypeError::format(
+                path,
+                format!(
+                    "manifest is incoherent: scheme={:?} requires format_version >= {}, got {}",
+                    manifest.scheme, FORMAT_VERSION_OPEN_SYNCMER, manifest.format_version
                 ),
             ));
         }
@@ -232,6 +288,7 @@ pub fn create_index_directory(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::FORMAT_VERSION_MINIMIZER;
     use super::*;
     use tempfile::TempDir;
 
@@ -241,7 +298,7 @@ mod tests {
         let index_dir = tmp.path().join("test.ryidx");
         create_index_directory(&index_dir).unwrap();
 
-        let mut manifest = ParquetManifest::new(64, 50, 12345);
+        let mut manifest = ParquetManifest::new_with_sketch(64, Sketch::Minimizer { w: 50 }, 12345);
         manifest.num_buckets = 10;
         manifest.total_minimizers = 1_000_000;
         manifest.source_hash = 0xDEADBEEF;
@@ -250,13 +307,33 @@ mod tests {
         let loaded = ParquetManifest::load(&index_dir).unwrap();
 
         assert_eq!(loaded.magic, FORMAT_MAGIC);
-        assert_eq!(loaded.format_version, FORMAT_VERSION);
+        assert_eq!(loaded.format_version, FORMAT_VERSION_MINIMIZER);
         assert_eq!(loaded.k, 64);
         assert_eq!(loaded.w, 50);
+        assert_eq!(loaded.scheme, SketchSchemeTag::Minimizer);
+        assert_eq!(loaded.s, None);
         assert_eq!(loaded.salt, 12345);
         assert_eq!(loaded.num_buckets, 10);
         assert_eq!(loaded.total_minimizers, 1_000_000);
         assert_eq!(loaded.source_hash, 0xDEADBEEF);
+        assert_eq!(loaded.sketch().unwrap(), Sketch::Minimizer { w: 50 });
+    }
+
+    #[test]
+    fn test_manifest_round_trip_syncmer() {
+        let tmp = TempDir::new().unwrap();
+        let index_dir = tmp.path().join("test.ryxdi");
+        create_index_directory(&index_dir).unwrap();
+
+        let manifest = ParquetManifest::new_with_sketch(64, Sketch::OpenSyncmer { s: 15 }, 12345);
+        manifest.save(&index_dir).unwrap();
+        let loaded = ParquetManifest::load(&index_dir).unwrap();
+
+        assert_eq!(loaded.format_version, FORMAT_VERSION_OPEN_SYNCMER);
+        assert_eq!(loaded.w, 0);
+        assert_eq!(loaded.scheme, SketchSchemeTag::OpenSyncmer);
+        assert_eq!(loaded.s, Some(15));
+        assert_eq!(loaded.sketch().unwrap(), Sketch::OpenSyncmer { s: 15 });
     }
 
     #[test]
@@ -276,8 +353,159 @@ mod tests {
         // Valid Parquet index
         let valid_dir = tmp.path().join("valid.ryidx");
         create_index_directory(&valid_dir).unwrap();
-        let manifest = ParquetManifest::new(64, 50, 0);
+        let manifest = ParquetManifest::new_with_sketch(64, Sketch::Minimizer { w: 50 }, 0);
         manifest.save(&valid_dir).unwrap();
         assert!(is_parquet_index(&valid_dir));
+    }
+
+    // --- Hand-written TOML fixtures ---------------------------------------
+    // These are literal strings, not output from the current writer: they
+    // must keep failing/passing for the right reason even if the writer
+    // changes shape later.
+
+    fn write_fixture(dir: &Path, toml_body: &str) {
+        create_index_directory(dir).unwrap();
+        fs::write(dir.join(files::MANIFEST), toml_body).unwrap();
+    }
+
+    #[test]
+    fn test_fixture_no_scheme_key_loads_as_minimizer() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("legacy.ryxdi");
+        write_fixture(
+            &dir,
+            r#"
+magic = "RYPE_PARQUET_V1"
+format_version = 1
+k = 64
+w = 50
+salt = "0x0000000000000000"
+source_hash = "0x0000000000000000"
+num_buckets = 1
+total_minimizers = 100
+"#,
+        );
+        let loaded = ParquetManifest::load(&dir).unwrap();
+        assert_eq!(loaded.scheme, SketchSchemeTag::Minimizer);
+        assert_eq!(loaded.sketch().unwrap(), Sketch::Minimizer { w: 50 });
+    }
+
+    #[test]
+    fn test_fixture_syncmer_manifest_no_w_key() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("syncmer.ryxdi");
+        write_fixture(
+            &dir,
+            r#"
+magic = "RYPE_PARQUET_V1"
+format_version = 2
+k = 64
+scheme = "open_syncmer"
+s = 15
+salt = "0x0000000000000000"
+source_hash = "0x0000000000000000"
+num_buckets = 1
+total_minimizers = 100
+"#,
+        );
+        let loaded = ParquetManifest::load(&dir).unwrap();
+        assert_eq!(loaded.w, 0);
+        assert_eq!(loaded.sketch().unwrap(), Sketch::OpenSyncmer { s: 15 });
+    }
+
+    #[test]
+    fn test_fixture_syncmer_at_format_version_1_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("bad.ryxdi");
+        write_fixture(
+            &dir,
+            r#"
+magic = "RYPE_PARQUET_V1"
+format_version = 1
+k = 64
+scheme = "open_syncmer"
+s = 15
+salt = "0x0000000000000000"
+source_hash = "0x0000000000000000"
+num_buckets = 1
+total_minimizers = 100
+"#,
+        );
+        let err = ParquetManifest::load(&dir).unwrap_err().to_string();
+        assert!(
+            err.contains("incoherent"),
+            "expected an incoherence error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_fixture_future_format_version_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("future.ryxdi");
+        write_fixture(
+            &dir,
+            r#"
+magic = "RYPE_PARQUET_V1"
+format_version = 3
+k = 64
+w = 50
+salt = "0x0000000000000000"
+source_hash = "0x0000000000000000"
+num_buckets = 1
+total_minimizers = 100
+"#,
+        );
+        let err = ParquetManifest::load(&dir).unwrap_err().to_string();
+        assert!(
+            err.contains("unsupported format version"),
+            "expected an unsupported-version error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_sketch_rejects_minimizer_with_s_present() {
+        let manifest = ParquetManifest {
+            scheme: SketchSchemeTag::Minimizer,
+            s: Some(15),
+            ..ParquetManifest::new_with_sketch(64, Sketch::Minimizer { w: 50 }, 0)
+        };
+        assert!(manifest.sketch().is_err());
+    }
+
+    #[test]
+    fn test_sketch_rejects_syncmer_with_s_absent() {
+        let manifest = ParquetManifest {
+            scheme: SketchSchemeTag::OpenSyncmer,
+            s: None,
+            ..ParquetManifest::new_with_sketch(64, Sketch::Minimizer { w: 50 }, 0)
+        };
+        assert!(manifest.sketch().is_err());
+    }
+
+    #[test]
+    fn test_save_rejects_incoherent_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("incoherent.ryxdi");
+        create_index_directory(&dir).unwrap();
+
+        let manifest = ParquetManifest {
+            scheme: SketchSchemeTag::OpenSyncmer,
+            s: None,
+            ..ParquetManifest::new_with_sketch(64, Sketch::Minimizer { w: 50 }, 0)
+        };
+        assert!(manifest.save(&dir).is_err());
+    }
+
+    #[test]
+    fn test_format_version_for_pinned_values() {
+        assert_eq!(
+            format_version_for(Sketch::Minimizer { w: 50 }),
+            FORMAT_VERSION_MINIMIZER
+        );
+        assert_eq!(
+            format_version_for(Sketch::OpenSyncmer { s: 15 }),
+            FORMAT_VERSION_OPEN_SYNCMER
+        );
+        assert_eq!(FORMAT_VERSION_MAX, 2);
     }
 }

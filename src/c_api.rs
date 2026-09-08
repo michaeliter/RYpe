@@ -67,6 +67,11 @@ impl RypeIndex {
         self.0.w()
     }
 
+    /// Returns the sketch scheme.
+    pub fn sketch(&self) -> crate::Sketch {
+        self.0.sketch()
+    }
+
     /// Returns the salt.
     pub fn salt(&self) -> u64 {
         self.0.salt()
@@ -558,7 +563,7 @@ pub extern "C" fn rype_calculate_batch_config(
     let index = unsafe { &*index_ptr };
 
     let k = index.k();
-    let w = index.w();
+    let sketch = index.sketch();
     let num_buckets = index.num_buckets();
 
     if num_buckets == 0 {
@@ -575,7 +580,7 @@ pub extern "C" fn rype_calculate_batch_config(
     };
 
     let num_threads = rayon::current_num_threads();
-    let read_profile = ReadMemoryProfile::new(avg_read_length, is_paired_bool, k, w);
+    let read_profile = ReadMemoryProfile::new(avg_read_length, is_paired_bool, k, sketch);
     let shard_reservation = estimate_shard_reservation(index.largest_shard_entries(), num_threads);
 
     // Build memory config:

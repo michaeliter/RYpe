@@ -177,6 +177,7 @@ fn build_inverted_from_buckets(
     let metadata = IndexMetadata {
         k,
         w,
+        sketch: rype::Sketch::Minimizer { w },
         salt,
         bucket_names,
         bucket_sources,

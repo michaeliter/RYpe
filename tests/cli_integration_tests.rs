@@ -342,6 +342,95 @@ fn test_cli_index_create_and_classify() -> Result<()> {
     Ok(())
 }
 
+/// Regression test: `classify run` against an open-syncmer index used to panic with
+/// "attempt to divide by zero" in the batch-size/OOM memory model, because that model
+/// divided by the manifest's `w` field, which is the documented sentinel `0` for
+/// syncmer indices (`w` is meaningless for that scheme). Also checks the property that
+/// actually matters: classifying a read against the index it was built from must score
+/// high, not merely "not crash".
+#[test]
+fn test_cli_syncmer_index_create_and_classify() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let index_path = dir.path().join("sync-test.ryxdi");
+
+    // Create a syncmer index: -S selects the open-syncmer scheme instead of -w.
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            index_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-S",
+            "8",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Syncmer index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(index_path.exists(), "Index directory should exist");
+
+    // A genuine substring of the source genome, so a high score is the expected outcome.
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        "@query1\nGAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )?;
+
+    let output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "-t",
+            "0.0",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "Classification against syncmer index failed (this is the div-by-zero regression \
+         if it panicked): {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let data_line = stdout
+        .lines()
+        .nth(1)
+        .unwrap_or_else(|| panic!("Expected a header + one data row, got: {stdout}"));
+    let score: f64 = data_line
+        .rsplit('\t')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap_or_else(|e| panic!("Could not parse score from '{data_line}': {e}"));
+    assert!(
+        score > 0.9,
+        "Expected a high hit rate classifying a read against its source syncmer index, got {score}"
+    );
+
+    Ok(())
+}
+
 /// Test index stats command
 #[test]
 fn test_cli_index_stats() -> Result<()> {

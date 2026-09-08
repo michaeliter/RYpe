@@ -50,10 +50,12 @@ pub struct ShardInfo {
 pub struct ShardManifest {
     pub k: usize,
     pub w: usize,
-    /// Sketch scheme this index was built with. Derived from `w` at load time
-    /// (`ParquetManifest` does not yet carry a scheme), so this is currently
-    /// always `Sketch::Minimizer { w }` until syncmer manifests exist.
+    /// Sketch scheme this index was built with, read from the manifest's
+    /// `scheme`/`s`/`w` fields via `ParquetManifest::sketch()`.
     pub sketch: Sketch,
+    /// Minimum manifest format version required to read this index. See
+    /// `parquet_index::FORMAT_VERSION_MAX`.
+    pub format_version: u32,
     pub salt: u64,
     pub source_hash: u64,
     /// Total minimizer entries across all shards (includes duplicates across shards).
@@ -95,6 +97,7 @@ impl ShardManifest {
         IndexMetadata {
             k: self.k,
             w: self.w,
+            sketch: self.sketch,
             salt: self.salt,
             bucket_names: self.bucket_names.clone(),
             bucket_sources: self.bucket_sources.clone(),
@@ -174,9 +177,8 @@ impl ShardedInvertedIndex {
         let manifest = ShardManifest {
             k: parquet_manifest.k,
             w: parquet_manifest.w,
-            sketch: Sketch::Minimizer {
-                w: parquet_manifest.w,
-            },
+            sketch: parquet_manifest.sketch()?,
+            format_version: parquet_manifest.format_version,
             salt: parquet_manifest.salt,
             source_hash: parquet_manifest.source_hash,
             total_minimizers: inverted.total_entries.min(usize::MAX as u64) as usize,
