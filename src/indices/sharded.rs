@@ -466,12 +466,9 @@ impl ShardedInvertedIndex {
                 self.manifest.k, metadata.k
             )));
         }
-        if self.manifest.w != metadata.w {
-            return Err(RypeError::validation(format!(
-                "W mismatch: sharded index has W={}, metadata has W={}",
-                self.manifest.w, metadata.w
-            )));
-        }
+        self.manifest
+            .sketch
+            .require_compatible(&metadata.sketch, "sharded index vs metadata")?;
         if self.manifest.salt != metadata.salt {
             return Err(RypeError::validation(format!(
                 "Salt mismatch: sharded index has salt={:#x}, metadata has salt={:#x}",

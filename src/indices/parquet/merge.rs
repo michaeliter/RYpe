@@ -29,14 +29,14 @@ pub struct MergeOptions {
 
 /// Validate that two indices are compatible for merging.
 ///
-/// Indices must have matching k, w, and salt values. Bucket names must be
-/// unique across both indices (no overlapping names).
+/// Indices must have matching k, sketch scheme/params, and salt. Bucket
+/// names must be unique across both indices (no overlapping names).
 ///
 /// # Errors
 ///
 /// Returns an error if:
 /// - k values don't match
-/// - w values don't match
+/// - sketch schemes/params don't match
 /// - salt values don't match
 /// - Any bucket name appears in both indices
 pub fn validate_merge_compatibility(
@@ -52,14 +52,9 @@ pub fn validate_merge_compatibility(
         )));
     }
 
-    // Check w values match
-    if primary.w() != secondary.w() {
-        return Err(RypeError::validation(format!(
-            "w mismatch: primary has w={}, secondary has w={}",
-            primary.w(),
-            secondary.w()
-        )));
-    }
+    primary
+        .sketch()
+        .require_compatible(&secondary.sketch(), "merge")?;
 
     // Check salt values match
     if primary.salt() != secondary.salt() {
@@ -913,6 +908,24 @@ mod tests {
         bucket_name: &str,
         minimizers: Vec<u64>,
     ) -> ShardedInvertedIndex {
+        create_test_index_with_sketch(
+            dir,
+            k,
+            crate::Sketch::Minimizer { w },
+            salt,
+            bucket_name,
+            minimizers,
+        )
+    }
+
+    fn create_test_index_with_sketch(
+        dir: &std::path::Path,
+        k: usize,
+        sketch: crate::Sketch,
+        salt: u64,
+        bucket_name: &str,
+        minimizers: Vec<u64>,
+    ) -> ShardedInvertedIndex {
         let bucket = BucketData {
             bucket_id: 1,
             bucket_name: bucket_name.to_string(),
@@ -920,17 +933,8 @@ mod tests {
             minimizers,
         };
 
-        create_parquet_inverted_index(
-            dir,
-            vec![bucket],
-            k,
-            crate::Sketch::Minimizer { w },
-            salt,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        create_parquet_inverted_index(dir, vec![bucket], k, sketch, salt, None, None, None)
+            .unwrap();
 
         ShardedInvertedIndex::open(dir).unwrap()
     }
@@ -981,9 +985,51 @@ mod tests {
         let result = validate_merge_compatibility(&primary, &secondary);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("w mismatch"), "Error: {}", err_msg);
+        assert!(
+            err_msg.contains("incompatible sketch"),
+            "Error: {}",
+            err_msg
+        );
         assert!(err_msg.contains("50"), "Error: {}", err_msg);
         assert!(err_msg.contains("100"), "Error: {}", err_msg);
+    }
+
+    #[test]
+    fn test_validate_incompatible_scheme() {
+        // The hazard `require_compatible` closes: two syncmer indices share
+        // the `w = 0` sentinel, so a `.w() != .w()` check alone would have
+        // silently accepted this as compatible.
+        let tmp = TempDir::new().unwrap();
+        let primary_path = tmp.path().join("primary.ryxdi");
+        let secondary_path = tmp.path().join("secondary.ryxdi");
+
+        let primary = create_test_index_with_sketch(
+            &primary_path,
+            64,
+            crate::Sketch::OpenSyncmer { s: 15 },
+            0x5555,
+            "bucket_a",
+            vec![1, 2, 3],
+        );
+        let secondary = create_test_index_with_sketch(
+            &secondary_path,
+            64,
+            crate::Sketch::OpenSyncmer { s: 21 },
+            0x5555,
+            "bucket_b",
+            vec![4, 5, 6],
+        );
+
+        let result = validate_merge_compatibility(&primary, &secondary);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("incompatible sketch"),
+            "Error: {}",
+            err_msg
+        );
+        assert!(err_msg.contains("s=15"), "Error: {}", err_msg);
+        assert!(err_msg.contains("s=21"), "Error: {}", err_msg);
     }
 
     #[test]

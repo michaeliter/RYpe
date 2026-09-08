@@ -155,6 +155,30 @@ impl Sketch {
             },
         }
     }
+
+    /// Require two sketches to combine safely (classify, merge, log-ratio,
+    /// negative filtering, ...). `ctx` names the operation, for the error.
+    ///
+    /// This is the single comparison site every combining operation must go
+    /// through -- a hand-written `.w() != .w()` check silently ignores a
+    /// `scheme`/`s` mismatch (two syncmer indices can share `w = 0` while
+    /// using different `s`), degrading a contamination filter into a
+    /// silent no-op instead of failing loud.
+    pub fn require_compatible(&self, other: &Self, ctx: &str) -> Result<(), RypeError> {
+        if self != other {
+            return Err(RypeError::validation(format!(
+                "{ctx}: incompatible sketch schemes: {self} vs {other}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// [`Self::require_compatible`], returning the shared sketch on success
+    /// so the caller can extract with it.
+    pub fn unify(a: &Self, b: &Self, ctx: &str) -> Result<Self, RypeError> {
+        a.require_compatible(b, ctx)?;
+        Ok(*a)
+    }
 }
 
 impl std::fmt::Display for Sketch {
@@ -384,5 +408,63 @@ mod tests {
         }
         let s = Sketch::OpenSyncmer { s: 15 };
         assert_eq!(accepts(s), s);
+    }
+
+    #[test]
+    fn test_require_compatible_accepts_identical_sketches() {
+        let a = Sketch::Minimizer { w: 50 };
+        let b = Sketch::Minimizer { w: 50 };
+        assert!(a.require_compatible(&b, "test").is_ok());
+
+        let a = Sketch::OpenSyncmer { s: 15 };
+        let b = Sketch::OpenSyncmer { s: 15 };
+        assert!(a.require_compatible(&b, "test").is_ok());
+    }
+
+    #[test]
+    fn test_require_compatible_rejects_minimizer_vs_syncmer() {
+        let a = Sketch::Minimizer { w: 50 };
+        let b = Sketch::OpenSyncmer { s: 15 };
+        let err = a.require_compatible(&b, "merge").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("merge"),
+            "error should name the context: {msg}"
+        );
+        assert!(
+            msg.contains("minimizer") && msg.contains("open-syncmer"),
+            "error should name both schemes: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_require_compatible_rejects_syncmer_different_s() {
+        // The exact silent-no-op hazard this helper exists to close: two
+        // syncmer indices share the `w = 0` sentinel, so a `.w() != .w()`
+        // check alone cannot tell them apart.
+        let a = Sketch::OpenSyncmer { s: 15 };
+        let b = Sketch::OpenSyncmer { s: 21 };
+        assert!(a.require_compatible(&b, "test").is_err());
+    }
+
+    #[test]
+    fn test_require_compatible_rejects_minimizer_different_w() {
+        let a = Sketch::Minimizer { w: 50 };
+        let b = Sketch::Minimizer { w: 20 };
+        assert!(a.require_compatible(&b, "test").is_err());
+    }
+
+    #[test]
+    fn test_unify_returns_shared_sketch_on_match() {
+        let a = Sketch::OpenSyncmer { s: 15 };
+        let b = Sketch::OpenSyncmer { s: 15 };
+        assert_eq!(Sketch::unify(&a, &b, "test").unwrap(), a);
+    }
+
+    #[test]
+    fn test_unify_rejects_mismatch() {
+        let a = Sketch::Minimizer { w: 50 };
+        let b = Sketch::Minimizer { w: 20 };
+        assert!(Sketch::unify(&a, &b, "test").is_err());
     }
 }

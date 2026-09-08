@@ -75,7 +75,8 @@ pub fn validate_single_bucket_index(bucket_names: &HashMap<u32, String>) -> Resu
 
 /// Validate that two indices are compatible for log-ratio computation.
 ///
-/// Checks that k, w, and salt match between the numerator and denominator indices.
+/// Checks that k, sketch scheme/params, and salt match between the
+/// numerator and denominator indices.
 pub fn validate_compatible_indices(a: &IndexMetadata, b: &IndexMetadata) -> Result<()> {
     if a.k != b.k {
         return Err(anyhow!(
@@ -85,14 +86,8 @@ pub fn validate_compatible_indices(a: &IndexMetadata, b: &IndexMetadata) -> Resu
             b.k
         ));
     }
-    if a.w != b.w {
-        return Err(anyhow!(
-            "Numerator and denominator indices have different w values: {} vs {}.\n\
-             Both indices must be built with the same k, w, and salt.",
-            a.w,
-            b.w
-        ));
-    }
+    a.sketch
+        .require_compatible(&b.sketch, "numerator vs denominator index")?;
     if a.salt != b.salt {
         return Err(anyhow!(
             "Numerator and denominator indices have different salt values: {:#x} vs {:#x}.\n\
@@ -167,8 +162,8 @@ pub fn partition_by_numerator_score(
 
 /// Validate that two sharded indices are compatible for log-ratio classification.
 ///
-/// Checks that both are single-bucket indices with matching k, w, and salt.
-/// Returns `(k, sketch, salt)` on success.
+/// Checks that both are single-bucket indices with matching k, sketch
+/// scheme/params, and salt. Returns `(k, sketch, salt)` on success.
 pub fn validate_log_ratio_indices(
     numerator: &ShardedInvertedIndex,
     denominator: &ShardedInvertedIndex,
@@ -189,14 +184,11 @@ pub fn validate_log_ratio_indices(
             denom_manifest.k
         ));
     }
-    if num_manifest.w != denom_manifest.w {
-        return Err(anyhow!(
-            "Numerator and denominator indices have different w values: {} vs {}.\n\
-             Both indices must be built with the same k, w, and salt.",
-            num_manifest.w,
-            denom_manifest.w
-        ));
-    }
+    let sketch = Sketch::unify(
+        &num_manifest.sketch,
+        &denom_manifest.sketch,
+        "numerator vs denominator index",
+    )?;
     if num_manifest.salt != denom_manifest.salt {
         return Err(anyhow!(
             "Numerator and denominator indices have different salt values: {:#x} vs {:#x}.\n\
@@ -206,7 +198,7 @@ pub fn validate_log_ratio_indices(
         ));
     }
 
-    Ok((num_manifest.k, num_manifest.sketch, num_manifest.salt))
+    Ok((num_manifest.k, sketch, num_manifest.salt))
 }
 
 /// Classify a batch of reads using log-ratio (numerator vs denominator).
@@ -526,7 +518,39 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("different w values"));
+            .contains("incompatible sketch"));
+    }
+
+    #[test]
+    fn test_validate_compatible_indices_fails_on_scheme_mismatch() {
+        let a = make_metadata(32, 10, 0x5555555555555555);
+        let b = IndexMetadata {
+            sketch: Sketch::OpenSyncmer { s: 8 },
+            ..make_metadata(32, 10, 0x5555555555555555)
+        };
+
+        let result = validate_compatible_indices(&a, &b);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible sketch"));
+    }
+
+    #[test]
+    fn test_validate_compatible_indices_fails_on_syncmer_different_s() {
+        // Both share the `w = 0` sentinel -- the exact case a `.w != .w`
+        // check alone would have silently accepted as compatible.
+        let a = IndexMetadata {
+            sketch: Sketch::OpenSyncmer { s: 15 },
+            ..make_metadata(64, 0, 0x5555555555555555)
+        };
+        let b = IndexMetadata {
+            sketch: Sketch::OpenSyncmer { s: 21 },
+            ..make_metadata(64, 0, 0x5555555555555555)
+        };
+
+        assert!(validate_compatible_indices(&a, &b).is_err());
     }
 
     #[test]

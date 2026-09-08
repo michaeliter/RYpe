@@ -180,7 +180,15 @@ impl InvertedIndex {
     }
 
     /// Validate that this inverted index matches the given metadata.
+    ///
+    /// `InvertedIndex` predates `Sketch` and carries no `sketch` field --
+    /// unlike `ShardManifest`/`IndexMetadata`, which already had one to
+    /// compare (a one-line fix, applied at `sharded.rs`'s counterpart of
+    /// this method). Adding a field here just to close this check would be
+    /// speculative: `validate_against_metadata` has zero callers (grepped),
+    /// so there is no live gap to close, dead or not.
     pub fn validate_against_metadata(&self, metadata: &IndexMetadata) -> Result<()> {
+        // scheme-blind: no `sketch` field on this struct, see doc comment above
         if self.k != metadata.k || self.w != metadata.w || self.salt != metadata.salt {
             return Err(RypeError::validation(format!(
                 "Inverted index parameters don't match source index.\n  \

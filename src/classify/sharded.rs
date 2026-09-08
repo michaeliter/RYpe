@@ -3,7 +3,7 @@
 //! These functions load one shard at a time to minimize memory usage when
 //! classifying against large indices that don't fit in memory.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use rayon::prelude::*;
 use std::borrow::Borrow;
 use std::collections::HashSet;
@@ -895,10 +895,35 @@ pub fn classify_with_sharded_negative(
 
     let negative = negative_index.unwrap();
     let manifest = positive_index.manifest();
+    let neg_manifest = negative.manifest();
+
+    // Validate positive/negative compatibility upfront: extraction below uses
+    // only the positive index's params, so a silent mismatch here would make
+    // negative filtering a no-op instead of failing loud (worst case for a
+    // contamination screen: two syncmer indices share the `w = 0` sentinel,
+    // so a bare `.w() != .w()` check would have missed a different `s`).
+    if manifest.k != neg_manifest.k {
+        return Err(anyhow!(
+            "k mismatch between positive and negative index: {} vs {}",
+            manifest.k,
+            neg_manifest.k
+        ));
+    }
+    let sketch = Sketch::unify(
+        &manifest.sketch,
+        &neg_manifest.sketch,
+        "positive vs negative index",
+    )?;
+    if manifest.salt != neg_manifest.salt {
+        return Err(anyhow!(
+            "salt mismatch between positive and negative index: {:#x} vs {:#x}",
+            manifest.salt,
+            neg_manifest.salt
+        ));
+    }
 
     // Step 1: Extract minimizers once (no negative filtering yet)
-    let extracted =
-        extract_batch_minimizers(manifest.k, manifest.sketch, manifest.salt, None, records);
+    let extracted = extract_batch_minimizers(manifest.k, sketch, manifest.salt, None, records);
 
     // Step 2: Build sorted unique minimizers for querying negative index
     let mut all_minimizers: Vec<u64> = extracted
@@ -1201,6 +1226,22 @@ mod tests {
         w: usize,
         salt: u64,
     ) -> ShardedInvertedIndex {
+        create_test_index_at_path_with_sketch(
+            path,
+            bucket_data,
+            k,
+            crate::Sketch::Minimizer { w },
+            salt,
+        )
+    }
+
+    fn create_test_index_at_path_with_sketch(
+        path: &std::path::Path,
+        bucket_data: Vec<(u32, &str, Vec<u64>)>,
+        k: usize,
+        sketch: crate::Sketch,
+        salt: u64,
+    ) -> ShardedInvertedIndex {
         let buckets: Vec<BucketData> = bucket_data
             .into_iter()
             .map(|(id, name, mins)| BucketData {
@@ -1212,17 +1253,8 @@ mod tests {
             .collect();
 
         let options = ParquetWriteOptions::default();
-        create_parquet_inverted_index(
-            path,
-            buckets,
-            k,
-            crate::Sketch::Minimizer { w },
-            salt,
-            None,
-            Some(&options),
-            None,
-        )
-        .unwrap();
+        create_parquet_inverted_index(path, buckets, k, sketch, salt, None, Some(&options), None)
+            .unwrap();
 
         ShardedInvertedIndex::open(path).unwrap()
     }
@@ -1242,6 +1274,169 @@ mod tests {
             results_standard.len(),
             results_sharded.len(),
             "Results should match when no negative index"
+        );
+    }
+
+    #[test]
+    fn test_classify_with_sharded_negative_rejects_scheme_mismatch() {
+        // The -N gap this function used to have: extraction only used the
+        // positive index's params, so a mismatched negative index was never
+        // checked at all. Two syncmer indices sharing the `w = 0` sentinel
+        // but different `s` is the case a bare `.w() != .w()` check (had one
+        // existed) would still have missed.
+        let dir = tempdir().unwrap();
+        let pos_path = dir.path().join("pos.ryxdi");
+        let neg_path = dir.path().join("neg.ryxdi");
+
+        let pos_index = create_test_index_at_path_with_sketch(
+            &pos_path,
+            vec![(1, "bucket1", vec![100, 200, 300])],
+            32,
+            crate::Sketch::OpenSyncmer { s: 15 },
+            0x12345,
+        );
+        let neg_index = create_test_index_at_path_with_sketch(
+            &neg_path,
+            vec![(1, "bucket1", vec![400, 500, 600])],
+            32,
+            crate::Sketch::OpenSyncmer { s: 21 },
+            0x12345,
+        );
+
+        let seq = generate_sequence(200, 0);
+        let records: Vec<QueryRecord> = vec![(1, seq.as_slice(), None)];
+
+        let result =
+            classify_with_sharded_negative(&pos_index, Some(&neg_index), &records, 0.1, None);
+        assert!(result.is_err(), "should reject mismatched sketch schemes");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("s=15") && err.contains("s=21"),
+            "error should name both s values: {err}"
+        );
+    }
+
+    /// The property that matters most: the syncmer scheme must actually
+    /// reach the query side. Forward- and minus-strand reads from the
+    /// index's own source sequence must score high; the same reads
+    /// extracted with the *wrong* scheme (minimizer) against that syncmer
+    /// index must collapse to near-zero.
+    #[test]
+    fn test_syncmer_index_classifies_both_strands_but_not_wrong_scheme() {
+        fn pseudo_random_seq(len: usize, seed: u64) -> Vec<u8> {
+            let bases = [b'A', b'C', b'G', b'T'];
+            let mut x = seed ^ 0x9E37_79B9_7F4A_7C15;
+            (0..len)
+                .map(|_| {
+                    x = crate::core::hash::mix64(x.wrapping_add(0x9E37_79B9_7F4A_7C15));
+                    bases[(x & 3) as usize]
+                })
+                .collect()
+        }
+
+        fn revcomp_bases(seq: &[u8]) -> Vec<u8> {
+            seq.iter()
+                .rev()
+                .map(|&b| match b {
+                    b'A' => b'T',
+                    b'T' => b'A',
+                    b'C' => b'G',
+                    b'G' => b'C',
+                    other => other,
+                })
+                .collect()
+        }
+
+        let dir = tempdir().unwrap();
+        let index_path = dir.path().join("sync.ryxdi");
+
+        let k = 32;
+        let s = 8;
+        let salt = 0x12345u64;
+        let source = pseudo_random_seq(2000, 42);
+
+        let mut ws = MinimizerWorkspace::new();
+        extract_into(&source, k, crate::Sketch::OpenSyncmer { s }, salt, &mut ws);
+        let mut mins: Vec<u64> = ws.buffer.drain(..).collect();
+        mins.sort();
+        mins.dedup();
+        assert!(!mins.is_empty(), "test fixture should select some syncmers");
+
+        let index = create_test_index_at_path_with_sketch(
+            &index_path,
+            vec![(1, "bucket1", mins)],
+            k,
+            crate::Sketch::OpenSyncmer { s },
+            salt,
+        );
+
+        // Forward-strand read: a substring of the source sequence.
+        let fwd_read = source[500..700].to_vec();
+        let records: Vec<QueryRecord> = vec![(1, fwd_read.as_slice(), None)];
+        let results = classify_batch_sharded_merge_join(&index, None, &records, 0.0, None).unwrap();
+        assert!(!results.is_empty(), "forward-strand read should hit");
+        assert!(
+            results[0].score > 0.8,
+            "forward-strand score should be high, got {}",
+            results[0].score
+        );
+
+        // Minus-strand read: reverse-complement of the same substring -- the
+        // Phase 2 rc-rule hazard at the integration level. If the rc mirror
+        // target/tie-break were wrong, minus-strand reads would lose their
+        // syncmers against a forward-built index.
+        let rc_read = revcomp_bases(&fwd_read);
+        let records: Vec<QueryRecord> = vec![(2, rc_read.as_slice(), None)];
+        let results = classify_batch_sharded_merge_join(&index, None, &records, 0.0, None).unwrap();
+        assert!(!results.is_empty(), "minus-strand read should hit");
+        assert!(
+            results[0].score > 0.8,
+            "minus-strand score should be high, got {}",
+            results[0].score
+        );
+
+        // Positive control: classify_from_extracted_minimizers itself must
+        // score high when the extraction DOES match the index's scheme --
+        // this rules out "empty/near-zero because the function is broken"
+        // as an explanation for the wrong-scheme result below, since that
+        // result is read through this same function, not the merge-join
+        // path exercised above.
+        let right_scheme_extracted = extract_batch_minimizers(
+            k,
+            crate::Sketch::OpenSyncmer { s },
+            salt,
+            None,
+            &[(1, fwd_read.as_slice(), None)],
+        );
+        let control_results =
+            classify_from_extracted_minimizers(&index, &right_scheme_extracted, &[1], 0.0, None)
+                .unwrap();
+        assert!(
+            !control_results.is_empty() && control_results[0].score > 0.8,
+            "sanity check: classify_from_extracted_minimizers should score \
+             high when extraction matches the index's scheme, got {:?}",
+            control_results.first()
+        );
+
+        // Wrong scheme: extract the same read with the MINIMIZER scheme
+        // instead, and classify those minimizers directly against the
+        // syncmer index (bypassing the manifest, which would otherwise
+        // auto-select the right scheme for every normal call path).
+        let wrong_scheme_extracted = extract_batch_minimizers(
+            k,
+            crate::Sketch::Minimizer { w: 10 },
+            salt,
+            None,
+            &[(1, fwd_read.as_slice(), None)],
+        );
+        let results =
+            classify_from_extracted_minimizers(&index, &wrong_scheme_extracted, &[1], 0.0, None)
+                .unwrap();
+        let wrong_scheme_score = results.first().map(|r| r.score).unwrap_or(0.0);
+        assert!(
+            wrong_scheme_score < 0.1,
+            "minimizer extraction against a syncmer index should collapse to \
+             near-zero, got {wrong_scheme_score}"
         );
     }
 

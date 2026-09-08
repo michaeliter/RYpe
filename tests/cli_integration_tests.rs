@@ -663,6 +663,189 @@ fn test_cli_minimizer_manifest_omits_scheme_keys() -> Result<()> {
     Ok(())
 }
 
+/// Phase 6 exit criterion: every operation that combines two indices must
+/// fail loud on a scheme mismatch, naming both schemes in the error -- not
+/// just silently score garbage. Table-driven over the operations, rather
+/// than one test per operation, so the property ("scheme mismatch is
+/// checked here") is asserted uniformly instead of per-op ad hoc.
+///
+/// k and salt are held identical between the two fixtures so a failure can
+/// only be attributed to the scheme mismatch, not an unrelated k/salt gate
+/// firing first.
+#[test]
+fn test_cli_cross_scheme_operations_fail_loud() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let min_path = dir.path().join("min.ryxdi");
+    let sync_path = dir.path().join("sync.ryxdi");
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            min_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Minimizer index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "create",
+            "-o",
+            sync_path.to_str().unwrap(),
+            "-r",
+            phix_path.to_str().unwrap(),
+            "-k",
+            "32",
+            "-S",
+            "8",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Syncmer index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let query_path = dir.path().join("query.fastq");
+    fs::write(
+        &query_path,
+        "@query1\nGAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAAATTATCTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )?;
+
+    let config_path = dir.path().join("subtract_config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[index]
+k = 32
+window = 10
+salt = 0x5555555555555555
+output = "from_config_out.ryxdi"
+
+[buckets.TestBucket]
+files = ["{}"]
+"#,
+            phix_path.to_str().unwrap()
+        ),
+    )?;
+
+    struct Op<'a> {
+        name: &'a str,
+        args: Vec<String>,
+    }
+    let out = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+    let ops = [
+        Op {
+            name: "merge",
+            args: vec![
+                "index".into(),
+                "merge".into(),
+                "--index-primary".into(),
+                min_path.to_str().unwrap().into(),
+                "--index-secondary".into(),
+                sync_path.to_str().unwrap().into(),
+                "-o".into(),
+                out("merged1.ryxdi"),
+            ],
+        },
+        Op {
+            name: "merge --subtract-from-primary",
+            args: vec![
+                "index".into(),
+                "merge".into(),
+                "--index-primary".into(),
+                min_path.to_str().unwrap().into(),
+                "--index-secondary".into(),
+                sync_path.to_str().unwrap().into(),
+                "-o".into(),
+                out("merged2.ryxdi"),
+                "--subtract-from-primary".into(),
+            ],
+        },
+        Op {
+            name: "from-config --subtract-from",
+            args: vec![
+                "index".into(),
+                "from-config".into(),
+                "-c".into(),
+                config_path.to_str().unwrap().into(),
+                "--subtract-from".into(),
+                sync_path.to_str().unwrap().into(),
+            ],
+        },
+        Op {
+            name: "classify run -N",
+            args: vec![
+                "classify".into(),
+                "run".into(),
+                "-i".into(),
+                min_path.to_str().unwrap().into(),
+                "-N".into(),
+                sync_path.to_str().unwrap().into(),
+                "-1".into(),
+                query_path.to_str().unwrap().into(),
+                "-t".into(),
+                "0.0".into(),
+            ],
+        },
+        Op {
+            name: "classify log-ratio",
+            args: vec![
+                "classify".into(),
+                "log-ratio".into(),
+                "-n".into(),
+                min_path.to_str().unwrap().into(),
+                "-d".into(),
+                sync_path.to_str().unwrap().into(),
+                "-1".into(),
+                query_path.to_str().unwrap().into(),
+                "-o".into(),
+                out("logratio.tsv"),
+            ],
+        },
+    ];
+
+    for op in &ops {
+        let output = Command::new(&binary).args(&op.args).output()?;
+        assert!(
+            !output.status.success(),
+            "'{}' should fail on scheme mismatch but succeeded",
+            op.name
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("minimizer") && stderr.contains("open-syncmer"),
+            "'{}' error should name both schemes, got: {}",
+            op.name,
+            stderr
+        );
+    }
+
+    Ok(())
+}
+
 /// Test index stats command
 #[test]
 fn test_cli_index_stats() -> Result<()> {

@@ -63,13 +63,7 @@ fn validate_subtraction_compatibility(
             subtract_index.k()
         ));
     }
-    if subtract_index.sketch() != sketch {
-        return Err(anyhow!(
-            "sketch mismatch: config has {}, subtraction index has {}",
-            sketch,
-            subtract_index.sketch()
-        ));
-    }
+    sketch.require_compatible(&subtract_index.sketch(), "config vs subtraction index")?;
     if subtract_index.salt() != salt {
         return Err(anyhow!(
             "salt mismatch: config has salt={:#x}, subtraction index has salt={:#x}",

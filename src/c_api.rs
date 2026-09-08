@@ -2575,20 +2575,19 @@ mod arrow_ffi {
         if let Some(ref neg_send) = neg_set_send {
             let pos_manifest = unsafe { &*index_ptr }.0.manifest();
             let neg_manifest = unsafe { &neg_send.get().index }.manifest();
-            if pos_manifest.k != neg_manifest.k
-                || pos_manifest.w != neg_manifest.w
-                || pos_manifest.salt != neg_manifest.salt
-            {
+            if pos_manifest.k != neg_manifest.k || pos_manifest.salt != neg_manifest.salt {
                 set_last_error(format!(
-                    "Negative index parameters (k={}, w={}, salt=0x{:x}) do not match \
-                     positive index (k={}, w={}, salt=0x{:x})",
-                    neg_manifest.k,
-                    neg_manifest.w,
-                    neg_manifest.salt,
-                    pos_manifest.k,
-                    pos_manifest.w,
-                    pos_manifest.salt,
+                    "Negative index parameters (k={}, salt=0x{:x}) do not match \
+                     positive index (k={}, salt=0x{:x})",
+                    neg_manifest.k, neg_manifest.salt, pos_manifest.k, pos_manifest.salt,
                 ));
+                return -1;
+            }
+            if let Err(e) = pos_manifest
+                .sketch
+                .require_compatible(&neg_manifest.sketch, "positive vs negative index")
+            {
+                set_last_error(e.to_string());
                 return -1;
             }
         }
