@@ -6974,3 +6974,116 @@ fn test_negative_index_run_reports_nonzero_passes() -> Result<()> {
 
     Ok(())
 }
+
+// =============================================================================
+// Regression tests: the no-rebuild guarantee against real, large-scale
+// pre-existing indices.
+//
+// These indices predate the `Sketch` refactor entirely: their manifests carry
+// no `scheme`/`s` keys at all (format_version 1). They exercise the exact
+// hazard the refactor was designed to avoid -- that adding scheme-awareness to
+// every `manifest.w` call site could silently break loading or classifying an
+// index nobody has rebuilt. Both fixtures documented in CLAUDE.md's
+// "Local-Only Performance Test Data" section are covered here --
+// `n100-w200.ryxdi` (160-bucket) and `n97-w50.ryxdi` (97-bucket, ~18GB) --
+// since different contributors have whichever one they happened to build
+// locally, and covering both means the test gives real coverage from
+// whichever fixture is present instead of silently skipping for anyone who
+// only has the other (see `src/commands/helpers/batch_config.rs`'s
+// `#[ignore]`d tests for the pattern this follows). Both are `#[ignore]`d
+// because this data is local-only (not in git).
+//
+// Run with: cargo test --test cli_integration_tests -- --ignored --nocapture
+// =============================================================================
+
+/// Regression: a real pre-existing minimizer index (built before `Sketch`
+/// existed) must still report itself as "minimizer" via `index stats`, and
+/// must still classify real reads end-to-end producing actual matches --
+/// not silently degrade to an empty or misinterpreted result under the new
+/// scheme-aware code paths.
+///
+/// `query_path` must be chosen per-fixture: a read shorter than `k + w - 1`
+/// cannot fill even one full minimizer window, so it selects zero
+/// minimizers regardless of correctness (`n100-w200.ryxdi`'s `w=200` needs
+/// reads >= 263bp, ruling out the 151bp short-read fixture -- this is a
+/// query/index length mismatch, not a scheme bug, and was confirmed by
+/// direct measurement before picking `long_read.parquet` here).
+fn check_real_index_no_rebuild_guarantee(index_path: &Path, query_path: &Path) {
+    if !index_path.exists() || !query_path.exists() {
+        eprintln!(
+            "Skipping: perf-assessment data not available at {}",
+            index_path.display()
+        );
+        return;
+    }
+
+    let binary = get_binary_path();
+
+    let stats_output = Command::new(&binary)
+        .args(["index", "stats", "-i", index_path.to_str().unwrap()])
+        .output()
+        .expect("failed to run index stats");
+    assert!(
+        stats_output.status.success(),
+        "{}: index stats failed: {}",
+        index_path.display(),
+        String::from_utf8_lossy(&stats_output.stderr)
+    );
+    let stats_stdout = String::from_utf8_lossy(&stats_output.stdout);
+    assert!(
+        stats_stdout.contains("minimizer") && !stats_stdout.contains("open-syncmer"),
+        "{}: pre-existing index with no scheme key must load as minimizer, got:\n{}",
+        index_path.display(),
+        stats_stdout
+    );
+
+    let dir = tempdir().expect("failed to create tempdir");
+    let out_path = dir.path().join("classify_out.tsv");
+    let classify_output = Command::new(&binary)
+        .args([
+            "classify",
+            "run",
+            "-i",
+            index_path.to_str().unwrap(),
+            "-1",
+            query_path.to_str().unwrap(),
+            "-o",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run classify");
+    assert!(
+        classify_output.status.success(),
+        "{}: classify run failed: {}",
+        index_path.display(),
+        String::from_utf8_lossy(&classify_output.stderr)
+    );
+
+    let result_contents = fs::read_to_string(&out_path).expect("failed to read classify output");
+    let num_lines = result_contents.lines().count();
+    assert!(
+        num_lines > 1,
+        "{}: classify run against a real pre-existing index produced no matches \
+         (only the header line) -- the scheme-aware extraction path may have \
+         silently broken query-side sketching for this index",
+        index_path.display()
+    );
+}
+
+#[test]
+#[ignore]
+fn test_real_index_no_rebuild_guarantee_n100_w200() {
+    check_real_index_no_rebuild_guarantee(
+        Path::new("perf-assessment/parquet-index/n100-w200.ryxdi"),
+        Path::new("perf-assessment/query-files/long_read.parquet"),
+    );
+}
+
+#[test]
+#[ignore]
+fn test_real_index_no_rebuild_guarantee_n97_w50() {
+    check_real_index_no_rebuild_guarantee(
+        Path::new("perf-assessment/parquet-index/n97-w50.ryxdi"),
+        Path::new("perf-assessment/query-files/short_read_R1.fastq.gz"),
+    );
+}

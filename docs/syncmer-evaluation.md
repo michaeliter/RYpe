@@ -329,6 +329,62 @@ the plan's hypothesis and does not change the verdict.
 shards/160 buckets, not "8 shards" as stated in `CLAUDE.md` — worth a doc fix, unrelated to this
 evaluation.)*
 
+## Finding 7: measured, post-implementation — the real win is short-read robustness at low density, not raw speed
+
+Open-syncmer sketching has since been implemented in production (`src/core/sketch.rs`,
+`Sketch::OpenSyncmer`). Two real measurements below replace the offline harness projections above
+with actual `rype index`/`rype classify` runs, `gtime -v` for wall time and peak RSS throughout.
+
+**Density-matched build, small scale (300 WoL2 genomes, `k=64`, `salt=0x5555555555555555`,
+`perf-assessment/config/n300-w50.toml` / `n300-s40.toml`):** `w=50` (density `2/51=0.0392`) vs.
+`s=40` (density `1/25=0.04`, chosen as the nearest round `s` to the density-matching solution
+`k-s+1=(w+1)/2`). Build: minimizer 5.21s / 2.19GB peak RSS vs. syncmer 5.32s / 2.15GB — statistically
+indistinguishable. Index size: minimizer 169MB (36.85M minimizers) vs. syncmer 178MB (35.60M
+minimizers) — **syncmer is ~5% *larger* despite 3.4% fewer entries** (worse bytes/entry: 4.6 vs. 5.24),
+confirming Finding 3's prediction that the density-matched point is a wash or slight loss, not a win.
+Classify (`short_read_R1.fastq.gz`, 1.7M reads): 3.56s/3.46GB vs. 3.86s/3.56GB — again indistinguishable;
+at this scale, query-file parsing dominates wall time far more than shard size does.
+
+**Full-scale accuracy/speed sweep (T2T-CHM13 as the reference, HG00133 haplotype-2 simulated reads
+as query — a different individual, so this measures genuine cross-individual recall, not
+self-consistency):** 10.03M paired 150bp short reads and 183k long reads (7.5–21kb, PacBio HiFi-like)
+classified against single-bucket T2T indices swept across minimizer `w ∈ {20,50,100,200}` and
+syncmer `s ∈ {54,44,35,25,15,8}` (`s=8` trips the tie-bias warning from Finding-adjacent
+`Sketch::validate`, recommending `s=15`):
+
+| scheme | param | density | index size | short-read recall (n=10.03M) | long-read recall (n=183k) |
+|---|---|---|---|---|---|
+| minimizer | w=20 | 0.0952 | 1.06GB | 99.88% | 99.97% |
+| minimizer | w=50 | 0.0392 | 475MB | 99.59% | 99.97% |
+| minimizer | w=100 | 0.0198 | 262MB | **0%** | 99.96% |
+| minimizer | w=200 | 0.00995 | 136MB | **0%** | 99.94% |
+| syncmer | s=54 | 0.0909 | 1.07GB | 99.93% | 99.98% |
+| syncmer | s=44 | 0.0476 | 570MB | 99.93% | 99.98% |
+| syncmer | s=35 | 0.0333 | 404MB | 99.87% | 99.98% |
+| syncmer | s=25 | 0.0250 | 308MB | 99.75% | 99.98% |
+| syncmer | s=15 | 0.0200 | 247MB | 99.50% | 99.98% |
+| syncmer | s=8 | 0.0175 | 215MB | 99.12% | 99.98% |
+
+**This is the real, load-bearing finding, and it's structural rather than a matter of degree.**
+Minimizer recall does not degrade gradually with `w` — it is flat, then **falls to exactly 0%** once
+`w` exceeds the read's available k-mer count (`read_len - k + 1 = 87` for a 150bp read at `k=64`):
+below that wall every read still gets scored; above it, not a single one can produce even one
+minimizer, because no window is ever full. Syncmer cannot hit this wall for realistic short reads at
+all: its effective window is `k-s+1`, which is bounded above by `k` itself (64 here) regardless of
+how low `s` goes, so it degrades smoothly instead (99.93% → 99.12% across the full sweep) and never
+goes dark. At the closest density match available in this sweep (`w=100` ≈ 0.0198 vs. `s=15` ≈
+0.0200, index sizes within 6% of each other), **syncmer gets 99.50% short-read recall where minimizer
+gets 0%.** Long-read recall is ≥99.94% everywhere for both schemes — 7.5–21kb reads dwarf every
+window size tested, so density only trades off size/speed there, never accuracy.
+
+**Speed/memory did not differ as much as the offline projection implied**, and the reason is
+visible directly in these numbers: classify peak RSS (6.4–17.5GB, query-batch-dominated) and wall
+time (21–37s) are governed overwhelmingly by parsing and buffering the multi-GB query file, not by
+which scheme built the multi-hundred-MB-to-1GB index — consistent with Finding 5 (selection
+throughput was never the bottleneck) and Finding 6 (I/O pruning was already saturated regardless of
+scheme). The size and short-read-robustness wins are real and measured; a large wall-clock/RSS win
+was never actually predicted by Findings 5/6 and did not materialize here either.
+
 ## What a "go" would cost (scoping only — not implemented here)
 
 Carried from the approved plan, unchanged:

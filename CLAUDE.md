@@ -93,7 +93,7 @@ cargo test -- --nocapture    # show output
   - `long_read.fastq.gz` — long reads (~2.2GB)
   - Parquet-converted versions also present (`*.parquet`)
 - **Pre-built indices**:
-  - `perf-assessment/parquet-index/n100-w200.ryxdi/` — 160-bucket index (k=64, w=200, 8 shards, ~486M minimizers)
+  - `perf-assessment/parquet-index/n100-w200.ryxdi/` — 160-bucket index (k=64, w=200, 160 shards, ~523M minimizers)
   - `perf-assessment/parquet-index/n97-w50.ryxdi/` — 97-bucket index (k=64, w=50, 11 shards, ~10.5B minimizers, ~18GB, `has_overlapping_shards = true`)
   - `perf-assessment/config/numerator-w200.ryxdi/` — single-bucket (8000 genomes, buckets 1–80, 267M minimizers)
   - `perf-assessment/config/denominator-w200.ryxdi/` — single-bucket (7952 genomes, buckets 81–160, 216M minimizers)

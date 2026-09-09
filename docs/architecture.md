@@ -21,7 +21,7 @@ The tradeoff is reduced specificity per k-mer. We compensate with longer k (defa
 
 A sliding window of size `w` over k-mers selects the minimum hash per window as the representative, with consecutive duplicates collapsed. Implemented with a monotonic deque for O(n) extraction.
 
-This reduces the index size from ~|sequence| to ~|sequence|/w entries while preserving the property that homologous regions share minimizers with high probability. Typical `w` is 50–200.
+This reduces the index size from ~|sequence| entries to a density of `2/(w+1)` selected per base while preserving the property that homologous regions share minimizers with high probability. Typical `w` is 50–200.
 
 ## Why Parquet for indices
 
