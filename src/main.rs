@@ -101,18 +101,15 @@ fn main() -> Result<()> {
                 let manifest = sharded.manifest();
 
                 println!("Index Stats for {:?}", index);
-                println!(
-                    "  Scheme: {}",
-                    match manifest.sketch {
-                        rype::Sketch::Minimizer { .. } => "minimizer",
-                        rype::Sketch::OpenSyncmer { .. } => "open-syncmer",
+                let (scheme_name, param_line) = match manifest.sketch {
+                    rype::Sketch::Minimizer { w } => ("minimizer", format!("  Window (w): {w}")),
+                    rype::Sketch::OpenSyncmer { s } => {
+                        ("open-syncmer", format!("  s-mer size (s): {s}"))
                     }
-                );
+                };
+                println!("  Scheme: {scheme_name}");
                 println!("  K: {}", manifest.k);
-                match manifest.sketch {
-                    rype::Sketch::Minimizer { w } => println!("  Window (w): {}", w),
-                    rype::Sketch::OpenSyncmer { s } => println!("  s-mer size (s): {}", s),
-                }
+                println!("{param_line}");
                 println!("  Format version: {}", manifest.format_version);
                 println!("  Salt: 0x{:x}", manifest.salt);
                 println!("  Buckets: {}", manifest.bucket_names.len());
