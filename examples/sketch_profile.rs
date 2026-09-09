@@ -108,6 +108,7 @@ enum Arm {
     MinLex,
     MinHash,
     SyncOpen { s: usize },
+    SyncOpenLex { s: usize },
     SyncClosed { s: usize },
     FracMin { density: f64 },
 }
@@ -210,8 +211,19 @@ fn windowed_min_select<F: Fn(u64) -> u64>(
 /// Syncmer selector: for each k-mer, find the argmin of its `k-s+1` contained
 /// s-mers (via the same monotonic-deque pattern, applied at s-mer
 /// granularity) and select the k-mer iff that argmin lands at the target
-/// offset (open) or either end (closed).
-fn syncmer_select(seq: &[u8], k: usize, s: usize, salt: u64, kind: SyncmerKind) -> Vec<u64> {
+/// offset (open) or either end (closed). `mix` computes the s-mer ordering
+/// key from `smer ^ salt` -- `mix64` for the production scheme, `|x| x` for
+/// the `sync-*-lex` control arms that ask whether syncmers need real hashing
+/// at all (mirrors `windowed_min_select`'s `mix` parameter and Finding 1's
+/// min-lex-vs-min-hash comparison, but for syncmers instead of minimizers).
+fn syncmer_select<F: Fn(u64) -> u64>(
+    seq: &[u8],
+    k: usize,
+    s: usize,
+    salt: u64,
+    kind: SyncmerKind,
+    mix: F,
+) -> Vec<u64> {
     assert!(
         s >= 1 && s < k,
         "s must satisfy 1 <= s < k, got s={s} k={k}"
@@ -246,7 +258,7 @@ fn syncmer_select(seq: &[u8], k: usize, s: usize, salt: u64, kind: SyncmerKind) 
 
         if valid_bases_count >= s {
             let s_pos = i + 1 - s;
-            let key = mix64(current_val_s ^ salt);
+            let key = mix(current_val_s ^ salt);
             while let Some(&(p, _)) = dq.front() {
                 if p + win <= s_pos {
                     dq.pop_front();
@@ -319,9 +331,12 @@ fn run_arm(seq: &[u8], k: usize, w: usize, salt: u64, arm: Arm) -> Vec<u64> {
         Arm::MinLex => windowed_min_select(seq, k, w, salt, |x| x),
         Arm::MinHash => windowed_min_select(seq, k, w, salt, mix64),
         Arm::SyncOpen { s } => {
-            syncmer_select(seq, k, s, salt, SyncmerKind::Open(open_target(k, s)))
+            syncmer_select(seq, k, s, salt, SyncmerKind::Open(open_target(k, s)), mix64)
         }
-        Arm::SyncClosed { s } => syncmer_select(seq, k, s, salt, SyncmerKind::Closed),
+        Arm::SyncOpenLex { s } => {
+            syncmer_select(seq, k, s, salt, SyncmerKind::Open(open_target(k, s)), |x| x)
+        }
+        Arm::SyncClosed { s } => syncmer_select(seq, k, s, salt, SyncmerKind::Closed, mix64),
         Arm::FracMin { density } => {
             let threshold = (density.clamp(0.0, 1.0) * u64::MAX as f64) as u64;
             fracmin_select(seq, k, salt, threshold)
@@ -359,6 +374,7 @@ fn arm_set_for(k: usize, w: usize) -> Vec<(String, Arm)> {
     s_values.dedup();
     for &s in &s_values {
         arms.push((format!("sync-open-s{s}"), Arm::SyncOpen { s }));
+        arms.push((format!("sync-open-lex-s{s}"), Arm::SyncOpenLex { s }));
         arms.push((format!("sync-closed-s{s}"), Arm::SyncClosed { s }));
     }
 
@@ -614,7 +630,14 @@ fn self_test() {
     );
 
     let s = 15usize;
-    let so = syncmer_select(&seq, k, s, salt, SyncmerKind::Open(open_target(k, s)));
+    let so = syncmer_select(
+        &seq,
+        k,
+        s,
+        salt,
+        SyncmerKind::Open(open_target(k, s)),
+        mix64,
+    );
     check_close(
         "sync-open(s=15) density",
         dens(so.len()),
@@ -622,12 +645,29 @@ fn self_test() {
         0.15,
     );
 
-    let sc = syncmer_select(&seq, k, s, salt, SyncmerKind::Closed);
+    let sc = syncmer_select(&seq, k, s, salt, SyncmerKind::Closed, mix64);
     check_close(
         "sync-closed(s=15) density",
         dens(sc.len()),
         2.0 / (k - s + 1) as f64,
         0.15,
+    );
+
+    // sync-open-lex density is deliberately NOT hard-asserted, same rationale
+    // as min-lex above: whether lex ordering's structure skews density away
+    // from the theoretical law is itself part of what this arm measures.
+    let sol = syncmer_select(
+        &seq,
+        k,
+        s,
+        salt,
+        SyncmerKind::Open(open_target(k, s)),
+        |x| x,
+    );
+    eprintln!(
+        "[self-test] sync-open-lex(s=15) density (unasserted, informational): {:.5} (theory {:.5})",
+        dens(sol.len()),
+        1.0 / (k - s + 1) as f64
     );
 
     let target = 0.05;

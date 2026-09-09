@@ -450,6 +450,27 @@ fn extract_into_minimizer(seq: &[u8], k: usize, w: usize, salt: u64, ws: &mut Mi
 /// and no value-based dedup: syncmer selection is position-local, so each
 /// k-mer position is visited exactly once.
 fn extract_into_syncmer(seq: &[u8], k: usize, s: usize, salt: u64, ws: &mut MinimizerWorkspace) {
+    extract_into_syncmer_ordered(seq, k, s, salt, ws, mix64)
+}
+
+/// Generalizes `extract_into_syncmer` over the s-mer ordering function.
+/// The production path (`extract_into_syncmer`) always orders by `mix64`;
+/// `extract_into_syncmer_lex` (test-only, below) orders by raw XOR instead,
+/// to check whether syncmer's context-independent conservation survives
+/// dropping the hash -- an offline harness check
+/// (`examples/sketch_profile.rs`'s `sync-open-lex` arm, see
+/// `docs/syncmer-evaluation.md` Finding 7) already found no measurable
+/// conservation difference on two real genome corpora; this real-data test
+/// confirms it holds for the production dual-strand/RC-mirroring path too,
+/// which the harness's single-strand-only design can't exercise.
+fn extract_into_syncmer_ordered<F: Fn(u64) -> u64>(
+    seq: &[u8],
+    k: usize,
+    s: usize,
+    salt: u64,
+    ws: &mut MinimizerWorkspace,
+    order: F,
+) {
     debug_assert!(s > 0 && s < k, "syncmer s-mer size must satisfy 0 < s < k");
     ws.buffer.clear();
     ws.q_fwd.clear();
@@ -485,7 +506,7 @@ fn extract_into_syncmer(seq: &[u8], k: usize, s: usize, salt: u64, ws: &mut Mini
 
         if valid_bases_count >= s {
             let s_pos = i + 1 - s;
-            let key = mix64(current_val_s ^ salt);
+            let key = order(current_val_s ^ salt);
 
             while let Some(&(p, _)) = ws.q_fwd.front() {
                 if p + win <= s_pos {
@@ -513,6 +534,19 @@ fn extract_into_syncmer(seq: &[u8], k: usize, s: usize, salt: u64, ws: &mut Mini
             }
         }
     }
+}
+
+/// Test-only: `extract_into_syncmer` with raw-XOR (lex) s-mer ordering
+/// instead of `mix64`. See `extract_into_syncmer_ordered`'s doc comment.
+#[cfg(test)]
+fn extract_into_syncmer_lex(
+    seq: &[u8],
+    k: usize,
+    s: usize,
+    salt: u64,
+    ws: &mut MinimizerWorkspace,
+) {
+    extract_into_syncmer_ordered(seq, k, s, salt, ws, |x| x)
 }
 
 /// Extract minimizers from both strands of a sequence.
@@ -679,6 +713,23 @@ fn extract_dual_strand_into_syncmer(
     salt: u64,
     ws: &mut MinimizerWorkspace,
 ) -> (Vec<u64>, Vec<u64>) {
+    extract_dual_strand_into_syncmer_ordered(seq, k, s, salt, ws, mix64)
+}
+
+/// Generalizes `extract_dual_strand_into_syncmer` over the s-mer ordering
+/// function. See `extract_into_syncmer_ordered`'s doc comment for why this
+/// exists; `extract_dual_strand_into_syncmer_lex` (test-only, below) is the
+/// dual-strand counterpart used to validate lex ordering against real reads,
+/// since real reads need the actual RC-mirroring logic this function
+/// implements, not the harness's single-strand-only reimplementation.
+fn extract_dual_strand_into_syncmer_ordered<F: Fn(u64) -> u64>(
+    seq: &[u8],
+    k: usize,
+    s: usize,
+    salt: u64,
+    ws: &mut MinimizerWorkspace,
+    order: F,
+) -> (Vec<u64>, Vec<u64>) {
     debug_assert!(s > 0 && s < k, "syncmer s-mer size must satisfy 0 < s < k");
     ws.q_fwd.clear();
     ws.q_rc.clear();
@@ -727,7 +778,7 @@ fn extract_dual_strand_into_syncmer(
         if valid_bases_count >= s {
             let s_pos = i + 1 - s;
 
-            let key_fwd = mix64(current_val_s ^ salt);
+            let key_fwd = order(current_val_s ^ salt);
             while let Some(&(p, _)) = ws.q_fwd.front() {
                 if p + win <= s_pos {
                     ws.q_fwd.pop_front();
@@ -744,7 +795,7 @@ fn extract_dual_strand_into_syncmer(
             }
             ws.q_fwd.push_back((s_pos, key_fwd));
 
-            let key_rc = mix64(current_val_s_rc ^ salt);
+            let key_rc = order(current_val_s_rc ^ salt);
             while let Some(&(p, _)) = ws.q_rc.front() {
                 if p + win <= s_pos {
                     ws.q_rc.pop_front();
@@ -777,6 +828,20 @@ fn extract_dual_strand_into_syncmer(
         }
     }
     (fwd_mins, rc_mins)
+}
+
+/// Test-only: `extract_dual_strand_into_syncmer` with raw-XOR (lex) s-mer
+/// ordering instead of `mix64`. See `extract_dual_strand_into_syncmer_ordered`'s
+/// doc comment.
+#[cfg(test)]
+fn extract_dual_strand_into_syncmer_lex(
+    seq: &[u8],
+    k: usize,
+    s: usize,
+    salt: u64,
+    ws: &mut MinimizerWorkspace,
+) -> (Vec<u64>, Vec<u64>) {
+    extract_dual_strand_into_syncmer_ordered(seq, k, s, salt, ws, |x| x)
 }
 
 /// Extract minimizers from paired-end reads.
@@ -1580,6 +1645,19 @@ mod tests {
             s: usize,
             salt: u64,
         ) -> (Vec<u64>, Vec<u64>) {
+            oracle_extract_syncmer_ordered(seq, k, s, salt, mix64)
+        }
+
+        /// Generalizes `oracle_extract_syncmer` over the s-mer ordering
+        /// function, so the same oracle backs both the production `mix64`
+        /// gate and the lex-ordering gate below.
+        fn oracle_extract_syncmer_ordered<F: Fn(u64) -> u64>(
+            seq: &[u8],
+            k: usize,
+            s: usize,
+            salt: u64,
+            order: F,
+        ) -> (Vec<u64>, Vec<u64>) {
             let len = seq.len();
             let mut fwd = Vec::new();
             let mut rc = Vec::new();
@@ -1594,9 +1672,9 @@ mod tests {
                 // Forward: ties keep the rightmost (highest-offset) s-mer,
                 // matching the `>=` pop-back rule.
                 let mut best_off = 0usize;
-                let mut best_key = mix64(window_fwd(seq, kmer_pos, s) ^ salt);
+                let mut best_key = order(window_fwd(seq, kmer_pos, s) ^ salt);
                 for j in 1..win {
-                    let key = mix64(window_fwd(seq, kmer_pos + j, s) ^ salt);
+                    let key = order(window_fwd(seq, kmer_pos + j, s) ^ salt);
                     if key <= best_key {
                         best_key = key;
                         best_off = j;
@@ -1609,9 +1687,9 @@ mod tests {
                 // RC: ties keep the leftmost (lowest-offset) s-mer, matching
                 // the strict `>` pop-back rule.
                 let mut best_off_rc = 0usize;
-                let mut best_key_rc = mix64(window_rc(seq, kmer_pos, s) ^ salt);
+                let mut best_key_rc = order(window_rc(seq, kmer_pos, s) ^ salt);
                 for j in 1..win {
-                    let key = mix64(window_rc(seq, kmer_pos + j, s) ^ salt);
+                    let key = order(window_rc(seq, kmer_pos + j, s) ^ salt);
                     if key < best_key_rc {
                         best_key_rc = key;
                         best_off_rc = j;
@@ -1722,6 +1800,93 @@ mod tests {
                     assert_eq!(
                         rc_channel, forward_on_revcomp,
                         "rc mismatch for k={} s={} seed={}",
+                        k, s, seed
+                    );
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Lex-ordering variant (raw XOR instead of `mix64` for the s-mer
+        // ordering key). Test-only: exists to check whether syncmer's
+        // conservation survives dropping the hash, per the offline harness
+        // finding (`docs/syncmer-evaluation.md` Finding 7) that motivated
+        // this. These two tests are the same gates as the `mix64` tests
+        // above, applied to the lex variant -- the oracle and RC-mirroring
+        // derivation are ordering-agnostic (they never depend on *which*
+        // total order `order` computes, only that ties are broken
+        // consistently), so both must still hold bit-for-bit.
+        // ---------------------------------------------------------------
+
+        #[test]
+        fn test_syncmer_lex_oracle_matches_rolling_implementation() {
+            let mut ws = MinimizerWorkspace::new();
+            let cases: Vec<(Vec<u8>, usize, usize, u64)> = vec![
+                (
+                    b"ACGTAGCTTGACCGTAAGCTTGGACCTAGGTCAAGCTTAGGCATCGTAGCTAGCATGCTAGCTAGCATCGATCG"
+                        .to_vec(),
+                    32,
+                    15,
+                    0,
+                ),
+                (b"ACGTAGCTTGACCGTAAGCTTGGACCTA".to_vec(), 16, 5, 12345),
+                (pseudo_random_seq(500, 1), 64, 15, 0xDEAD_BEEF),
+                (pseudo_random_seq(500, 2), 64, 44, 0),
+                (pseudo_random_seq(500, 3), 64, 54, 42),
+                (pseudo_random_seq(200, 4), 16, 7, 0),
+            ];
+            for (seq, k, s, salt) in cases {
+                let (expect_fwd, expect_rc) =
+                    oracle_extract_syncmer_ordered(&seq, k, s, salt, |x| x);
+
+                extract_into_syncmer_lex(&seq, k, s, salt, &mut ws);
+                assert_eq!(
+                    ws.buffer, expect_fwd,
+                    "lex extract_into mismatch for k={} s={} salt={}",
+                    k, s, salt
+                );
+
+                let (fwd, rc) = extract_dual_strand_into_syncmer_lex(&seq, k, s, salt, &mut ws);
+                assert_eq!(
+                    fwd, expect_fwd,
+                    "lex dual fwd mismatch for k={} s={} salt={}",
+                    k, s, salt
+                );
+                assert_eq!(
+                    rc, expect_rc,
+                    "lex dual rc mismatch for k={} s={} salt={}",
+                    k, s, salt
+                );
+            }
+        }
+
+        #[test]
+        fn test_syncmer_lex_rc_matches_forward_on_revcomp() {
+            let mut ws = MinimizerWorkspace::new();
+            let params: &[(usize, usize)] = &[
+                (16, 7),
+                (16, 5),
+                (32, 15),
+                (32, 20),
+                (64, 15),
+                (64, 44),
+                (64, 54),
+            ];
+            for &(k, s) in params {
+                for seed in 0..5u64 {
+                    let seq = pseudo_random_seq(300, seed * 1000 + k as u64 * 10 + s as u64);
+                    let rc_seq = revcomp_bases(&seq);
+
+                    let (_, mut rc_channel) =
+                        extract_dual_strand_into_syncmer_lex(&seq, k, s, 0, &mut ws);
+                    extract_into_syncmer_lex(&rc_seq, k, s, 0, &mut ws);
+                    let mut forward_on_revcomp = ws.buffer.clone();
+
+                    rc_channel.sort_unstable();
+                    forward_on_revcomp.sort_unstable();
+                    assert_eq!(
+                        rc_channel, forward_on_revcomp,
+                        "lex rc mismatch for k={} s={} seed={}",
                         k, s, seed
                     );
                 }
@@ -1857,6 +2022,190 @@ mod tests {
         }
         for w in rc.windows(2) {
             assert!(w[0] < w[1], "RC not strictly sorted after N");
+        }
+    }
+
+    // =========================================================================
+    // Real-data confirmatory check: does lex ordering hold up on real reads?
+    //
+    // The offline harness (`examples/sketch_profile.rs`'s `sync-open-lex`
+    // arm) already found no measurable conservation difference between
+    // mix64 and lex ordering, on two real genome corpora (WoL2 bacterial
+    // genomes and real T2T-CHM13 human chromosomes) -- see
+    // `docs/syncmer-evaluation.md` Finding 7. But that harness is
+    // single-forward-strand only (documented scope), so it can't exercise
+    // the dual-strand RC-mirroring logic real reads actually need. This
+    // check reuses the real production dual-strand extraction functions
+    // (just refactored to be ordering-generic above) against real reads.
+    //
+    // Uses the same real data as the human w/s sweep matrix reported to the
+    // user this session: T2T-CHM13 as the single-bucket reference, HG00133
+    // haplotype-2 simulated short (150bp) and long (7.5-21kb PacBio
+    // HiFi-like) reads as queries -- a different individual than the
+    // reference, so this is a genuine cross-individual recall check, not
+    // self-consistency. Uses R1 single-end for the short-read arm (not
+    // paired R1+R2 as the earlier full-`rype classify run` matrix did) --
+    // a deliberate simplification, since both the hashed and lex recall
+    // numbers here come from the identical (lighter-weight) methodology, so
+    // the *comparison* is valid even though the absolute recall figures
+    // aren't required to numerically match that earlier run.
+    //
+    // #[ignore]d because this data is local-only (not in git). Run with:
+    // cargo test --lib lex_ordering_real_data_check -- --ignored --nocapture
+    // =========================================================================
+    #[cfg(feature = "fastx")]
+    mod lex_ordering_real_data_check {
+        use super::*;
+        use needletail::parse_fastx_file;
+        use std::collections::HashSet;
+
+        const T2T_GENOME: &str =
+            "/Users/michaeliter/rype-work/references/chm13v2.0_maskedY_rCRS.fa.PanSN.fa.gz";
+        const HG00133_SHORT_R1: &str =
+            "/Users/michaeliter/rype-work/references/HG00133_hap2_hprc_r2_v1.0.1_R1.fastq.gz";
+        const HG00133_LONG: &str =
+            "/Users/michaeliter/rype-work/references/HG00133_hap2_hprc_r2_v1.0.1.fastq.gz";
+
+        const K: usize = 64;
+        const SALT: u64 = 0x5555_5555_5555_5555;
+        const THRESHOLD: f64 = 0.1;
+
+        /// Score formula copied from `classify::scoring::compute_score`
+        /// (`pub(super)` to `classify`, not visible here) -- duplicating a
+        /// 3-line formula is more surgical than widening production
+        /// visibility for a test (Rule 3).
+        fn compute_score(
+            fwd_hits: usize,
+            fwd_total: usize,
+            rc_hits: usize,
+            rc_total: usize,
+        ) -> f64 {
+            let fwd_score = if fwd_total > 0 {
+                fwd_hits as f64 / fwd_total as f64
+            } else {
+                0.0
+            };
+            let rc_score = if rc_total > 0 {
+                rc_hits as f64 / rc_total as f64
+            } else {
+                0.0
+            };
+            fwd_score.max(rc_score)
+        }
+
+        /// Build the reference's selected-k-mer set from every record in
+        /// `path`, mirroring `commands/index.rs`'s per-record forward-only
+        /// extraction (build indices are forward-strand only).
+        fn build_reference_set(path: &str, s: usize, lex: bool) -> HashSet<u64> {
+            let mut reader = parse_fastx_file(path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+            let mut ws = MinimizerWorkspace::new();
+            let mut set = HashSet::new();
+            while let Some(record) = reader.next() {
+                let rec = record.unwrap_or_else(|e| panic!("record in {path}: {e}"));
+                let seq = rec.seq();
+                if lex {
+                    extract_into_syncmer_lex(&seq, K, s, SALT, &mut ws);
+                } else {
+                    extract_into_syncmer(&seq, K, s, SALT, &mut ws);
+                }
+                set.extend(ws.buffer.iter().copied());
+            }
+            set
+        }
+
+        /// Classify every read in `path` against `reference`, returning
+        /// `(hit_count, total_reads)` at `THRESHOLD`.
+        fn classify_reads(
+            path: &str,
+            s: usize,
+            lex: bool,
+            reference: &HashSet<u64>,
+        ) -> (usize, usize) {
+            let mut reader = parse_fastx_file(path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+            let mut ws = MinimizerWorkspace::new();
+            let mut hits = 0usize;
+            let mut total = 0usize;
+            while let Some(record) = reader.next() {
+                let rec = record.unwrap_or_else(|e| panic!("record in {path}: {e}"));
+                let seq = rec.seq();
+                let (fwd, rc) = if lex {
+                    extract_dual_strand_into_syncmer_lex(&seq, K, s, SALT, &mut ws)
+                } else {
+                    extract_dual_strand_into_syncmer(&seq, K, s, SALT, &mut ws)
+                };
+                let fwd_hits = fwd.iter().filter(|v| reference.contains(v)).count();
+                let rc_hits = rc.iter().filter(|v| reference.contains(v)).count();
+                let score = compute_score(fwd_hits, fwd.len(), rc_hits, rc.len());
+                if score >= THRESHOLD {
+                    hits += 1;
+                }
+                total += 1;
+            }
+            (hits, total)
+        }
+
+        fn check_lex_recall_matches_hashed(s: usize, query_path: &str, query_label: &str) {
+            if !std::path::Path::new(T2T_GENOME).exists()
+                || !std::path::Path::new(query_path).exists()
+            {
+                eprintln!("Skipping: real reference data not available locally (T2T/HG00133)");
+                return;
+            }
+
+            eprintln!("[lex-check] building reference sets for s={s} ...");
+            let hashed_ref = build_reference_set(T2T_GENOME, s, false);
+            let lex_ref = build_reference_set(T2T_GENOME, s, true);
+            eprintln!(
+                "[lex-check] s={s}: hashed reference {} entries, lex reference {} entries",
+                hashed_ref.len(),
+                lex_ref.len()
+            );
+
+            let (hashed_hits, hashed_total) = classify_reads(query_path, s, false, &hashed_ref);
+            let (lex_hits, lex_total) = classify_reads(query_path, s, true, &lex_ref);
+            assert_eq!(
+                hashed_total, lex_total,
+                "read count mismatch between passes"
+            );
+
+            let hashed_recall = hashed_hits as f64 / hashed_total as f64;
+            let lex_recall = lex_hits as f64 / lex_total as f64;
+            eprintln!(
+                "[lex-check] {query_label} s={s}: hashed_recall={hashed_recall:.4} \
+                 ({hashed_hits}/{hashed_total}), lex_recall={lex_recall:.4} ({lex_hits}/{lex_total})",
+            );
+
+            let abs_diff = (hashed_recall - lex_recall).abs();
+            assert!(
+                abs_diff < 0.02,
+                "{query_label} s={s}: lex recall diverged from hashed recall by {abs_diff:.4} \
+                 (hashed={hashed_recall:.4}, lex={lex_recall:.4}) -- more than the 2pp tolerance, \
+                 which would mean lex ordering is NOT a safe drop-in for real reads",
+            );
+        }
+
+        #[test]
+        #[ignore]
+        fn test_lex_recall_matches_hashed_s15_short_reads() {
+            check_lex_recall_matches_hashed(15, HG00133_SHORT_R1, "short");
+        }
+
+        #[test]
+        #[ignore]
+        fn test_lex_recall_matches_hashed_s15_long_reads() {
+            check_lex_recall_matches_hashed(15, HG00133_LONG, "long");
+        }
+
+        #[test]
+        #[ignore]
+        fn test_lex_recall_matches_hashed_s44_short_reads() {
+            check_lex_recall_matches_hashed(44, HG00133_SHORT_R1, "short");
+        }
+
+        #[test]
+        #[ignore]
+        fn test_lex_recall_matches_hashed_s44_long_reads() {
+            check_lex_recall_matches_hashed(44, HG00133_LONG, "long");
         }
     }
 }

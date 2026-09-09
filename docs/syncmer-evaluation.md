@@ -385,6 +385,65 @@ throughput was never the bottleneck) and Finding 6 (I/O pruning was already satu
 scheme). The size and short-read-robustness wins are real and measured; a large wall-clock/RSS win
 was never actually predicted by Findings 5/6 and did not materialize here either.
 
+## Finding 8: lex ordering (dropping `mix64`) survives a full real-read, production-code confirmatory check
+
+Finding 7's performance review found syncmer classify was slower than expected relative to its
+size advantage, and traced it to `mix64`'s per-base hashing cost (~30-35%, tracking the measured
+short-read classify gap almost exactly). That raised the obvious question: does syncmer actually
+need real hashing for its s-mer ordering, or would today's minimizer scheme's own lex order
+(`kmer ^ salt`, no hash — Finding 1) work just as well and recover the speed?
+
+**Step 1 — offline harness, two real genome corpora.** Added a `sync-open-lex` arm to
+`examples/sketch_profile.rs` (raw-XOR s-mer ordering instead of `mix64`, otherwise identical
+selection logic) and re-ran the conservation sweep on both WoL2 (500 bacterial genomes) and real
+T2T-CHM13 human chromosomes (25 files, split from the reference used throughout this session). At
+every practically-relevant `s` (`s ≥ 8`; `s=4` is already outside the recommended range per
+`Sketch::validate`'s bias warning), conservation was statistically identical between lex and hashed
+ordering on **both** corpora (e.g. T2T `s=15, θ=0.01`: hashed 0.81226 vs. lex 0.81235), and lex
+ordering recovered essentially all the `mix64` cost (T2T `s=15, w=100`: hashed 107.6 Mbase/s vs.
+lex 161.2 Mbase/s, matching `min-lex`'s 163.2 Mbase/s baseline). One real wrinkle: at the
+already-unsafe `s=4`, lex's density diverges further from hashed on human sequence (75% more
+selections) than on WoL2 (40% more) — human repeat content amplifies the small-alphabet tie bias —
+but conservation was unaffected even there.
+
+**Step 2 — production dual-strand/RC-mirroring correctness.** The harness is single-forward-strand
+only by design (see its module doc comment), so it cannot exercise the RC-mirroring tie-break rule
+from Phase 2 (mirrored target `win-1-t`, mirrored tie-break `>` vs. `>=`) — the highest-risk part
+of the whole feature. `src/core/extraction.rs`'s `extract_into_syncmer` and
+`extract_dual_strand_into_syncmer` were generalized to take the s-mer ordering function as a
+parameter (public paths still hardcode `mix64`, zero behavior change — verified unchanged against
+the full test suite), with `#[cfg(test)]`-only lex wrappers added alongside. The existing
+definitional-oracle and RC-mirroring gates (`test_syncmer_oracle_matches_rolling_implementation`,
+`test_syncmer_rc_matches_forward_on_revcomp`) were duplicated for the lex variant and pass
+bit-for-bit — confirming the RC-mirroring derivation is ordering-agnostic, not `mix64`-specific.
+
+**Step 3 — real cross-individual read recall.** A new `#[ignore]`d test module
+(`core::extraction::tests::lex_ordering_real_data_check`) builds a real T2T-CHM13 reference
+s-mer set (both hashed and lex, per-record forward-only extraction mirroring
+`commands/index.rs`'s build path) and classifies real HG00133 haplotype-2 reads (a different
+individual — genuine cross-individual recall, not self-consistency) against both, using the actual
+production dual-strand extraction functions and `classify::scoring::compute_score`'s formula
+(`max(fwd_hits/fwd_total, rc_hits/rc_total)`). Recall tracked within noise at every point:
+
+| s | reads | hashed recall | lex recall | Δ |
+|---|---|---|---|---|
+| 15 | short (R1 single-end) | 94.17% | 93.82% | 0.35pp |
+| 15 | long | 99.99% | 99.99% | ~0pp |
+| 44 | short (R1 single-end) | 98.74% | 98.67% | 0.07pp |
+| 44 | long | 99.99% | 99.99% | ~0pp |
+
+(Absolute recall is lower than the paired-R1+R2 numbers in Finding 7's table because this check
+uses R1 single-end for a lighter-weight methodology; the hashed-vs-lex comparison, computed
+identically for both, is unaffected by that choice.)
+
+**Conclusion**: three independent lines of evidence — synthetic-mutation conservation on two real
+genome corpora, bit-for-bit production-code correctness including the highest-risk RC-mirroring
+logic, and real cross-individual read recall — all converge on the same answer: dropping `mix64`
+for lex ordering is safe for syncmer and recovers essentially all of the hashing cost. **Not yet
+done**: switching the production default's ordering from `mix64` to lex, which would need a
+`format_version` bump (it changes which bit-patterns get selected for a shipped scheme) and
+re-verification of any pinned/golden vectors — a separate decision, deliberately not made here.
+
 ## What a "go" would cost (scoping only — not implemented here)
 
 Carried from the approved plan, unchanged:
