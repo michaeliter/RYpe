@@ -5,9 +5,10 @@
 //! crate -- they are scheme-independent, and folding them into this type
 //! would touch every k/salt-threading call site for no benefit.
 //!
-//! Minimizer ordering is unchanged, bit-for-bit: minimizers still order by
-//! raw `kmer ^ salt` (see [`super::hash::mix64`]'s doc comment). `mix64` is
-//! used only to order s-mers when selecting open syncmers.
+//! Minimizer ordering is unchanged, bit-for-bit: minimizers order by raw
+//! `kmer ^ salt`. Open syncmers order their s-mers the same way -- raw
+//! `smer ^ salt`, unmixed -- per `docs/syncmer-evaluation.md` Finding 8,
+//! which found real-hash ordering measurably unnecessary.
 
 use crate::error::RypeError;
 
@@ -18,8 +19,8 @@ pub enum Sketch {
     /// window of `w` consecutive k-mer start positions.
     Minimizer { w: usize },
     /// Open syncmer: select a k-mer iff the argmin of its `k - s + 1`
-    /// contained s-mers (ordered by `mix64(smer ^ salt)`) lands at the
-    /// conservation-optimal offset `open_target(k, s)`.
+    /// contained s-mers (ordered by raw `smer ^ salt`, same as minimizers)
+    /// lands at the conservation-optimal offset `open_target(k, s)`.
     OpenSyncmer { s: usize },
 }
 

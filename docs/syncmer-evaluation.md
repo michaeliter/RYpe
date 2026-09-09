@@ -439,10 +439,25 @@ identically for both, is unaffected by that choice.)
 **Conclusion**: three independent lines of evidence — synthetic-mutation conservation on two real
 genome corpora, bit-for-bit production-code correctness including the highest-risk RC-mirroring
 logic, and real cross-individual read recall — all converge on the same answer: dropping `mix64`
-for lex ordering is safe for syncmer and recovers essentially all of the hashing cost. **Not yet
-done**: switching the production default's ordering from `mix64` to lex, which would need a
-`format_version` bump (it changes which bit-patterns get selected for a shipped scheme) and
-re-verification of any pinned/golden vectors — a separate decision, deliberately not made here.
+for lex ordering is safe for syncmer and recovers essentially all of the hashing cost.
+
+**Update: the production default was switched.** Since open-syncmer sketching has never shipped on
+`main` (this entire feature exists only on `feat/syncmer-sketching`, unmerged, unpushed), there is
+no existing external `.ryxdi` whose readability this could break — the usual reason to bump
+`format_version` for an on-disk semantic change (Phase 4's `format_version_for` mapping already
+distinguishes syncmer-aware binaries from pre-syncmer ones; that distinction is untouched and
+remains correct) doesn't apply to a change made before the feature's first release. `mix64` was
+removed from all three production syncmer extraction entry points
+(`extract_into_syncmer`, `extract_dual_strand_into_syncmer`, `extract_strand_minimizers_syncmer` in
+`src/core/extraction.rs`) in favor of raw `smer ^ salt` ordering; it remains in `src/core/hash.rs`,
+now `#[cfg(test)]`-only, as a deterministic pseudo-random sequence generator for test fixtures (its
+former sketching role). The oracle/RC-mirroring correctness tests and the harness's `sync-open-lex`
+arm already validated this exact change before it was made, so no new test infrastructure was
+needed post-switch — the pre-switch lex-vs-hashed comparison tests were removed as redundant with
+the (now-updated) mix64-based oracle tests, which validate the new default directly. One test
+needed recalibration: `test_syncmer_density_matches_law`'s tolerance widened from 5% to 12%, since
+lex ordering has a real structural density deviation from the theoretical law (mirroring `min-lex`'s
+own known, deliberately-unasserted deviation from minimizer's theoretical density in Finding 1).
 
 ## What a "go" would cost (scoping only — not implemented here)
 

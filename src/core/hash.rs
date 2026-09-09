@@ -1,17 +1,22 @@
-//! Order-mixing hash for syncmer s-mer selection.
+//! Order-mixing hash, test-only.
 //!
-//! `mix64` is used *only* to order s-mers when picking the argmin for
-//! open-syncmer selection. The stored k-mer value must never be passed
-//! through this function — it stays `kmer ^ salt` everywhere, so the sorted
-//! Parquet column keeps the delta-encoding structure that minimizer indices
-//! rely on. Minimizer ordering is unaffected: minimizers order by raw
-//! `kmer ^ salt`, unmixed, exactly as before this module existed.
+//! Open-syncmer s-mer selection originally ordered by `mix64(smer ^ salt)`;
+//! `docs/syncmer-evaluation.md` Finding 8 found real-hash ordering measurably
+//! unnecessary (a synthetic-mutation conservation sweep on two real genome
+//! corpora, bit-for-bit production oracle/RC-mirroring tests, and real
+//! cross-individual read recall all showed lex ordering -- the same raw
+//! `smer ^ salt` minimizers already use, unmixed -- performs identically
+//! while recovering the hashing cost), so production now orders s-mers the
+//! same way minimizers do. `mix64` remains as a deterministic,
+//! dependency-free pseudo-random sequence generator for test fixtures
+//! (e.g. `classify::sharded`'s tests) -- a bijection is a convenient
+//! avalanche step for that, unrelated to its former sketching role.
 
 /// splitmix64 finalizer (Steele, Lea & Flood 2014; the mixing stage of
 /// `next()` in the reference `splitmix64.c` generator, without the golden-
 /// gamma increment). Not a general-purpose hash: it is a bijection on `u64`,
-/// used here purely to break the small-alphabet ties inherent to ordering
-/// 1-bit-per-base RY-encoded s-mers.
+/// used here as a test-fixture avalanche step (see module doc comment).
+#[cfg(test)]
 #[inline(always)]
 pub(crate) fn mix64(mut x: u64) -> u64 {
     x ^= x >> 30;
