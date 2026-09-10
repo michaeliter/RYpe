@@ -456,10 +456,7 @@ fn load_filtered_coo_pairs(
     let num_chunks = (num_threads * CHUNK_OVERSUBSCRIPTION_FACTOR)
         .min(matching_row_groups.len())
         .max(1);
-    // matching_row_groups.len().div_ceil(num_chunks) would be simpler but
-    // div_ceil on usize was stabilized in Rust 1.73, above this crate's
-    // declared MSRV (1.70) — see the same workaround in c_api.rs.
-    let chunk_size = (matching_row_groups.len() + num_chunks - 1) / num_chunks;
+    let chunk_size = matching_row_groups.len().div_ceil(num_chunks);
     let chunks: Vec<&[(usize, u64, u64)]> = matching_row_groups.chunks(chunk_size).collect();
 
     // Estimate pairs for pre-allocation: one row group's worth at a
@@ -695,10 +692,7 @@ fn load_filtered_coo_pairs(
             RypeError::io(
                 path.clone(),
                 "read row group chunk",
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("row groups {:?}..={:?}: {}", first_rg, last_rg, e),
-                ),
+                std::io::Error::other(format!("row groups {:?}..={:?}: {}", first_rg, last_rg, e)),
             )
         })?;
 

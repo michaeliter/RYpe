@@ -11,7 +11,7 @@ readme = "README.md"
 license = "BSD-3-Clause"
 keywords = ["bioinformatics", "microbiome", "genomics", "minimizer", "classification"]
 categories = ["science", "command-line-utilities"]
-rust-version = "1.70"
+rust-version = "1.75"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -27,7 +27,7 @@ serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 env_logger = "0.11"
 zstd = "0.13"  # Compression for inverted index
-flate2 = "1.1.8"  # Gzip compression for output
+flate2 = { version = "1.1.8", features = ["zlib-rs"] }  # Gzip; zlib-rs backend (pure Rust, no C, wasm-safe) instead of the default slower miniz_oxide
 parquet = { version = "59", default-features = false, features = ["zstd", "snap", "arrow"] }
 bytes = "1.5"
 arrow = { version = "59", default-features = false }

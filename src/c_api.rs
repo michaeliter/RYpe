@@ -695,9 +695,7 @@ pub extern "C" fn rype_estimate_pass_count(total_reads: size_t, batch_size: size
     if batch_size == 0 {
         return 0;
     }
-    // total_reads.div_ceil(batch_size) would be simpler but div_ceil on usize
-    // was stabilized in Rust 1.73, above this crate's declared MSRV (1.70).
-    total_reads.saturating_add(batch_size - 1) / batch_size
+    total_reads.div_ceil(batch_size)
 }
 
 // --- Bucket Name Lookup ---

@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CLI tool for index management and classification
 
 ### Changed
+- Minimum supported Rust version raised to 1.75 (from 1.70), required by the `zlib-rs` gzip backend below.
+- Gzip decompression (query FASTQ/FASTA input) and compression (`.gz` output) now use `flate2`'s `zlib-rs` backend instead of the default `miniz_oxide`, for faster inflate on real query files. Pure Rust, no new C toolchain dependency, wasm-compatible.
 
 ### Deprecated
 

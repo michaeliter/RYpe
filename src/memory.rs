@@ -512,7 +512,7 @@ impl ReadMemoryProfile {
     /// Adds overhead for read_id column (~32-80 bytes for Illumina IDs).
     pub fn estimate_arrow_bytes_per_row(&self, is_paired: bool) -> usize {
         // Number of string columns: read_id + seq1 (+ seq2 if paired)
-        let num_string_cols = if is_paired { 3 } else { 2 };
+        let num_string_cols: usize = if is_paired { 3 } else { 2 };
 
         // Per-row data: sequence bytes + read_id (estimate 50 bytes for Illumina headers)
         let read_id_bytes = 50;
@@ -523,7 +523,7 @@ impl ReadMemoryProfile {
         let offset_overhead = 4 * num_string_cols;
 
         // Validity bitmap: ~1 bit per column per row, rounded up
-        let validity_overhead = (num_string_cols + 7) / 8;
+        let validity_overhead = num_string_cols.div_ceil(8);
 
         // Arrow ArrayData struct overhead per column (~40 bytes per array)
         // Amortized per row for typical batch sizes (10K rows): negligible

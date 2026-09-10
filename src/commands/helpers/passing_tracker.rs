@@ -17,7 +17,7 @@ pub struct PassingReadTracker {
 impl PassingReadTracker {
     /// Create a new tracker with initial capacity for `num_reads` reads.
     pub fn with_capacity(num_reads: usize) -> Self {
-        let words = (num_reads + 63) / 64;
+        let words = num_reads.div_ceil(64);
         Self {
             bits: vec![0u64; words],
             count: 0,
