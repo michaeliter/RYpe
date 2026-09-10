@@ -710,6 +710,17 @@ const MIN_CHUNK_BYTES: usize = 100 * 1024 * 1024;
 /// are the same width, so codegen is identical.
 const MAX_CHUNK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
+/// Estimated expansion ratio from on-disk file size to in-memory sequence
+/// bytes, used only to decide how many small files `SequenceChunkIterator`
+/// can safely batch for parallel reading in one `next_chunk()` call (see
+/// its docs). A rough constant, not a precise model: gzip'd FASTA/FASTQ
+/// commonly expands 3-5x; plain-text input is 1x and simply gets batched
+/// somewhat more conservatively than necessary. Never a correctness
+/// concern either way -- underestimating just makes a batch larger than
+/// `target_chunk_bytes` (already tolerated, same as one oversized sequence
+/// today), and overestimating just makes chunks smaller than necessary.
+const CHUNK_BATCH_SIZE_ESTIMATE_RATIO: f64 = 4.0;
+
 /// Calculate chunk configuration based on available memory.
 ///
 /// # Arguments
@@ -783,17 +794,12 @@ impl SequenceChunkIterator {
     fn open_next_file(&mut self) -> Result<bool> {
         while self.current_file_idx < self.files.len() {
             let file_path = &self.files[self.current_file_idx];
-            let abs_path = resolve_path(&self.config_dir, file_path);
+            let (abs_path, filename, result) = resolve_and_open_fastx(&self.config_dir, file_path);
             self.current_file_idx += 1;
-
-            self.current_filename = abs_path
-                .canonicalize()
-                .unwrap_or_else(|_| abs_path.clone())
-                .to_string_lossy()
-                .to_string();
+            self.current_filename = filename;
 
             // Try to open the file, skip if empty or invalid (unless strict)
-            match parse_fastx_file(&abs_path) {
+            match result {
                 Ok(reader) => {
                     self.current_reader = Some(reader);
                     return Ok(true);
@@ -817,12 +823,151 @@ impl SequenceChunkIterator {
         Ok(false)
     }
 
+    /// Estimate this file's expanded in-memory size (see
+    /// `CHUNK_BATCH_SIZE_ESTIMATE_RATIO`). Returns `u64::MAX` if the file
+    /// can't be stat'd, which forces the caller onto the sequential
+    /// per-record path where the real open error is reported normally.
+    fn estimate_file_bytes(&self, idx: usize) -> u64 {
+        let abs_path = resolve_path(&self.config_dir, &self.files[idx]);
+        match std::fs::metadata(&abs_path) {
+            Ok(meta) => (meta.len() as f64 * CHUNK_BATCH_SIZE_ESTIMATE_RATIO) as u64,
+            Err(_) => u64::MAX,
+        }
+    }
+
     /// Get the next chunk of sequences.
     ///
     /// Returns `Ok(Some(chunk))` with sequences, `Ok(None)` when exhausted,
     /// or `Err` on I/O error.
+    ///
+    /// At a clean file boundary (no file left half-read by a previous
+    /// call), this batches consecutive files whose combined *estimated*
+    /// size stays under `target_chunk_bytes` and reads+parses them in
+    /// parallel -- each task opens and owns one whole file end-to-end, so
+    /// there's no shared reader state and no rayon-pool-nesting hazard
+    /// beyond ordinary nested parallelism (ordinary `join`/`par_iter`
+    /// nesting is safe under rayon's work-stealing scheduler; the hazard
+    /// `flush_sort_pool`'s docs warn about is specifically a *channel*
+    /// blocking a worker in a way the scheduler can't route around, which
+    /// doesn't apply here).
+    ///
+    /// A file whose own estimate already meets the budget (a single huge
+    /// reference, e.g. one chromosome) instead falls through to
+    /// `next_chunk_sequential`, which streams it record-by-record and
+    /// isolates an oversized sequence to its own chunk -- exactly today's
+    /// behavior -- rather than materializing the whole file at once.
     #[allow(clippy::type_complexity)]
     fn next_chunk(&mut self) -> Result<Option<Vec<(Vec<u8>, String)>>> {
+        // A file left partially read by a previous call (an open reader,
+        // or a buffered oversized sequence) must be finished via the
+        // sequential path -- that's what gives an in-progress file's
+        // oversized sequence its own chunk without this call re-batching
+        // around it.
+        if self.pending_sequence.is_some() || self.current_reader.is_some() {
+            return self.next_chunk_sequential();
+        }
+
+        loop {
+            if self.current_file_idx >= self.files.len() {
+                return Ok(None);
+            }
+
+            let first_est = self.estimate_file_bytes(self.current_file_idx);
+            if first_est >= self.target_chunk_bytes as u64 {
+                return self.next_chunk_sequential();
+            }
+
+            // Greedily batch consecutive small files up to the byte budget.
+            // Seeded with `first_est` (already computed above) so this loop
+            // doesn't stat() the same first file twice.
+            let start = self.current_file_idx;
+            let mut end = start + 1;
+            let mut acc: u64 = first_est;
+            while end < self.files.len() {
+                let est = self.estimate_file_bytes(end);
+                if acc + est > self.target_chunk_bytes as u64 {
+                    break;
+                }
+                acc += est;
+                end += 1;
+                if est >= self.target_chunk_bytes as u64 {
+                    break;
+                }
+            }
+
+            let batch = self.files[start..end].to_vec();
+            let config_dir = self.config_dir.clone();
+
+            // Read the batch in waves of ~thread-count files rather than all at
+            // once: `.par_iter().collect()` over the *whole* batch wouldn't
+            // return until every file finished, so all of the batch's
+            // decompressed bytes (up to `target_chunk_bytes`, the same total a
+            // sequential read would also reach) would sit resident
+            // simultaneously in `results` on top of what's being moved into
+            // `chunk` -- capping how many files are ever mid-read at once
+            // bounds that transient overhead to roughly what's actually
+            // executing in parallel, without changing the batch's total size
+            // (and so without changing downstream per-chunk extract/merge
+            // cadence).
+            let wave_size = rayon::current_num_threads().max(1);
+            let mut chunk: Vec<(Vec<u8>, String)> = Vec::new();
+            let mut chunk_real_bytes: u64 = 0;
+            let mut files_consumed = 0usize;
+            for wave in batch.chunks(wave_size) {
+                let results: Vec<Result<FileReadOutcome>> = wave
+                    .par_iter()
+                    .map(|file_path| read_whole_file(&config_dir, file_path))
+                    .collect();
+                files_consumed += wave.len();
+
+                for result in results {
+                    match result? {
+                        FileReadOutcome::Ok(seqs) => {
+                            chunk_real_bytes +=
+                                seqs.iter().map(|(seq, _)| seq.len() as u64).sum::<u64>();
+                            chunk.extend(seqs);
+                        }
+                        FileReadOutcome::OpenFailed(abs_path, e) => {
+                            if self.strict {
+                                return Err(e).context(format!(
+                                    "Failed to open file {}",
+                                    abs_path.display()
+                                ));
+                            }
+                            log::warn!(
+                                "Skipping file {} (possibly empty or invalid): {}",
+                                abs_path.display(),
+                                e
+                            );
+                        }
+                    }
+                }
+
+                // The on-disk-size estimate that planned this batch can badly
+                // undershoot real decompressed bytes (e.g. highly compressible
+                // input) -- once *actual* bytes reach budget, stop admitting
+                // further waves into this chunk rather than trusting the
+                // upfront estimate for the whole batch. Files not yet read
+                // stay in `self.files` for the next `next_chunk()` call.
+                if chunk_real_bytes >= self.target_chunk_bytes as u64 {
+                    break;
+                }
+            }
+            self.current_file_idx = start + files_consumed;
+
+            if !chunk.is_empty() {
+                return Ok(Some(chunk));
+            }
+            // Every file in this batch was empty/invalid; try the next batch.
+        }
+    }
+
+    /// Sequential, single-record-at-a-time chunk reader. Handles resuming a
+    /// partially-read file (`current_reader`/`pending_sequence`) and is the
+    /// only path that can isolate one oversized sequence to its own chunk
+    /// without reading the rest of its file first -- see `next_chunk`.
+    #[allow(clippy::type_complexity)]
+    fn next_chunk_sequential(&mut self) -> Result<Option<Vec<(Vec<u8>, String)>>> {
         let mut chunk: Vec<(Vec<u8>, String)> = Vec::new();
         let mut chunk_bytes: usize = 0;
 
@@ -883,6 +1028,66 @@ impl SequenceChunkIterator {
             Ok(Some(chunk))
         }
     }
+}
+
+/// Resolve `file_path` against `config_dir` and open it as FASTX, returning
+/// the absolute path, its canonicalized display filename, and the open
+/// result. Shared by `open_next_file` (loops/skips on failure) and
+/// `read_whole_file` (reports the failure back per-file so the parallel
+/// batch path can decide skip-vs-error).
+fn resolve_and_open_fastx(
+    config_dir: &Path,
+    file_path: &Path,
+) -> (PathBuf, String, Result<Box<dyn needletail::FastxReader>>) {
+    let abs_path = resolve_path(config_dir, file_path);
+    let filename = abs_path
+        .canonicalize()
+        .unwrap_or_else(|_| abs_path.clone())
+        .to_string_lossy()
+        .to_string();
+    let result = parse_fastx_file(&abs_path).map_err(anyhow::Error::from);
+    (abs_path, filename, result)
+}
+
+/// Outcome of reading one whole file for `next_chunk`'s parallel-batch path.
+///
+/// Distinguishes an *open* failure (skippable unless `strict`, matching
+/// `SequenceChunkIterator::open_next_file`) from a mid-file record parse
+/// error, which is always a hard error regardless of `strict` -- that
+/// distinction is why this isn't a plain `Result`.
+enum FileReadOutcome {
+    Ok(Vec<(Vec<u8>, String)>),
+    OpenFailed(PathBuf, anyhow::Error),
+}
+
+/// Read every sequence from one file, for use inside a parallel batch.
+///
+/// Takes plain path arguments rather than `&SequenceChunkIterator` so it
+/// can run in a `par_iter` closure without borrowing the iterator's `&mut
+/// self` state.
+fn read_whole_file(config_dir: &Path, file_path: &Path) -> Result<FileReadOutcome> {
+    let (abs_path, filename, result) = resolve_and_open_fastx(config_dir, file_path);
+    let mut reader = match result {
+        Ok(r) => r,
+        Err(e) => return Ok(FileReadOutcome::OpenFailed(abs_path, e)),
+    };
+
+    let mut sequences: Vec<(Vec<u8>, String)> = Vec::new();
+    while let Some(record) = reader.next() {
+        match record {
+            Ok(rec) => {
+                let seq = rec.seq().to_vec();
+                let seq_name = String::from_utf8_lossy(rec.id()).to_string();
+                let source_label = format!("{}{}{}", filename, BUCKET_SOURCE_DELIM, seq_name);
+                sequences.push((seq, source_label));
+            }
+            Err(e) => {
+                return Err(anyhow!("Invalid record in {}: {}", filename, e));
+            }
+        }
+    }
+
+    Ok(FileReadOutcome::Ok(sequences))
 }
 
 /// Build a single bucket using chunked parallel extraction.
@@ -2778,6 +2983,21 @@ mod tests {
         path
     }
 
+    /// Helper to create a single-record gzip-compressed FASTA file for testing.
+    fn create_gz_fasta_file(dir: &Path, name: &str, id: &str, seq: &[u8]) -> PathBuf {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let path = dir.join(name);
+        let file = File::create(&path).unwrap();
+        let mut encoder = GzEncoder::new(file, Compression::best());
+        writeln!(encoder, ">{id}").unwrap();
+        encoder.write_all(seq).unwrap();
+        writeln!(encoder).unwrap();
+        encoder.finish().unwrap();
+        path
+    }
+
     /// Helper to create a config file for testing
     fn create_test_config(
         dir: &Path,
@@ -4301,6 +4521,99 @@ files = [{}]
         );
     }
 
+    /// `next_chunk`'s parallel file-batching runs nested inside
+    /// `build_parquet_index_from_config_streaming`'s own `bucket_pool.install(||
+    /// work_items.par_iter()...)` (see that function) whenever `effective_concurrency
+    /// > 1` lets multiple buckets run at once on the same size-limited pool. Nested
+    /// `par_iter` calls are safe under rayon's work-stealing scheduler -- unlike the
+    /// bounded-channel hazard `flush_sort_pool`'s docs describe, a worker blocked on
+    /// a nested `par_iter` can steal and run other pending work instead of parking --
+    /// but this proves it empirically for this specific nesting rather than relying
+    /// on that reasoning alone: several buckets, each with enough small files to
+    /// force its own `next_chunk()` calls onto the parallel-batch path, all built
+    /// with `effective_concurrency` forced above 1. A real deadlock here would hang
+    /// the test rather than fail an assertion, so this test's actual value is that
+    /// it completes at all.
+    #[test]
+    fn test_from_config_streaming_concurrent_buckets_with_batched_files_no_deadlock() {
+        use rype::ShardedInvertedIndex;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        fn make_sequence(seed: u64, length: usize) -> Vec<u8> {
+            let mut state = seed;
+            (0..length)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    match (state >> 32) % 4 {
+                        0 => b'A',
+                        1 => b'C',
+                        2 => b'G',
+                        _ => b'T',
+                    }
+                })
+                .collect()
+        }
+
+        // 4 buckets x 6 files x ~200KB each: small enough that every file is well
+        // under a per-bucket chunk budget, so each bucket's next_chunk() calls take
+        // the new parallel-batch path (not the single-oversized-file fallback).
+        const NUM_BUCKETS: usize = 4;
+        const FILES_PER_BUCKET: usize = 6;
+        let mut bucket_toml = String::new();
+        for b in 0..NUM_BUCKETS {
+            let seq = make_sequence(100 + b as u64, 200_000);
+            let mut files = Vec::new();
+            for f in 0..FILES_PER_BUCKET {
+                let name = format!("bucket{b}_file{f}.fa");
+                create_fasta_file(dir, &name, &seq);
+                files.push(format!("\"{name}\""));
+            }
+            bucket_toml.push_str(&format!(
+                "\n[buckets.Bucket{b}]\nfiles = [{}]\n",
+                files.join(", ")
+            ));
+        }
+
+        let config = format!(
+            "[index]\nk = 32\nwindow = 10\nsalt = 0x5555555555555555\noutput = \"concurrent.ryidx\"\n{}",
+            bucket_toml
+        );
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, &config).unwrap();
+
+        // A large explicit max_shard_size (bypassing the config-file/detected-memory
+        // default) forces `overall_available_estimate` well above `per_bucket_floor`,
+        // so `effective_concurrency` is not clamped to 1 by the memory-floor guard --
+        // it becomes `rayon::current_num_threads()`, i.e. real bucket-level
+        // concurrency on any multi-core machine.
+        let result = build_parquet_index_from_config_streaming(
+            &config_path,
+            Some(1024 * 1024 * 1024), // 1 GiB
+            None,
+            false,
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "Concurrent multi-bucket streaming build should succeed: {:?}",
+            result
+        );
+
+        let index = ShardedInvertedIndex::open(&dir.join("concurrent.ryxdi")).unwrap();
+        let manifest = index.manifest();
+        assert_eq!(
+            manifest.bucket_names.len(),
+            NUM_BUCKETS,
+            "All buckets should be present in the final index"
+        );
+        assert!(
+            manifest.total_minimizers > 0,
+            "Should have extracted minimizers from every bucket"
+        );
+    }
+
     // ==========================================================================
     // Tests for parallel single-bucket extraction (TDD RED phase)
     // ==========================================================================
@@ -4870,6 +5183,211 @@ files = ["short.fa", "long.fa"]
         assert!(all_sources[1].contains("s2"));
         assert!(all_sources[2].contains("s3"));
         assert!(all_sources[3].contains("s4"));
+    }
+
+    /// `next_chunk`'s clean-file-boundary path batches several small files
+    /// and reads them in parallel (see its docs), then concatenates results
+    /// in input order via `par_iter().collect()`. With only 2-3 files (as
+    /// in `test_sequence_chunk_iterator_exhausts_all_files`) an accidental
+    /// reordering bug -- e.g. sorting by content, or racing results into an
+    /// unordered structure -- could pass by luck. This uses enough files
+    /// that such a bug would show up as an out-of-order sequence with high
+    /// probability, not chance.
+    #[test]
+    fn test_sequence_chunk_iterator_parallel_batch_preserves_file_order_at_scale() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        const NUM_FILES: usize = 40;
+        let seq = vec![b'A'; 50];
+        let files: Vec<PathBuf> = (0..NUM_FILES)
+            .map(|i| {
+                create_multi_fasta_file(
+                    dir,
+                    &format!("file{i}.fa"),
+                    &[(&format!("s{i}"), seq.as_slice())],
+                )
+            })
+            .collect();
+
+        // Budget comfortably covers all NUM_FILES * 50 bytes in one batch,
+        // so this is a single next_chunk() call spanning every file.
+        let mut chunk_iter = SequenceChunkIterator::new(&files, dir, 1_000_000);
+
+        let chunk = chunk_iter
+            .next_chunk()
+            .unwrap()
+            .expect("expected one chunk covering all files");
+        assert_eq!(
+            chunk.len(),
+            NUM_FILES,
+            "all sequences should be in one chunk"
+        );
+        assert!(
+            chunk_iter.next_chunk().unwrap().is_none(),
+            "iterator should be exhausted after the single batched chunk"
+        );
+
+        for (i, (_, src)) in chunk.iter().enumerate() {
+            assert!(
+                src.contains(&format!("s{i}")),
+                "position {i} expected source containing 's{i}', got '{src}' -- \
+                 file order was not preserved by the parallel batch"
+            );
+        }
+    }
+
+    /// `estimate_file_bytes` multiplies on-disk size by a fixed ratio
+    /// (`CHUNK_BATCH_SIZE_ESTIMATE_RATIO`) that has no way to know a given
+    /// file's *real* compression ratio. This proves the over-estimate
+    /// direction is still correct: several small, uncompressed (1x real
+    /// ratio) files whose on-disk-size-times-4 estimate is deliberately
+    /// inflated well past their true combined size must still all be read,
+    /// in full and in order, regardless of how conservatively they get
+    /// batched or how often that forces the sequential fallback.
+    #[test]
+    fn test_sequence_chunk_iterator_ratio_overestimate_still_correct() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Each file's real on-disk size is ~120 bytes (100bp sequence plus
+        // header/newlines); the 4x estimate is ~480 bytes -- comfortably
+        // above a budget sized to the *real* total but below the estimated
+        // total, so the ratio's inflation actually changes the batching
+        // decision relative to real size, not just in theory.
+        let seq = vec![b'C'; 100];
+        let files: Vec<PathBuf> = (0..5)
+            .map(|i| {
+                create_multi_fasta_file(
+                    dir,
+                    &format!("f{i}.fa"),
+                    &[(&format!("seq{i}"), seq.as_slice())],
+                )
+            })
+            .collect();
+
+        let mut chunk_iter = SequenceChunkIterator::new(&files, dir, 150);
+
+        let mut all_sources: Vec<String> = Vec::new();
+        while let Some(chunk) = chunk_iter.next_chunk().unwrap() {
+            for (_, src) in chunk {
+                all_sources.push(src);
+            }
+        }
+
+        assert_eq!(
+            all_sources.len(),
+            5,
+            "every sequence must still be read exactly once"
+        );
+        for (i, src) in all_sources.iter().enumerate() {
+            assert!(
+                src.contains(&format!("seq{i}")),
+                "position {i}: expected 'seq{i}', got '{src}'"
+            );
+        }
+    }
+
+    /// Mirror of the overestimate test above, for the underestimate
+    /// direction: a highly compressible gzip file's on-disk size can be a
+    /// small fraction of its decompressed size, so `estimate_file_bytes`'s
+    /// fixed 4x ratio can badly *underestimate* real memory use and let the
+    /// parallel-batch path take a file the sequential fallback would
+    /// otherwise have caught. Per `CHUNK_BATCH_SIZE_ESTIMATE_RATIO`'s docs
+    /// this is a memory/packing concern, never a correctness one -- this
+    /// test is what actually proves that claim rather than just asserting it.
+    #[test]
+    fn test_sequence_chunk_iterator_ratio_underestimate_still_correct() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // A single repeated base compresses extremely well: ~200KB of
+        // sequence shrinks to well under 1KB on disk, so on-disk-size * 4
+        // (a few KB) is nowhere near the true ~200KB decompressed size.
+        let seq = vec![b'G'; 200_000];
+        let path = create_gz_fasta_file(dir, "compressible.fa.gz", "big", &seq);
+
+        let on_disk_len = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            on_disk_len * 10 < seq.len() as u64,
+            "fixture didn't compress as expected -- got {on_disk_len} bytes on disk for a \
+             {}-byte sequence, need at least 10x for this test to exercise the \
+             underestimate direction",
+            seq.len()
+        );
+
+        // Budget set well above the ratio-estimated size (on_disk_len * 4)
+        // so the file lands in the parallel-batch path, not the sequential
+        // fallback -- deliberately exercising the underestimate case.
+        let target_chunk_bytes = (on_disk_len as usize * 4) + 1;
+        let mut chunk_iter = SequenceChunkIterator::new(&[path], dir, target_chunk_bytes);
+
+        let chunk = chunk_iter
+            .next_chunk()
+            .unwrap()
+            .expect("expected the single sequence");
+        assert_eq!(chunk.len(), 1);
+        assert_eq!(
+            chunk[0].0.len(),
+            seq.len(),
+            "decompressed sequence length must be exact despite the size estimate being \
+             far too low"
+        );
+        assert!(chunk[0].0.iter().all(|&b| b == b'G'));
+        assert!(chunk_iter.next_chunk().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_sequence_chunk_iterator_parallel_batch_stops_early_on_real_overshoot() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Many small, highly-compressible files: each file's on-disk-size *
+        // ratio estimate is tiny, so the estimate-based batch planner alone
+        // would admit *all* of them into one planned batch -- but their real
+        // decompressed bytes vastly exceed the budget. This exercises the
+        // real-bytes-checked-after-each-wave guard, not the single-
+        // oversized-file estimate check (`test_..._underestimate_still_correct`
+        // above covers that one).
+        const N: usize = 200;
+        const SEQ_LEN: usize = 50_000;
+        let mut paths = Vec::with_capacity(N);
+        for i in 0..N {
+            let seq = vec![b'G'; SEQ_LEN];
+            let path = create_gz_fasta_file(
+                dir,
+                &format!("compressible_{i}.fa.gz"),
+                &format!("seq{i}"),
+                &seq,
+            );
+            paths.push(path);
+        }
+
+        // Real total is N * SEQ_LEN = 10,000,000 bytes; the budget below is
+        // small enough that the estimate-based planner would still admit
+        // every file into one batch (on-disk size is a few hundred bytes
+        // each, so the whole batch's *estimate* stays under budget).
+        let target_chunk_bytes = 500_000;
+        let mut chunk_iter = SequenceChunkIterator::new(&paths, dir, target_chunk_bytes);
+
+        let first = chunk_iter
+            .next_chunk()
+            .unwrap()
+            .expect("expected at least one sequence");
+        assert!(
+            first.len() < N,
+            "expected the real-bytes-per-wave guard to stop well short of the full \
+             {N}-file estimate-planned batch, got {} sequences in a single next_chunk() call \
+             against a {target_chunk_bytes}-byte budget",
+            first.len()
+        );
+
+        // No data lost: every file must still come back across subsequent calls.
+        let mut total = first.len();
+        while let Some(chunk) = chunk_iter.next_chunk().unwrap() {
+            total += chunk.len();
+        }
+        assert_eq!(total, N, "expected all {N} sequences across all chunks");
     }
 
     #[test]
