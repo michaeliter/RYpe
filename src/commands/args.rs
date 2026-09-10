@@ -447,9 +447,13 @@ WHEN TO USE 'run' vs 'aggregate':
         use_bloom_filter: bool,
 
         /// Enable parallel row group reading for Parquet input files.
-        /// Processes N row groups in parallel for faster decompression.
-        /// Default: 4 when enabled, 0 = disabled (sequential reading).
-        /// Most effective with SSDs when decompression is CPU-bound.
+        /// Processes up to N row groups concurrently for faster decompression.
+        /// 0 (default) = sequential reading.
+        /// Row group count is fixed when the file is written, not by this flag: a file
+        /// with only 1 row group (the common case for query Parquet written without an
+        /// explicit row-group size) sees no benefit from any N > 1. Convert with a
+        /// smaller row-group size (~50-100 MB uncompressed per group) to make this
+        /// effective. Most effective with SSDs when decompression is CPU-bound.
         #[arg(long, default_value_t = 0)]
         parallel_input_rg: usize,
 
@@ -631,6 +635,13 @@ EXAMPLES:
         use_bloom_filter: bool,
 
         /// Enable parallel row group reading for Parquet input files.
+        /// Processes up to N row groups concurrently for faster decompression.
+        /// 0 (default) = sequential reading.
+        /// Row group count is fixed when the file is written, not by this flag: a file
+        /// with only 1 row group (the common case for query Parquet written without an
+        /// explicit row-group size) sees no benefit from any N > 1. Convert with a
+        /// smaller row-group size (~50-100 MB uncompressed per group) to make this
+        /// effective. Most effective with SSDs when decompression is CPU-bound.
         #[arg(long, default_value_t = 0)]
         parallel_input_rg: usize,
 

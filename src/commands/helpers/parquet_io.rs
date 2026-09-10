@@ -6,17 +6,79 @@ use arrow::datatypes::DataType;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
-use rayon::prelude::*;
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use rype::{FirstErrorCapture, QueryRecord};
 
 use super::fastx_io::OwnedFastxRecord;
+
+/// Bounded semaphore gating how many row groups may be claimed-but-not-yet-
+/// emitted at once in `reader_thread_parallel`'s bounded work queue. Without
+/// this, workers can race arbitrarily far ahead of a straggler row group
+/// (or a slow consumer), buffering unboundedly decoded data in the reorder
+/// buffer -- this caps that to `capacity` outstanding row groups, matching
+/// the old chunked design's memory bound while still letting workers keep
+/// claiming new work as soon as the *oldest* unemitted one clears, rather
+/// than waiting for an entire fixed-size chunk to finish.
+struct RowGroupWindow {
+    state: Mutex<RowGroupWindowState>,
+    cond: Condvar,
+}
+
+struct RowGroupWindowState {
+    available: usize,
+    aborted: bool,
+}
+
+impl RowGroupWindow {
+    fn new(capacity: usize) -> Self {
+        Self {
+            state: Mutex::new(RowGroupWindowState {
+                available: capacity,
+                aborted: false,
+            }),
+            cond: Condvar::new(),
+        }
+    }
+
+    /// Blocks until a permit is available or the window is aborted.
+    /// Returns `false` (no permit acquired) if aborted.
+    fn acquire(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        while state.available == 0 && !state.aborted {
+            state = self.cond.wait(state).unwrap();
+        }
+        if state.aborted {
+            return false;
+        }
+        state.available -= 1;
+        true
+    }
+
+    /// Returns a permit, waking one waiter (if any).
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.available += 1;
+        self.cond.notify_one();
+    }
+
+    /// Wakes every current and future waiter without granting a permit --
+    /// used when the emitter gives up early (error, or the consumer
+    /// dropped) so workers blocked on `acquire()` don't hang forever
+    /// waiting for a permit that will never come.
+    fn abort(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.aborted = true;
+        self.cond.notify_all();
+    }
+}
 
 /// Check if a file path indicates Parquet input.
 pub fn is_parquet_input(path: &Path) -> bool {
@@ -335,8 +397,8 @@ impl PrefetchingParquetReader {
     /// # Arguments
     /// * `path` - Path to the Parquet file
     /// * `batch_size` - Number of records per batch (controls Parquet reader batch size)
-    /// * `parallel_row_groups` - Optional number of row groups to process in parallel.
-    ///   If `Some(n)`, uses parallel reading with n row groups per chunk.
+    /// * `parallel_row_groups` - Optional number of row groups to read concurrently.
+    ///   If `Some(n)`, uses a bounded work queue of up to n concurrent readers.
     ///   If `None`, uses sequential reading (original behavior).
     ///
     /// # Returns
@@ -345,9 +407,13 @@ impl PrefetchingParquetReader {
     /// # Parallel Reading
     ///
     /// When `parallel_row_groups` is `Some(n)`:
-    /// - Row groups are processed in parallel chunks of size n
+    /// - Up to n row groups are read concurrently at any time; each worker claims the
+    ///   next unclaimed row group as soon as it finishes its current one, rather than
+    ///   waiting for a fixed-size batch of n to fully complete
     /// - Each parallel task opens its own file handle
-    /// - Results are sorted within each chunk to maintain ordering
+    /// - A reorder buffer re-serializes results to maintain row-group order, bounded to
+    ///   at most n claimed-but-not-yet-emitted row groups at once (see `RowGroupWindow`)
+    ///   so a slow row group can't let unbounded decoded data accumulate in memory
     /// - Most effective when decompression is CPU-bound (not I/O-bound)
     ///
     /// Recommended values:
@@ -586,17 +652,22 @@ impl PrefetchingParquetReader {
         let _ = sender.send(Ok(None));
     }
 
-    /// Background thread function that reads row groups in parallel chunks and sends batches.
+    /// Background thread function that reads row groups concurrently via a
+    /// bounded work queue and sends batches downstream in order.
     ///
-    /// This function processes row groups in parallel chunks using rayon, providing better
-    /// throughput when decompression is CPU-bound. Results are sorted within each chunk
-    /// to maintain ordering.
+    /// Up to `parallel_rg` worker tasks continuously claim the next unclaimed
+    /// row group from a shared cursor (rather than processing fixed-size
+    /// chunks), so a slow row group blocks only the emission of results that
+    /// come after it in order -- not the start of unrelated later reads. A
+    /// reorder buffer, bounded to `parallel_rg` claimed-but-not-yet-emitted
+    /// row groups via `RowGroupWindow`, re-serializes results before
+    /// forwarding them to `sender`.
     ///
     /// # Arguments
     /// * `path` - Path to the Parquet file
     /// * `_batch_size` - Ignored (use natural Parquet batching to avoid overflow)
     /// * `col_indices` - Column indices for projection
-    /// * `parallel_rg` - Number of row groups to process in parallel per chunk
+    /// * `parallel_rg` - Max row groups read concurrently / buffered awaiting emission
     /// * `sender` - Channel sender for batch results
     /// * `error_capture` - Thread-safe error capture for errors during send failures
     #[allow(clippy::too_many_arguments)]
@@ -655,99 +726,198 @@ impl PrefetchingParquetReader {
 
         // Wrap col_indices in Arc for sharing across threads
         let col_indices = Arc::new(col_indices);
+        let path = Arc::new(path);
 
-        // Process row groups in chunks of parallel_rg
-        for chunk_start in (0..num_row_groups).step_by(parallel_rg) {
-            let chunk_end = (chunk_start + parallel_rg).min(num_row_groups);
-            let rg_indices: Vec<usize> = (chunk_start..chunk_end).collect();
+        // Bounded work queue: up to `parallel_rg` workers continuously claim
+        // the next unclaimed row group from a shared cursor, instead of the
+        // old step_by(parallel_rg) chunking, where a slow row group blocked
+        // both the rest of its chunk *and* the start of the next chunk. A
+        // small reorder buffer re-serializes results before forwarding to
+        // `sender`, since downstream consumers require row-group order.
+        // `window` bounds how many row groups can be claimed-but-not-yet-
+        // emitted at once (see `RowGroupWindow`), so a straggler can't let
+        // decoded data pile up in `pending` without limit.
+        //
+        // Workers are plain OS threads, deliberately NOT rayon tasks: each
+        // one runs a `loop` that never returns control until all row groups
+        // are claimed, so scheduling them on rayon's shared global pool
+        // would let `parallel_rg` of them permanently occupy pool workers
+        // for the whole read. When `parallel_rg` is close to or exceeds
+        // `rayon::current_num_threads()`, that starves every *other* rayon
+        // caller sharing the pool -- including `process_batch()`'s own
+        // `par_iter()` extraction on the consumer thread, which then blocks
+        // forever waiting for a worker rayon will never free up (verified:
+        // this reproduced as a deterministic hang via the real CLI with
+        // `--parallel-input-rg` set to the machine's full thread count).
+        let next_rg = Arc::new(AtomicUsize::new(0));
+        let window = Arc::new(RowGroupWindow::new(parallel_rg.min(num_row_groups).max(1)));
+        let (result_tx, result_rx) = mpsc::channel::<(usize, Result<Vec<ParquetBatch>, String>)>();
 
-            // Read row groups in parallel, each task loads its own metadata for robustness
-            // Use Result collection pattern for clean error handling - first error fails the chunk
-            #[allow(clippy::type_complexity)]
-            let chunk_results: Result<Vec<(usize, Vec<ParquetBatch>)>, String> = rg_indices
-                .into_par_iter()
-                .map(|rg_idx| {
-                    // Each parallel task opens its own file handle and loads fresh metadata
-                    // This is more robust than sharing metadata across file handles
-                    let file = File::open(&path)
-                        .map_err(|e| format!("Failed to open file for RG {}: {}", rg_idx, e))?;
+        let mut worker_handles = Vec::with_capacity(parallel_rg.min(num_row_groups));
+        for _ in 0..parallel_rg.min(num_row_groups) {
+            let next_rg = Arc::clone(&next_rg);
+            let window = Arc::clone(&window);
+            let result_tx = result_tx.clone();
+            let path = Arc::clone(&path);
+            let col_indices = Arc::clone(&col_indices);
+            worker_handles.push(thread::spawn(move || loop {
+                // Acquire a permit *before* claiming an index. If this were
+                // reversed (claim, then acquire), a worker that claims a low
+                // index (possibly the one the emitter is currently waiting
+                // on) could be preempted between the two calls, letting
+                // workers that claimed *later* indices win every remaining
+                // permit first -- starving the low index's worker of a
+                // permit forever, since none can be released until that
+                // exact index is emitted. Acquiring first guarantees the
+                // first `capacity` indices are always granted a permit
+                // up front, with no ordering gap in between (verified: this
+                // reproduced as a real, scheduling-dependent deadlock with
+                // the old order, independent of rayon).
+                if !window.acquire() {
+                    break; // emitter aborted; no more permits will ever be granted
+                }
+                let rg_idx = next_rg.fetch_add(1, Ordering::Relaxed);
+                if rg_idx >= num_row_groups {
+                    window.release(); // no work left -- give back the unused permit
+                    break;
+                }
+                let result = Self::read_row_group(
+                    &path,
+                    rg_idx,
+                    &col_indices,
+                    trim_to,
+                    minimum_length,
+                    needs_trim_filter,
+                );
+                if result_tx.send((rg_idx, result)).is_err() {
+                    window.abort(); // emitter gave up -- unblock any siblings waiting on a permit
+                    break;
+                }
+            }));
+        }
+        // Drop this thread's own clone so `result_rx.recv()` below sees the
+        // channel close once every worker's clone is also dropped.
+        drop(result_tx);
 
-                    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-                        .map_err(|e| format!("Failed to create reader for RG {}: {}", rg_idx, e))?;
-
-                    // Build projection mask for this reader
-                    let projection = parquet::arrow::ProjectionMask::roots(
-                        builder.parquet_schema(),
-                        col_indices.iter().copied(),
-                    );
-
-                    // Use row group selection and projection, but let Parquet use natural batching.
-                    // Do NOT use .with_batch_size() with large values to avoid offset overflow.
-                    let reader = builder
-                        .with_row_groups(vec![rg_idx])
-                        .with_projection(projection)
-                        .build()
-                        .map_err(|e| format!("Failed to build reader for RG {}: {}", rg_idx, e))?;
-
-                    // Collect all batches from this row group
-                    let mut batches = Vec::new();
-                    for batch_result in reader {
-                        let batch = batch_result.map_err(|e| {
-                            format!("Error reading batch from RG {}: {}", rg_idx, e)
-                        })?;
-
-                        let headers = Self::extract_headers(&batch).map_err(|e| {
-                            format!("Error extracting headers from RG {}: {}", rg_idx, e)
-                        })?;
-
-                        // If trim/filter active, convert to Owned in this thread.
-                        // Each batch uses id_offset=0; ID remapping happens during accumulation.
-                        if needs_trim_filter {
-                            let (records, filtered_headers) = batch_to_owned_records_trimmed(
-                                &batch,
-                                &headers,
-                                trim_to,
-                                minimum_length,
-                                0,
-                            )
-                            .map_err(|e| {
-                                format!("Error trimming batch from RG {}: {}", rg_idx, e)
-                            })?;
-                            batches.push(ParquetBatch::Owned(records, filtered_headers));
-                        } else {
-                            batches.push(ParquetBatch::Arrow(batch, headers));
+        // Emitter: runs on this thread, overlapping with the still-running
+        // workers rather than waiting for them all to finish first,
+        // reordering results as they arrive and forwarding them to `sender`
+        // in row-group order. Every exit path falls through to joining the
+        // workers below instead of returning early, so none are left
+        // detached and still running past this function's return.
+        let mut pending: HashMap<usize, Vec<ParquetBatch>> = HashMap::new();
+        let mut next_to_emit = 0usize;
+        while next_to_emit < num_row_groups {
+            match result_rx.recv() {
+                Ok((rg_idx, Ok(batches))) => {
+                    pending.insert(rg_idx, batches);
+                    while let Some(batches) = pending.remove(&next_to_emit) {
+                        for parquet_batch in batches {
+                            if sender.send(Ok(Some(parquet_batch))).is_err() {
+                                window.abort();
+                                for handle in worker_handles {
+                                    let _ = handle.join();
+                                }
+                                return; // receiver dropped - exit cleanly
+                            }
                         }
+                        next_to_emit += 1;
+                        window.release();
                     }
-
-                    Ok((rg_idx, batches))
-                })
-                .collect();
-
-            // Handle chunk result - either process success or report first error
-            let mut sorted_results = match chunk_results {
-                Ok(results) => results,
-                Err(e) => {
-                    error_capture.store_msg(&e);
+                }
+                Ok((rg_idx, Err(e))) => {
+                    error_capture.store_msg(format!("Error reading row group {}: {}", rg_idx, e));
+                    window.abort();
+                    for handle in worker_handles {
+                        let _ = handle.join();
+                    }
                     return;
                 }
-            };
-
-            // Sort by row group index to maintain ordering
-            sorted_results.sort_by_key(|(idx, _)| *idx);
-
-            // Send batches in order
-            for (_, batches) in sorted_results {
-                for parquet_batch in batches {
-                    if sender.send(Ok(Some(parquet_batch))).is_err() {
-                        // Receiver dropped - exit cleanly
-                        return;
+                Err(_) => {
+                    // Every worker exited without completing every row
+                    // group. Don't stamp a message here: if a worker
+                    // panicked, joining below re-raises that panic on this
+                    // thread, and the real panic message should win over a
+                    // placeholder -- `next_batch()`'s disconnected-error
+                    // handling already falls back to a clear message
+                    // ("Prefetch thread panicked"/"exited unexpectedly")
+                    // if `error_capture` is empty.
+                    window.abort();
+                    for handle in worker_handles {
+                        let _ = handle.join();
                     }
+                    return;
                 }
             }
         }
 
-        // Send None to signal completion
-        let _ = sender.send(Ok(None));
+        for handle in worker_handles {
+            let _ = handle.join();
+        }
+
+        // Send None to signal completion, unless a row group failed above --
+        // on error, falling through here (without sending) drops `sender`,
+        // so `next_batch()` sees a closed channel and reports the message
+        // stashed in `error_capture`.
+        if error_capture.get().is_none() {
+            let _ = sender.send(Ok(None));
+        }
+    }
+
+    /// Read one row group's batches, applying trim/filter if active.
+    ///
+    /// Each call opens its own file handle and loads fresh metadata, which
+    /// is more robust than sharing metadata/handles across threads.
+    fn read_row_group(
+        path: &Path,
+        rg_idx: usize,
+        col_indices: &[usize],
+        trim_to: Option<usize>,
+        minimum_length: Option<usize>,
+        needs_trim_filter: bool,
+    ) -> Result<Vec<ParquetBatch>, String> {
+        let file = File::open(path)
+            .map_err(|e| format!("Failed to open file for RG {}: {}", rg_idx, e))?;
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| format!("Failed to create reader for RG {}: {}", rg_idx, e))?;
+
+        // Build projection mask for this reader
+        let projection = parquet::arrow::ProjectionMask::roots(
+            builder.parquet_schema(),
+            col_indices.iter().copied(),
+        );
+
+        // Use row group selection and projection, but let Parquet use natural batching.
+        // Do NOT use .with_batch_size() with large values to avoid offset overflow.
+        let reader = builder
+            .with_row_groups(vec![rg_idx])
+            .with_projection(projection)
+            .build()
+            .map_err(|e| format!("Failed to build reader for RG {}: {}", rg_idx, e))?;
+
+        // Collect all batches from this row group
+        let mut batches = Vec::new();
+        for batch_result in reader {
+            let batch = batch_result
+                .map_err(|e| format!("Error reading batch from RG {}: {}", rg_idx, e))?;
+
+            let headers = Self::extract_headers(&batch)
+                .map_err(|e| format!("Error extracting headers from RG {}: {}", rg_idx, e))?;
+
+            // If trim/filter active, convert to Owned in this thread.
+            // Each batch uses id_offset=0; ID remapping happens during accumulation.
+            if needs_trim_filter {
+                let (records, filtered_headers) =
+                    batch_to_owned_records_trimmed(&batch, &headers, trim_to, minimum_length, 0)
+                        .map_err(|e| format!("Error trimming batch from RG {}: {}", rg_idx, e))?;
+                batches.push(ParquetBatch::Owned(records, filtered_headers));
+            } else {
+                batches.push(ParquetBatch::Arrow(batch, headers));
+            }
+        }
+
+        Ok(batches)
     }
 
     /// Extract headers (read_ids) from a RecordBatch.
@@ -1206,6 +1376,57 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use std::path::Path;
     use std::sync::Arc;
+
+    // -------------------------------------------------------------------------
+    // Tests for RowGroupWindow
+    // -------------------------------------------------------------------------
+
+    /// Spawns a thread blocked in `acquire()` and confirms it hasn't
+    /// returned yet. Not asserting on exact timing -- the sleep is a
+    /// generous margin to avoid a false pass by checking before the thread
+    /// has had any chance to run at all.
+    fn spawn_blocked_acquire(window: &Arc<RowGroupWindow>) -> std::thread::JoinHandle<bool> {
+        let window = Arc::clone(window);
+        let handle = std::thread::spawn(move || window.acquire());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !handle.is_finished(),
+            "acquire() must block while the window is exhausted, not return immediately"
+        );
+        handle
+    }
+
+    #[test]
+    fn test_row_group_window_blocks_when_exhausted_and_unblocks_on_release() {
+        let window = Arc::new(RowGroupWindow::new(2));
+        assert!(window.acquire());
+        assert!(window.acquire());
+
+        // Window now has 0 available permits; a third acquire on another
+        // thread must block until a release happens.
+        let handle = spawn_blocked_acquire(&window);
+
+        window.release();
+        assert!(
+            handle.join().unwrap(),
+            "acquire() must unblock and return true once a permit is released"
+        );
+    }
+
+    #[test]
+    fn test_row_group_window_abort_unblocks_waiters_without_a_permit() {
+        let window = Arc::new(RowGroupWindow::new(1));
+        assert!(window.acquire()); // exhaust the single permit
+
+        let handle = spawn_blocked_acquire(&window);
+
+        window.abort();
+        assert!(
+            !handle.join().unwrap(),
+            "acquire() must return false (no permit) once aborted, not hang forever \
+             waiting for a release that will never come"
+        );
+    }
 
     // -------------------------------------------------------------------------
     // Tests for is_parquet_input
@@ -1697,6 +1918,66 @@ mod tests {
         reader.finish().unwrap();
     }
 
+    /// Write a Parquet file with one row group per record (forcing a
+    /// boundary via `flush()` after each write), so tests can exercise
+    /// cross-row-group ordering with `parallel_row_groups` set below the
+    /// row group count.
+    fn write_test_parquet_multi_rg(dir: &std::path::Path, ids: &[&str], seqs: &[&str]) -> PathBuf {
+        let path = dir.join("test_multi_rg.parquet");
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            Field::new("read_id", DataType::LargeUtf8, false),
+            Field::new("sequence1", DataType::LargeUtf8, false),
+        ]));
+
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), None).unwrap();
+
+        for (id, seq) in ids.iter().zip(seqs.iter()) {
+            let id_array = LargeStringArray::from_iter_values([*id]);
+            let seq_array = LargeStringArray::from_iter_values([*seq]);
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(id_array), Arc::new(seq_array)],
+            )
+            .unwrap();
+            writer.write(&batch).unwrap();
+            writer.flush().unwrap(); // force a row-group boundary per record
+        }
+
+        writer.close().unwrap();
+        path
+    }
+
+    #[test]
+    fn test_prefetching_parquet_reader_parallel_preserves_order_across_many_row_groups() {
+        let dir = tempdir().unwrap();
+        let ids: Vec<String> = (0..10).map(|i| format!("r{i}")).collect();
+        let seqs: Vec<String> = (0..10).map(|i| "ACGT".repeat(i + 1)).collect();
+        let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        let seq_refs: Vec<&str> = seqs.iter().map(|s| s.as_str()).collect();
+        let path = write_test_parquet_multi_rg(dir.path(), &id_refs, &seq_refs);
+
+        // 10 row groups, parallelism of 3 -- under the old step_by(parallel_rg)
+        // chunking this forces uneven waves (3+3+3+1); it exercises the
+        // bounded-queue reorder buffer's uneven-leftover path the same way.
+        let mut reader =
+            PrefetchingParquetReader::with_parallel_row_groups(&path, 1000, Some(3), None, None)
+                .unwrap();
+
+        let mut all_headers = Vec::new();
+        while let Some(batch) = reader.next_batch().unwrap() {
+            let (record_batch, headers) = batch.into_arrow();
+            assert_eq!(record_batch.num_rows(), headers.len());
+            all_headers.extend(headers);
+        }
+
+        assert_eq!(
+            all_headers, ids,
+            "row groups must be emitted in original file order regardless of read concurrency"
+        );
+        reader.finish().unwrap();
+    }
+
     #[test]
     fn test_prefetching_parquet_reader_no_filter_returns_arrow() {
         let dir = tempdir().unwrap();
@@ -1721,5 +2002,161 @@ mod tests {
 
         assert_eq!(total_rows, 3);
         reader.finish().unwrap();
+    }
+
+    /// Regression test for a deadlock: `reader_thread_parallel`'s row-group
+    /// workers must not be scheduled as rayon tasks on the shared global
+    /// pool. Each worker runs a `loop` that never returns control until all
+    /// row groups are claimed, so when they *were* `rayon::scope` tasks,
+    /// setting `parallel_rg >= rayon::current_num_threads()` let them
+    /// permanently occupy every pool worker for the whole read -- starving
+    /// any *other* rayon caller sharing the pool. In production that other
+    /// caller is `process_batch()`'s own `par_iter()` extraction on the
+    /// consumer thread, interleaved between `next_batch()` calls exactly as
+    /// this test does; it would then block forever waiting for a worker
+    /// rayon can never free up, since the reader's own workers never yield.
+    /// Reproduced as a deterministic hang via the real CLI before the fix
+    /// (switching the workers to plain `std::thread::spawn` OS threads,
+    /// which don't compete with rayon's pool at all).
+    #[test]
+    fn test_parallel_reader_does_not_starve_concurrent_rayon_work() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("oversubscribed.parquet");
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            Field::new("read_id", DataType::LargeUtf8, false),
+            Field::new("sequence1", DataType::LargeUtf8, false),
+        ]));
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), None).unwrap();
+
+        let num_threads = rayon::current_num_threads();
+        // Enough row groups to keep every worker busy for a few rounds, with
+        // real (non-instant) per-row-group work, so the concurrent rayon
+        // call below has a real chance to be attempted while the read is
+        // still in flight rather than after it has already finished.
+        let num_row_groups = num_threads * 4;
+        for rg in 0..num_row_groups {
+            let ids: Vec<String> = (0..500).map(|i| format!("rg{}_r{}", rg, i)).collect();
+            let seqs: Vec<String> = (0..500).map(|_| "A".repeat(300)).collect();
+            let id_array = LargeStringArray::from_iter_values(ids.iter().map(|s| s.as_str()));
+            let seq_array = LargeStringArray::from_iter_values(seqs.iter().map(|s| s.as_str()));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(id_array), Arc::new(seq_array)],
+            )
+            .unwrap();
+            writer.write(&batch).unwrap();
+            writer.flush().unwrap();
+        }
+        writer.close().unwrap();
+        let total = num_row_groups * 500;
+
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            // Deliberately oversubscribed relative to the pool, matching
+            // the shape that deadlocked in production.
+            let mut reader = PrefetchingParquetReader::with_parallel_row_groups(
+                &path,
+                1000,
+                Some(num_threads + 4),
+                None,
+                None,
+            )
+            .unwrap();
+            let mut count = 0;
+            while let Some(batch) = reader.next_batch().unwrap() {
+                let (rb, _) = batch.into_arrow();
+                count += rb.num_rows();
+                // Mirrors classify.rs's process_batch(): real rayon work on
+                // the consumer thread, interleaved with reads.
+                use rayon::prelude::*;
+                let _: u64 = (0..10_000u64).into_par_iter().map(|x| x * x).sum();
+            }
+            reader.finish().unwrap();
+            let _ = done_tx.send(count);
+        });
+
+        match done_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(count) => assert_eq!(count, total),
+            Err(_) => panic!(
+                "HUNG: parallel reader starved concurrent rayon work \
+                 (did not finish within 30s)"
+            ),
+        }
+    }
+
+    /// Generates `scratch/bench-uneven-rg-large.parquet`: 104 row groups,
+    /// mostly small (2,000 short reads each) but with a much larger
+    /// "straggler" row group (20,000 longer reads) at every 8th position --
+    /// matching the old `step_by(parallel_rg=8)` chunking, so every chunk
+    /// pays a "wait for the slow one" barrier under the old lockstep design.
+    /// This is the scenario Phase 4's bounded-work-queue rewrite targets:
+    /// letting workers race ahead into later chunks' fast row groups instead
+    /// of idling at each synthetic chunk boundary. Not run in CI; regenerate
+    /// manually before benchmarking `--parallel-input-rg` with
+    /// `cargo test --release -- --ignored gen_bench_fixture`.
+    #[test]
+    #[ignore]
+    fn gen_bench_fixture_uneven_row_groups() {
+        let dir = Path::new("scratch");
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("bench-uneven-rg-large.parquet");
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            Field::new("read_id", DataType::LargeUtf8, false),
+            Field::new("sequence1", DataType::LargeUtf8, false),
+        ]));
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), None).unwrap();
+
+        // Deterministic pseudo-random ACGT sequence, no `rand` dependency needed.
+        fn make_seq(seed: usize, len: usize) -> String {
+            const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+            let mut state = seed as u64 ^ 0x9E3779B97F4A7C15;
+            (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    BASES[(state % 4) as usize] as char
+                })
+                .collect()
+        }
+
+        let mut write_row_group = |start_id: usize, count: usize, seq_len: usize| {
+            let ids: Vec<String> = (0..count).map(|i| format!("r{}", start_id + i)).collect();
+            let seqs: Vec<String> = (0..count)
+                .map(|i| make_seq(start_id + i, seq_len))
+                .collect();
+            let id_array = LargeStringArray::from_iter_values(ids.iter().map(|s| s.as_str()));
+            let seq_array = LargeStringArray::from_iter_values(seqs.iter().map(|s| s.as_str()));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(id_array), Arc::new(seq_array)],
+            )
+            .unwrap();
+            writer.write(&batch).unwrap();
+            writer.flush().unwrap();
+        };
+
+        // A straggler in *every* chunk-sized window (matching the old
+        // step_by(parallel_rg=8) chunking): this is the pattern where the
+        // old lockstep design pays a "wait for the slow one" barrier on
+        // every single chunk, while the bounded-window design lets workers
+        // race ahead into later chunks' fast row groups instead of idling
+        // at each synthetic chunk boundary.
+        let mut next_id = 0usize;
+        for rg in 0..104 {
+            if rg % 8 == 0 {
+                write_row_group(next_id, 20_000, 500); // straggler
+                next_id += 20_000;
+            } else {
+                write_row_group(next_id, 2_000, 150);
+                next_id += 2_000;
+            }
+        }
+        writer.close().unwrap();
+
+        eprintln!("wrote {} ({} total reads)", path.display(), next_id);
     }
 }
