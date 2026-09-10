@@ -6468,3 +6468,98 @@ fn test_negative_index_run_reports_nonzero_passes() -> Result<()> {
 
     Ok(())
 }
+
+/// Test that `from-config --timing` reports sub-phase timings for the single-bucket
+/// streaming build, not just one opaque `bucket_building` total.
+///
+/// Without per-phase attribution, a build regression (e.g. a change that
+/// accidentally makes the k-way merge or the flush sort slower) is invisible in
+/// `--timing` output -- it just shows up as a bigger `bucket_building` number with
+/// no clue which of "reading files", "extracting minimizers", "merging", or
+/// "flushing to Parquet" caused it. This test pins the specific labels a future
+/// profiling pass depends on, and forces multiple chunk iterations (via a small
+/// `--max-memory`) so an accumulation bug -- e.g. overwriting a running total
+/// instead of adding to it -- cannot hide behind a single-chunk build.
+#[test]
+fn test_from_config_timing_reports_build_sub_phases() -> Result<()> {
+    let dir = tempdir()?;
+    let binary = get_binary_path();
+
+    fn make_sequence(seed: u64, length: usize) -> Vec<u8> {
+        let mut state = seed;
+        (0..length)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                match (state >> 32) % 4 {
+                    0 => b'A',
+                    1 => b'C',
+                    2 => b'G',
+                    _ => b'T',
+                }
+            })
+            .collect()
+    }
+
+    // Several small files, forced into multiple chunks via --max-memory, so the
+    // accumulation loop in build_single_bucket_streaming actually runs more than
+    // once per timing label.
+    let seq = make_sequence(7, 500_000);
+    let seq_str = std::str::from_utf8(&seq).unwrap();
+    let mut file_list = String::new();
+    for i in 0..10 {
+        let path = dir.path().join(format!("ref{}.fa", i));
+        fs::write(&path, format!(">seq{}\n{}\n", i, seq_str))?;
+        if !file_list.is_empty() {
+            file_list.push_str(", ");
+        }
+        file_list.push_str(&format!("\"{}\"", path.to_str().unwrap()));
+    }
+
+    let config_path = dir.path().join("config.toml");
+    let config_content = format!(
+        r#"
+[index]
+k = 32
+window = 10
+salt = 0x5555555555555555
+output = "test_timing.ryxdi"
+
+[buckets.TestBucket]
+files = [{}]
+"#,
+        file_list,
+    );
+    fs::write(&config_path, &config_content)?;
+
+    let output = Command::new(&binary)
+        .args([
+            "index",
+            "from-config",
+            "-c",
+            config_path.to_str().unwrap(),
+            "--max-memory",
+            "4M",
+            "--timing",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Index creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for label in [
+        "build: chunk_read",
+        "build: extract",
+        "build: kway_merge",
+        "build: accumulate",
+    ] {
+        assert!(
+            stderr.contains(label),
+            "expected `--timing` stderr to contain a \"{label}\" line, got:\n{stderr}"
+        );
+    }
+
+    Ok(())
+}

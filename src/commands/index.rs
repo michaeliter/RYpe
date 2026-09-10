@@ -1265,7 +1265,21 @@ fn build_single_bucket_streaming(
         SequenceChunkIterator::new(files, config_dir, chunk_config.target_chunk_bytes);
     let mut chunk_count = 0;
 
-    while let Some(chunk) = chunk_iter.next_chunk()? {
+    // Sub-phase timing, accumulated across all chunk iterations and reported once
+    // below -- see docs/architecture.md's build lifecycle section for how this
+    // fits into the overall `parquet_index: bucket_building` total.
+    let mut t_chunk_read_ms: u128 = 0;
+    let mut t_extract_ms: u128 = 0;
+    let mut t_kway_merge_ms: u128 = 0;
+    let mut t_accumulate_ms: u128 = 0;
+
+    loop {
+        let t_chunk_read = Instant::now();
+        let next = chunk_iter.next_chunk()?;
+        t_chunk_read_ms += t_chunk_read.elapsed().as_millis();
+        let Some(chunk) = next else {
+            break;
+        };
         chunk_count += 1;
         let chunk_size: usize = chunk.iter().map(|(seq, _)| seq.len()).sum();
         let t_chunk = std::time::Instant::now();
@@ -1290,6 +1304,7 @@ fn build_single_bucket_streaming(
         let estimated_mins = MinimizerWorkspace::estimate_for_length(avg_len, k, w);
 
         // Parallel extraction within chunk
+        let t_extract = Instant::now();
         let chunk_mins: Vec<Vec<u64>> = chunk
             .par_iter()
             .map_init(
@@ -1302,9 +1317,12 @@ fn build_single_bucket_streaming(
                 },
             )
             .collect();
+        t_extract_ms += t_extract.elapsed().as_millis();
 
         // K-way merge this chunk's results
+        let t_kway_merge = Instant::now();
         let chunk_merged = kway_merge_dedup(chunk_mins);
+        t_kway_merge_ms += t_kway_merge.elapsed().as_millis();
         let chunk_unique_before_filter = chunk_merged.len();
 
         // Filter out excluded minimizers if subtraction is active
@@ -1325,6 +1343,7 @@ fn build_single_bucket_streaming(
 
         // Stream to accumulator in batches, checking flush threshold between batches.
         // This ensures shards don't exceed max_shard_bytes even with large chunks.
+        let t_accumulate = Instant::now();
         let mut chunk_flushes = 0usize;
         for batch in chunk_merged.chunks(add_batch_entries) {
             accumulator.add_entries_from_minimizers(batch, BUCKET_ID);
@@ -1343,6 +1362,7 @@ fn build_single_bucket_streaming(
                 }
             }
         }
+        t_accumulate_ms += t_accumulate.elapsed().as_millis();
         let chunk_elapsed = t_chunk.elapsed();
         log::info!(
             "  Chunk {} done in {:.2}s: {} unique → {} written ({} excluded), {} flush(es)",
@@ -1354,6 +1374,11 @@ fn build_single_bucket_streaming(
             chunk_flushes,
         );
     }
+
+    log_timing("build: chunk_read", t_chunk_read_ms);
+    log_timing("build: extract", t_extract_ms);
+    log_timing("build: kway_merge", t_kway_merge_ms);
+    log_timing("build: accumulate", t_accumulate_ms);
 
     if total_excluded > 0 {
         log::info!(
@@ -1402,6 +1427,7 @@ fn build_single_bucket_streaming(
         "Consolidation took {:.2}s",
         t_consolidate.elapsed().as_secs_f64()
     );
+    log_timing("build: consolidate", t_consolidate.elapsed().as_millis());
 
     log::info!(
         "Completed bucket '{}': {} minimizers, {} shards ({} chunks processed)",
