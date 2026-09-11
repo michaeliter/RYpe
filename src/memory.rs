@@ -690,10 +690,8 @@ fn sample_parquet_lengths(
 ) -> Option<(usize, usize, bool)> {
     use arrow::array::{Array, LargeStringArray, StringArray};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use std::fs::File;
-
     // Open Parquet file
-    let file = File::open(path).ok()?;
+    let file = crate::indices::parquet::ParquetFile::open(path).ok()?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
 
     let schema = builder.schema();

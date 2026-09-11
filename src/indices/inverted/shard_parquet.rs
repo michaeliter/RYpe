@@ -338,9 +338,7 @@ impl InvertedIndex {
         use parquet::file::reader::FileReader;
         use parquet::file::serialized_reader::SerializedFileReader;
         use parquet::file::statistics::Statistics;
-        use std::fs::File;
-
-        let file = File::open(path)?;
+        let file = crate::indices::parquet::ParquetFile::open(path)?;
         let reader = SerializedFileReader::new(file)?;
         let metadata = reader.metadata();
         let num_row_groups = metadata.num_row_groups();

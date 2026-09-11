@@ -206,6 +206,7 @@ fn load_filtered_coo_pairs(
     query_minimizers: &[u64],
     options: Option<&super::super::parquet::ParquetReadOptions>,
 ) -> Result<Vec<(u64, u32)>> {
+    use crate::indices::parquet::ParquetFile;
     use arrow::array::{Array, UInt32Array, UInt64Array};
     use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
     use parquet::file::properties::ReaderProperties;
@@ -213,7 +214,6 @@ fn load_filtered_coo_pairs(
     use parquet::file::serialized_reader::{ReadOptionsBuilder, SerializedFileReader};
     use parquet::file::statistics::Statistics;
     use rayon::prelude::*;
-    use std::fs::File;
 
     let use_bloom_filter = options.map(|o| o.use_bloom_filter).unwrap_or(false);
 
@@ -244,7 +244,8 @@ fn load_filtered_coo_pairs(
     // When bloom filter is enabled, we keep the reader alive longer to access bloom
     // filters for each row group after statistics filtering.
     let matching_row_groups: Vec<(usize, u64, u64)> = {
-        let file = File::open(path).map_err(|e| RypeError::io(path, "open Parquet shard", e))?;
+        let file =
+            ParquetFile::open(path).map_err(|e| RypeError::io(path, "open Parquet shard", e))?;
 
         // Use new_with_options when bloom filter reading is requested
         let parquet_reader = if use_bloom_filter {
@@ -411,7 +412,8 @@ fn load_filtered_coo_pairs(
     // re-deserialize the full footer (which itself lists every row group's
     // statistics) just to build a reader for a single row group.
     let arrow_metadata = {
-        let file = File::open(path).map_err(|e| RypeError::io(path, "open Parquet shard", e))?;
+        let file =
+            ParquetFile::open(path).map_err(|e| RypeError::io(path, "open Parquet shard", e))?;
         ArrowReaderMetadata::load(&file, Default::default())?
     };
 
@@ -505,7 +507,7 @@ fn load_filtered_coo_pairs(
 
             let rg_indices: Vec<usize> = chunk.iter().map(|&(rg_idx, _, _)| rg_idx).collect();
 
-            let file = File::open(&path)?;
+            let file = ParquetFile::open(&path)?;
             let builder =
                 ParquetRecordBatchReaderBuilder::new_with_metadata(file, arrow_metadata.clone());
             let mut reader = builder.with_row_groups(rg_indices).build()?;
@@ -773,10 +775,10 @@ pub fn load_row_group_pairs(
     rg_idx: usize,
     query_minimizers: &[u64],
 ) -> Result<Vec<(u64, u32)>> {
+    use crate::indices::parquet::ParquetFile;
     use arrow::array::{Array, UInt32Array, UInt64Array};
     use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
     use parquet::file::statistics::Statistics;
-    use std::fs::File;
 
     if query_minimizers.is_empty() {
         return Ok(Vec::new());
@@ -787,7 +789,7 @@ pub fn load_row_group_pairs(
     // Arrow reader (further down). Previously this opened the file and parsed
     // the footer twice per call, which is expensive when a shard has many row
     // groups (the footer lists every row group's statistics).
-    let file = File::open(path).map_err(|e| RypeError::io(path, "open Parquet file", e))?;
+    let file = ParquetFile::open(path).map_err(|e| RypeError::io(path, "open Parquet file", e))?;
     let arrow_metadata = ArrowReaderMetadata::load(&file, Default::default())?;
     let metadata = arrow_metadata.metadata();
 
@@ -929,12 +931,12 @@ pub struct RowGroupRangeInfo {
 /// # Errors
 /// Returns an error if the file cannot be opened or lacks statistics.
 pub fn get_row_group_ranges(path: &std::path::Path) -> Result<Vec<RowGroupRangeInfo>> {
+    use crate::indices::parquet::ParquetFile;
     use parquet::file::reader::FileReader;
     use parquet::file::serialized_reader::SerializedFileReader;
     use parquet::file::statistics::Statistics;
-    use std::fs::File;
 
-    let file = File::open(path).map_err(|e| RypeError::io(path, "open Parquet file", e))?;
+    let file = ParquetFile::open(path).map_err(|e| RypeError::io(path, "open Parquet file", e))?;
     let parquet_reader = SerializedFileReader::new(file)?;
     let metadata = parquet_reader.metadata();
 

@@ -16,10 +16,13 @@
 
 mod arrow_build;
 mod buckets;
+mod file_reader;
 mod manifest;
 pub mod merge;
 mod options;
 mod streaming;
+
+pub use file_reader::ParquetFile;
 
 /// Format version for the Parquet-based index.
 /// Increment when making breaking changes to the format.

@@ -157,8 +157,8 @@ pub fn read_buckets_parquet(
 )> {
     let path = index_dir.join(files::BUCKETS);
 
-    let file =
-        File::open(&path).map_err(|e| RypeError::io(path.clone(), "open buckets file", e))?;
+    let file = super::ParquetFile::open(&path)
+        .map_err(|e| RypeError::io(path.clone(), "open buckets file", e))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
 
     // Detect whether stats columns are present
