@@ -1195,31 +1195,23 @@ mod tests {
     }
 
     #[test]
-    fn parallel_rg_classification_uses_attached_sidecar() {
-        // --parallel-rg reads Parquet row groups directly; with a sidecar
-        // attached it must not silently bypass it. Rewrite every sidecar row
-        // to bucket 5 (a real bucket, so the accumulator accepts it).
+    fn parallel_rg_classification_rejects_attached_sidecar() {
+        // Row-group parallelism decodes Parquet directly; with a sidecar
+        // attached it must fail loudly rather than silently bypass it.
         let (_tmp, idx) = exported_index(test_buckets(), 1 << 40);
-        let bids = raw_shard_path(&idx.join(RAW_DIR), 0, BUCKET_IDS_FILE);
-        let n = std::fs::metadata(&bids).unwrap().len() as usize / 4;
-        let bytes: Vec<u8> = vec![5u32; n].iter().flat_map(|b| b.to_le_bytes()).collect();
-        std::fs::write(&bids, bytes).unwrap();
-
         let mut sharded = ShardedInvertedIndex::open(&idx).unwrap();
         sharded.attach_raw(RawLoad::Mmap).unwrap();
-        let fwd = make_query(61, &all_minimizers(&idx), 200, 0, false);
-        let mut fwd_unique = fwd.clone();
-        fwd_unique.dedup();
-        let hits = crate::classify::classify_from_extracted_minimizers_parallel_rg(
+        let mut fwd = make_query(61, &all_minimizers(&idx), 200, 0, false);
+        fwd.dedup();
+        let err = crate::classify::classify_from_extracted_minimizers_parallel_rg(
             &sharded,
-            &[(fwd_unique, Vec::new())],
+            &[(fwd, Vec::new())],
             &[7],
             0.0,
             None,
         )
-        .unwrap();
-        assert!(!hits.is_empty(), "precondition");
-        assert!(hits.iter().all(|h| h.bucket_id == 5), "got {:?}", hits);
+        .unwrap_err();
+        assert!(err.to_string().contains("raw sidecar"), "got: {err}");
     }
 
     fn copy_dir(src: &Path, dst: &Path) {

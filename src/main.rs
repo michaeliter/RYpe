@@ -412,10 +412,7 @@ fn main() -> Result<()> {
                     ENABLE_TIMING.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
 
-                let raw_index = raw_index.then_some(match raw_load.as_deref() {
-                    Some("read") => rype::RawLoad::Read,
-                    _ => rype::RawLoad::Mmap,
-                });
+                let raw_index = raw_index.then(|| raw_load.map_or(rype::RawLoad::Mmap, Into::into));
                 run_classify(ClassifyRunArgs {
                     common: CommonClassifyArgs {
                         index,

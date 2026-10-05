@@ -68,12 +68,6 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
              Use --wide without --threshold, or omit --wide to use threshold filtering."
         ));
     }
-    if args.raw_index.is_some() && args.common.parallel_rg {
-        return Err(anyhow!(
-            "--raw-index is incompatible with --parallel-rg: row-group parallelism decodes \
-             Parquet row groups directly (raw lookups are already parallel)."
-        ));
-    }
 
     // Load negative index if provided (memory-efficient sharded filtering)
     let negative_sharded: Option<ShardedInvertedIndex> = if let Some(ref neg_path) =

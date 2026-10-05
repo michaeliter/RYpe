@@ -457,8 +457,8 @@ fn run_sorted(binary: &Path, args: &[&str]) -> Vec<String> {
     lines
 }
 
-/// Build a two-bucket (phiX, pUC19) index and a pUC19-only negative index,
-/// both with raw sidecars exported. Returns (positive, negative) paths.
+/// Build a two-bucket (phiX, pUC19) index with a raw sidecar, and a
+/// pUC19-only negative index. Returns (positive, negative) paths.
 fn raw_test_indices(binary: &Path, dir: &Path, manifest_dir: &str) -> (PathBuf, PathBuf) {
     let examples = Path::new(manifest_dir).join("examples");
     let phix = examples.join("phiX174.fasta");
@@ -498,12 +498,11 @@ fn raw_test_indices(binary: &Path, dir: &Path, manifest_dir: &str) -> (PathBuf, 
             "10",
         ],
     );
-    for idx in [&pos, &neg] {
-        run_sorted(
-            binary,
-            &["index", "export-raw", "-i", idx.to_str().unwrap()],
-        );
-    }
+    // Only the positive index is served from a sidecar; -N stays Parquet.
+    run_sorted(
+        binary,
+        &["index", "export-raw", "-i", pos.to_str().unwrap()],
+    );
     (pos, neg)
 }
 
@@ -615,6 +614,8 @@ fn test_cli_classify_raw_index_rejections() -> Result<()> {
     );
     let err = stderr_of(&["--raw-index", "--parallel-rg"]);
     assert!(err.contains("--parallel-rg"), "parallel-rg: {err}");
+    let err = stderr_of(&["--raw-index", "--use-bloom-filter"]);
+    assert!(err.contains("--use-bloom-filter"), "bloom: {err}");
 
     let err = stderr_of(&["--raw-load", "read"]);
     assert!(

@@ -1,6 +1,6 @@
 //! Command-line argument definitions for the rype CLI.
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 use super::helpers::{
@@ -365,6 +365,22 @@ EXAMPLES:
     },
 }
 
+/// CLI form of [`rype::RawLoad`].
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum RawLoadArg {
+    Mmap,
+    Read,
+}
+
+impl From<RawLoadArg> for rype::RawLoad {
+    fn from(arg: RawLoadArg) -> Self {
+        match arg {
+            RawLoadArg::Mmap => rype::RawLoad::Mmap,
+            RawLoadArg::Read => rype::RawLoad::Read,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum ClassifyCommands {
     /// Classify reads against an index, one result line per read
@@ -496,13 +512,14 @@ WHEN TO USE 'run' vs 'aggregate':
 
         /// Search the index's raw sidecar in place (memory-mapped) instead of
         /// decoding Parquet shards. Create it once with `rype index export-raw`.
-        /// Incompatible with --parallel-rg.
-        #[arg(long)]
+        /// Applies to --index only; a --negative-index is still read from Parquet.
+        #[arg(long, conflicts_with_all = ["parallel_rg", "use_bloom_filter"])]
         raw_index: bool,
 
-        /// How --raw-index loads the sidecar: "mmap" (default) or "read" into memory.
-        #[arg(long, hide = true, requires = "raw_index", value_parser = ["mmap", "read"])]
-        raw_load: Option<String>,
+        /// Benchmarking only: how --raw-index loads the sidecar. "read" loads it
+        /// fully into memory, outside the --max-memory budget.
+        #[arg(long, hide = true, requires = "raw_index", value_enum)]
+        raw_load: Option<RawLoadArg>,
     },
 
     /// Pool all reads for sample-level classification (higher sensitivity)
