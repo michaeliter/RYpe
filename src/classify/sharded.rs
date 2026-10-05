@@ -697,6 +697,13 @@ pub fn classify_from_query_index_parallel_rg(
         return classify_from_query_index(sharded, query_idx, query_ids, threshold, _read_options);
     }
 
+    // Row-group parallelism reads Parquet directly; an attached raw sidecar is
+    // only reachable through the shard loop (whose lookups are parallel too).
+    if sharded.has_raw() {
+        log::info!("parallel row-group mode bypassed: shard loads use the raw sidecar");
+        return classify_from_query_index(sharded, query_idx, query_ids, threshold, _read_options);
+    }
+
     // Compute unique query minimizers once for shard/RG filtering and bloom filter hints
     let query_minimizers = query_idx.unique_minimizers();
     let (query_min, query_max) = match query_idx.minimizer_range() {

@@ -222,10 +222,13 @@ impl ShardedInvertedIndex {
     ) -> Option<Result<Vec<(u64, u32)>>> {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(raw) = &self.raw {
-            let shard = raw.shard(shard_id).ok_or_else(|| {
-                RypeError::validation(format!("shard {} missing from raw sidecar", shard_id))
-            });
-            return Some(shard.and_then(|s| s.load_coo_for_query(query_minimizers)));
+            let raw_dir = self.base_path.join(super::raw::RAW_DIR);
+            let pairs = raw
+                .shard(shard_id)
+                .ok_or_else(|| RypeError::validation(format!("shard {} not in sidecar", shard_id)))
+                .and_then(|s| s.load_coo_for_query(query_minimizers))
+                .map_err(|e| RypeError::format(&raw_dir, format!("shard {}: {}", shard_id, e)));
+            return Some(pairs);
         }
         let _ = (shard_id, query_minimizers);
         None

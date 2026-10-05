@@ -377,7 +377,10 @@ impl RawShard {
                 "query_minimizers must be sorted in ascending order",
             ));
         }
-        Ok(self.lookup_chunked(query, rayon::current_num_threads()))
+        let t = std::time::Instant::now();
+        let pairs = self.lookup_chunked(query, rayon::current_num_threads());
+        crate::log_timing("raw_lookup: wall", t.elapsed().as_millis());
+        Ok(pairs)
     }
 
     /// [`Self::load_coo_for_query`] split into `n_chunks` parallel query chunks.
@@ -388,6 +391,9 @@ impl RawShard {
         };
         // Every query is offered to every shard; only values in range can match.
         let query = &query[query.partition_point(|&q| q < lo)..query.partition_point(|&q| q <= hi)];
+        // Small queries aren't worth a rayon task per thread.
+        let n_chunks =
+            n_chunks.min(query.len().saturating_add(MIN_QUERY_PER_CHUNK - 1) / MIN_QUERY_PER_CHUNK);
         split_at_value_boundaries(query, n_chunks)
             .into_par_iter()
             .map(|chunk| {
@@ -400,6 +406,9 @@ impl RawShard {
     }
 }
 
+/// Minimum query values per parallel lookup chunk.
+const MIN_QUERY_PER_CHUNK: usize = 4096;
+
 /// Split sorted `q` into at most `n` contiguous non-empty chunks without
 /// splitting a run of equal values (which would emit that run's rows twice).
 fn split_at_value_boundaries(q: &[u64], n: usize) -> Vec<&[u64]> {
@@ -407,12 +416,15 @@ fn split_at_value_boundaries(q: &[u64], n: usize) -> Vec<&[u64]> {
         return Vec::new();
     }
     let n = n.clamp(1, q.len());
+    // (len + n - 1) / n without div_ceil (MSRV 1.70); n <= len so no overflow.
+    let step = (q.len() - 1) / n + 1;
     let mut chunks = Vec::with_capacity(n);
     let mut start = 0;
     for i in 1..n {
-        let mut b = (q.len() * i / n).max(start);
-        while b < q.len() && b > 0 && q[b] == q[b - 1] {
-            b += 1;
+        let mut b = (step * i).clamp(start.max(1), q.len());
+        if b < q.len() {
+            let v = q[b - 1];
+            b += q[b..].partition_point(|&x| x == v);
         }
         if b > start && b < q.len() {
             chunks.push(&q[start..b]);
@@ -1027,6 +1039,21 @@ mod tests {
         for n in [2, 3, 7, 64, q.len(), q.len() + 5] {
             assert_eq!(shard.lookup_chunked(&q, n), reference, "n_chunks = {n}");
         }
+
+        // One value repeated across every would-be boundary.
+        let v = q[q.len() / 2];
+        let mut runs = vec![v; 50_000];
+        runs.extend_from_slice(&q[..100]);
+        runs.sort_unstable();
+        let reference = shard.lookup_chunked(&runs, 1);
+        assert!(reference.iter().any(|p| p.0 == v), "precondition");
+        for n in [2, 5, 13] {
+            assert_eq!(
+                shard.lookup_chunked(&runs, n),
+                reference,
+                "long run, n = {n}"
+            );
+        }
     }
 
     #[test]
@@ -1114,6 +1141,34 @@ mod tests {
         assert!(!coo.is_empty() && coo.iter().all(|&(_, b)| b == 99));
         let csr = sharded.load_shard_for_query(0, &q, None).unwrap();
         assert!(!csr.bucket_ids.is_empty() && csr.bucket_ids.iter().all(|&b| b == 99));
+    }
+
+    #[test]
+    fn parallel_rg_classification_uses_attached_sidecar() {
+        // --parallel-rg reads Parquet row groups directly; with a sidecar
+        // attached it must not silently bypass it. Rewrite every sidecar row
+        // to bucket 5 (a real bucket, so the accumulator accepts it).
+        let (_tmp, idx) = exported_index(test_buckets(), 1 << 40);
+        let bids = raw_shard_path(&idx.join(RAW_DIR), 0, BUCKET_IDS_FILE);
+        let n = std::fs::metadata(&bids).unwrap().len() as usize / 4;
+        let bytes: Vec<u8> = vec![5u32; n].iter().flat_map(|b| b.to_le_bytes()).collect();
+        std::fs::write(&bids, bytes).unwrap();
+
+        let mut sharded = ShardedInvertedIndex::open(&idx).unwrap();
+        sharded.attach_raw(RawLoad::Mmap).unwrap();
+        let fwd = make_query(61, &all_minimizers(&idx), 200, 0, false);
+        let mut fwd_unique = fwd.clone();
+        fwd_unique.dedup();
+        let hits = crate::classify::classify_from_extracted_minimizers_parallel_rg(
+            &sharded,
+            &[(fwd_unique, Vec::new())],
+            &[7],
+            0.0,
+            None,
+        )
+        .unwrap();
+        assert!(!hits.is_empty(), "precondition");
+        assert!(hits.iter().all(|h| h.bucket_id == 5), "got {:?}", hits);
     }
 
     fn copy_dir(src: &Path, dst: &Path) {
