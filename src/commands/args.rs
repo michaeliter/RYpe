@@ -157,6 +157,14 @@ pub enum IndexCommands {
         index: PathBuf,
     },
 
+    /// Write an uncompressed, mmap-able copy of the index shards to <INDEX>/raw/.
+    /// Uses ~12 bytes per entry on disk.
+    ExportRaw {
+        /// Path to index directory (.ryxdi)
+        #[arg(short, long)]
+        index: PathBuf,
+    },
+
     /// Show source file paths or sequence IDs for a bucket
     BucketSourceDetail {
         /// Path to index directory (.ryxdi)

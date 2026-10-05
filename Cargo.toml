@@ -32,6 +32,9 @@ parquet = { version = "59", default-features = false, features = ["zstd", "snap"
 bytes = "1.5"
 arrow = { version = "59", default-features = false }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+memmap2 = "0.9"  # mmap for the raw (uncompressed) sidecar index format
+
 [dev-dependencies]
 tempfile = "3.24.0"
 

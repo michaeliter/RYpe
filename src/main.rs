@@ -132,6 +132,25 @@ fn main() -> Result<()> {
                 }
             }
 
+            IndexCommands::ExportRaw { index } => {
+                if !rype::is_parquet_index(&index) {
+                    return Err(anyhow!(
+                        "Index not found or not in Parquet format: {}",
+                        index.display()
+                    ));
+                }
+                let t = std::time::Instant::now();
+                let manifest = rype::export_raw(&index)?;
+                let entries: u64 = manifest.shards.iter().map(|s| s.num_entries).sum();
+                println!(
+                    "Wrote raw sidecar for {} shards ({} entries) to {} in {:.1}s",
+                    manifest.shards.len(),
+                    entries,
+                    index.join(rype::RAW_DIR).display(),
+                    t.elapsed().as_secs_f64()
+                );
+            }
+
             IndexCommands::BucketSourceDetail {
                 index,
                 bucket,

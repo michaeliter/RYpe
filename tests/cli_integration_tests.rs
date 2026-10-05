@@ -342,6 +342,54 @@ fn test_cli_index_create_and_classify() -> Result<()> {
     Ok(())
 }
 
+/// `index export-raw` writes a sidecar the library accepts as matching its index,
+/// and refuses a path that is not an index.
+#[test]
+fn test_cli_index_export_raw() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+
+    let phix_path = std::path::Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix_path.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+
+    let binary = get_binary_path();
+    let index_path = dir.path().join("test.ryxdi");
+    let output = Command::new(&binary)
+        .args(["index", "create", "-o", index_path.to_str().unwrap()])
+        .args(["-r", phix_path.to_str().unwrap(), "-k", "32", "-w", "10"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = Command::new(&binary)
+        .args(["index", "export-raw", "-i", index_path.to_str().unwrap()])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "export-raw failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sharded = rype::ShardedInvertedIndex::open(&index_path)?;
+    rype::RawIndex::open(&sharded, rype::RawLoad::Mmap)?;
+
+    let missing = dir.path().join("missing.ryxdi");
+    let output = Command::new(&binary)
+        .args(["index", "export-raw", "-i", missing.to_str().unwrap()])
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "export-raw on a missing index must fail"
+    );
+
+    Ok(())
+}
+
 /// Test index stats command
 #[test]
 fn test_cli_index_stats() -> Result<()> {

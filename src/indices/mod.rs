@@ -7,6 +7,8 @@
 
 mod inverted;
 pub mod parquet;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod raw;
 pub mod sharded;
 
 // Re-export primary types at the indices module level

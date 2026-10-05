@@ -873,6 +873,22 @@ pub fn merge_indices_streaming(
 /// Loads the entire shard at once — memory usage is O(shard entries × 12 bytes).
 /// Used internally by `consolidate_shards` and available for testing/inspection.
 pub fn read_shard_pairs(path: &Path) -> Result<Vec<(u64, u32)>> {
+    let mut pairs = Vec::new();
+    for_each_shard_batch(path, |minimizers, bucket_ids| {
+        pairs.extend(minimizers.iter().copied().zip(bucket_ids.iter().copied()));
+        Ok(())
+    })?;
+    Ok(pairs)
+}
+
+/// Stream a Parquet shard file batch by batch, in file order, calling
+/// `f(minimizers, bucket_ids)` with row-parallel column slices.
+///
+/// Memory usage is bounded by one record batch, unlike [`read_shard_pairs`].
+pub(crate) fn for_each_shard_batch<F>(path: &Path, mut f: F) -> Result<()>
+where
+    F: FnMut(&[u64], &[u32]) -> Result<()>,
+{
     use arrow::array::{UInt32Array, UInt64Array};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -881,7 +897,6 @@ pub fn read_shard_pairs(path: &Path) -> Result<Vec<(u64, u32)>> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let reader = builder.build()?;
 
-    let mut pairs = Vec::new();
     for batch in reader {
         let batch = batch?;
         let minimizers = batch
@@ -895,11 +910,9 @@ pub fn read_shard_pairs(path: &Path) -> Result<Vec<(u64, u32)>> {
             .downcast_ref::<UInt32Array>()
             .ok_or_else(|| RypeError::format(path, "Expected UInt32Array for bucket_id column"))?;
 
-        for i in 0..batch.num_rows() {
-            pairs.push((minimizers.value(i), bucket_ids.value(i)));
-        }
+        f(minimizers.values(), bucket_ids.values())?;
     }
-    Ok(pairs)
+    Ok(())
 }
 
 #[cfg(test)]

@@ -66,6 +66,12 @@ pub use types::{BucketFileStats, HitResult, IndexMetadata, QueryRecord};
 // Primary index types
 pub use indices::{InvertedIndex, ShardedInvertedIndex};
 
+// Raw (uncompressed, mmap-able) sidecar index format
+#[cfg(not(target_arch = "wasm32"))]
+pub use indices::raw::{
+    export_raw, RawIndex, RawLoad, RawManifest, RawShard, RawShardInfo, RAW_DIR,
+};
+
 // Minimizer extraction
 pub use core::{extract_into, get_paired_minimizers_into, MinimizerWorkspace, Strand};
 
