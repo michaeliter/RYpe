@@ -119,6 +119,9 @@ pub struct ShardedInvertedIndex {
     /// Cached row group ranges for shards: Vec indexed by shard position in manifest.
     /// Each inner Vec contains RowGroupRangeInfo with rg_idx, min, max, and uncompressed_size.
     rg_ranges_cache: Vec<Vec<super::inverted::RowGroupRangeInfo>>,
+    /// Raw sidecar serving shard loads in place of Parquet, once attached.
+    #[cfg(not(target_arch = "wasm32"))]
+    raw: Option<std::sync::Arc<super::raw::RawIndex>>,
 }
 
 impl ShardedInvertedIndex {
@@ -188,7 +191,44 @@ impl ShardedInvertedIndex {
             manifest,
             base_path: base_path.to_path_buf(),
             rg_ranges_cache,
+            #[cfg(not(target_arch = "wasm32"))]
+            raw: None,
         })
+    }
+
+    /// Serve subsequent shard loads from the index's raw sidecar
+    /// (see `rype index export-raw`) instead of decoding Parquet.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn attach_raw(&mut self, load: super::raw::RawLoad) -> Result<()> {
+        let raw = super::raw::RawIndex::open(self, load)?;
+        self.raw = Some(std::sync::Arc::new(raw));
+        Ok(())
+    }
+
+    /// Whether shard loads are served by an attached raw sidecar.
+    pub fn has_raw(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.raw.is_some();
+        #[cfg(target_arch = "wasm32")]
+        false
+    }
+
+    /// Rows of `shard_id` matching `query_minimizers`, from the raw sidecar if
+    /// one is attached; `None` means load from Parquet.
+    fn raw_coo_for_query(
+        &self,
+        shard_id: u32,
+        query_minimizers: &[u64],
+    ) -> Option<Result<Vec<(u64, u32)>>> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(raw) = &self.raw {
+            let shard = raw.shard(shard_id).ok_or_else(|| {
+                RypeError::validation(format!("shard {} missing from raw sidecar", shard_id))
+            });
+            return Some(shard.and_then(|s| s.load_coo_for_query(query_minimizers)));
+        }
+        let _ = (shard_id, query_minimizers);
+        None
     }
 
     /// Load row group ranges for all shards.
@@ -405,6 +445,16 @@ impl ShardedInvertedIndex {
         query_minimizers: &[u64],
         options: Option<&super::parquet::ParquetReadOptions>,
     ) -> Result<InvertedIndex> {
+        if let Some(pairs) = self.raw_coo_for_query(shard_id, query_minimizers) {
+            let m = &self.manifest;
+            return Ok(InvertedIndex::from_sorted_coo_pairs(
+                &pairs?,
+                m.k,
+                m.w,
+                m.salt,
+                m.source_hash,
+            ));
+        }
         let path = self.shard_path(shard_id);
         InvertedIndex::load_shard_parquet_for_query(
             &path,
@@ -433,6 +483,9 @@ impl ShardedInvertedIndex {
         query_minimizers: &[u64],
         options: Option<&super::parquet::ParquetReadOptions>,
     ) -> Result<Vec<(u64, u32)>> {
+        if let Some(pairs) = self.raw_coo_for_query(shard_id, query_minimizers) {
+            return pairs;
+        }
         let path = self.shard_path(shard_id);
         InvertedIndex::load_shard_coo_for_query(&path, self.manifest.k, query_minimizers, options)
             .map_err(|e| RypeError::format(&path, e.to_string()))

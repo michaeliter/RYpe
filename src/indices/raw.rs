@@ -24,6 +24,7 @@ use crate::error::{Result, RypeError};
 use crate::indices::parquet::hex_u64;
 use crate::indices::parquet::merge::for_each_shard_batch;
 use crate::indices::sharded::{ShardInfo, ShardedInvertedIndex};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -365,6 +366,126 @@ impl RawShard {
     /// Bucket-id column, row-parallel to [`Self::minimizers`].
     pub fn bucket_ids(&self) -> &[u32] {
         self.bucket_ids.as_slice()
+    }
+
+    /// The `(minimizer, bucket_id)` rows whose minimizer occurs in `query`, in
+    /// row order — exactly what the Parquet loader returns for the same shard
+    /// and query. `query` must be sorted ascending (duplicates allowed).
+    pub fn load_coo_for_query(&self, query: &[u64]) -> Result<Vec<(u64, u32)>> {
+        if !query.windows(2).all(|w| w[0] <= w[1]) {
+            return Err(RypeError::validation(
+                "query_minimizers must be sorted in ascending order",
+            ));
+        }
+        Ok(self.lookup_chunked(query, rayon::current_num_threads()))
+    }
+
+    /// [`Self::load_coo_for_query`] split into `n_chunks` parallel query chunks.
+    fn lookup_chunked(&self, query: &[u64], n_chunks: usize) -> Vec<(u64, u32)> {
+        let (mins, bids) = (self.minimizers(), self.bucket_ids());
+        let (Some(&lo), Some(&hi)) = (mins.first(), mins.last()) else {
+            return Vec::new();
+        };
+        // Every query is offered to every shard; only values in range can match.
+        let query = &query[query.partition_point(|&q| q < lo)..query.partition_point(|&q| q <= hi)];
+        split_at_value_boundaries(query, n_chunks)
+            .into_par_iter()
+            .map(|chunk| {
+                let r_lo = mins.partition_point(|&m| m < chunk[0]);
+                let r_hi = mins.partition_point(|&m| m <= chunk[chunk.len() - 1]);
+                intersect_rows(chunk, &mins[r_lo..r_hi], &bids[r_lo..r_hi])
+            })
+            .collect::<Vec<_>>()
+            .concat()
+    }
+}
+
+/// Split sorted `q` into at most `n` contiguous non-empty chunks without
+/// splitting a run of equal values (which would emit that run's rows twice).
+fn split_at_value_boundaries(q: &[u64], n: usize) -> Vec<&[u64]> {
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let n = n.clamp(1, q.len());
+    let mut chunks = Vec::with_capacity(n);
+    let mut start = 0;
+    for i in 1..n {
+        let mut b = (q.len() * i / n).max(start);
+        while b < q.len() && b > 0 && q[b] == q[b - 1] {
+            b += 1;
+        }
+        if b > start && b < q.len() {
+            chunks.push(&q[start..b]);
+            start = b;
+        }
+    }
+    chunks.push(&q[start..]);
+    chunks
+}
+
+/// Rows of (`mins`, `bids`) whose minimizer occurs in sorted `query`, in row
+/// order. Gallops the shorter side over the longer one, so the cost is
+/// O(short * log(long / short)) whichever side dominates. Unlike
+/// `gallop_for_each`, this finds the *first* row of each value and emits the
+/// whole run, since multi-bucket shards repeat a minimizer once per bucket.
+fn intersect_rows(query: &[u64], mins: &[u64], bids: &[u32]) -> Vec<(u64, u32)> {
+    let mut out = Vec::new();
+    if query.len() <= mins.len() {
+        let mut r = 0;
+        let mut prev = None;
+        for &q in query {
+            if prev == Some(q) {
+                continue;
+            }
+            prev = Some(q);
+            r = gallop_lower_bound(mins, r, q);
+            while r < mins.len() && mins[r] == q {
+                out.push((q, bids[r]));
+                r += 1;
+            }
+            if r == mins.len() {
+                break;
+            }
+        }
+    } else {
+        let mut qi = 0;
+        let mut r = 0;
+        while r < mins.len() {
+            let m = mins[r];
+            let mut run_end = r + 1;
+            while run_end < mins.len() && mins[run_end] == m {
+                run_end += 1;
+            }
+            qi = gallop_lower_bound(query, qi, m);
+            if qi == query.len() {
+                break;
+            }
+            if query[qi] == m {
+                out.extend((r..run_end).map(|i| (m, bids[i])));
+            }
+            r = run_end;
+        }
+    }
+    out
+}
+
+/// First index `i >= from` with `v[i] >= target` (or `v.len()`), via
+/// exponential then binary search: O(log(i - from)).
+fn gallop_lower_bound(v: &[u64], from: usize, target: u64) -> usize {
+    if from >= v.len() || v[from] >= target {
+        return from;
+    }
+    // Invariant: v[lo] < target.
+    let mut lo = from;
+    let mut step = 1;
+    loop {
+        let probe = lo + step;
+        if probe >= v.len() || v[probe] >= target {
+            let end = probe.min(v.len());
+            return lo + 1 + v[lo + 1..end].partition_point(|&x| x < target);
+        }
+        lo = probe;
+        step *= 2;
     }
 }
 
@@ -802,6 +923,197 @@ mod tests {
             !idx.join(RAW_DIR).exists(),
             "failed export must not leave a sidecar"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Lookup equivalence (Phase 2): raw lookups must return exactly the
+    // Parquet loader's rows, or classification results would diverge.
+    // ---------------------------------------------------------------------
+
+    /// Sorted query: `n_hits` values sampled from `pool` plus `n_misses`
+    /// random values, optionally with every value duplicated.
+    fn make_query(seed: u64, pool: &[u64], n_hits: usize, n_misses: usize, dup: bool) -> Vec<u64> {
+        let mut q: Vec<u64> = bucket_minimizers(seed, n_misses);
+        let r = bucket_minimizers(seed ^ 0xDEAD, n_hits);
+        q.extend(r.iter().map(|&x| pool[(x % pool.len() as u64) as usize]));
+        if dup {
+            q.extend(q.clone());
+        }
+        q.sort_unstable();
+        q
+    }
+
+    fn exported_index(buckets: Vec<BucketData>, max_shard_bytes: usize) -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let idx = tmp.path().join("idx.ryxdi");
+        build_index(&idx, buckets, max_shard_bytes);
+        export_raw(&idx).unwrap();
+        (tmp, idx)
+    }
+
+    /// All query shapes the lookup must handle, built from the index's own values.
+    fn query_cases(all: &[u64]) -> Vec<(&'static str, Vec<u64>)> {
+        let below = all[0].saturating_sub(1);
+        let above = all.last().unwrap().saturating_add(1);
+        let mut out_of_range = vec![above];
+        if all[0] > 0 {
+            out_of_range.insert(0, below);
+        }
+        vec![
+            ("empty", vec![]),
+            ("single hit", vec![all[all.len() / 2]]),
+            ("single miss", vec![all[all.len() / 2] ^ 1 << 50]),
+            ("out of range", out_of_range),
+            ("sparse", make_query(11, all, 50, 50, false)),
+            ("medium", make_query(12, all, 20_000, 20_000, false)),
+            (
+                "dense with duplicates",
+                make_query(13, all, 150_000, 50_000, true),
+            ),
+            ("every index value", {
+                let mut v = all.to_vec();
+                v.dedup();
+                v
+            }),
+        ]
+    }
+
+    fn all_minimizers(idx: &Path) -> Vec<u64> {
+        let sharded = ShardedInvertedIndex::open(idx).unwrap();
+        let mut all: Vec<u64> = sharded
+            .manifest()
+            .shards
+            .iter()
+            .flat_map(|s| read_shard_pairs(&sharded.shard_path(s.shard_id)).unwrap())
+            .map(|p| p.0)
+            .collect();
+        all.sort_unstable();
+        all
+    }
+
+    #[test]
+    fn raw_lookup_matches_parquet_loader_exactly() {
+        let (_tmp, idx) = exported_index(test_buckets(), 1 << 20);
+        let parquet = ShardedInvertedIndex::open(&idx).unwrap();
+        assert!(parquet.manifest().shards.len() > 1, "precondition");
+        for (name, q) in query_cases(&all_minimizers(&idx)) {
+            for load in [RawLoad::Mmap, RawLoad::Read] {
+                let raw = open_raw(&idx, load).unwrap();
+                for info in &parquet.manifest().shards {
+                    let expected = parquet
+                        .load_shard_coo_for_query(info.shard_id, &q, None)
+                        .unwrap();
+                    let got = raw
+                        .shard(info.shard_id)
+                        .unwrap()
+                        .load_coo_for_query(&q)
+                        .unwrap();
+                    assert_eq!(got, expected, "{name}, shard {}, {load:?}", info.shard_id);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_lookup_matches_single_chunk_for_any_chunk_count() {
+        // Chunk boundaries must never split a run of equal query values (or
+        // the run's rows would be emitted twice) nor drop rows at the edges.
+        let (_tmp, idx) = exported_index(test_buckets(), 1 << 40);
+        let raw = open_raw(&idx, RawLoad::Mmap).unwrap();
+        let shard = raw.shard(0).unwrap();
+        let q = make_query(21, &all_minimizers(&idx), 5_000, 5_000, true);
+        let reference = shard.lookup_chunked(&q, 1);
+        assert!(!reference.is_empty(), "precondition");
+        for n in [2, 3, 7, 64, q.len(), q.len() + 5] {
+            assert_eq!(shard.lookup_chunked(&q, n), reference, "n_chunks = {n}");
+        }
+    }
+
+    #[test]
+    fn lookup_handles_query_much_larger_than_shard() {
+        // Every query is passed to every shard, so a small shard can face a
+        // query far larger than itself; results must still match Parquet.
+        let small = vec![BucketData {
+            bucket_id: 3,
+            bucket_name: "small".into(),
+            sources: vec!["s".into()],
+            minimizers: bucket_minimizers(5, 500),
+        }];
+        let (_tmp, idx) = exported_index(small, 1 << 40);
+        let parquet = ShardedInvertedIndex::open(&idx).unwrap();
+        let raw = open_raw(&idx, RawLoad::Mmap).unwrap();
+        let q = make_query(31, &all_minimizers(&idx), 300, 200_000, false);
+        let expected = parquet.load_shard_coo_for_query(0, &q, None).unwrap();
+        assert!(!expected.is_empty(), "precondition");
+        for n in [1, 4] {
+            assert_eq!(raw.shard(0).unwrap().lookup_chunked(&q, n), expected);
+        }
+    }
+
+    #[test]
+    fn lookup_rejects_unsorted_query() {
+        let (_tmp, idx) = exported_index(test_buckets(), 1 << 40);
+        let raw = open_raw(&idx, RawLoad::Mmap).unwrap();
+        let err = raw
+            .shard(0)
+            .unwrap()
+            .load_coo_for_query(&[5, 3])
+            .unwrap_err();
+        assert!(err.to_string().contains("sorted"), "got: {err}");
+    }
+
+    #[test]
+    fn attached_sidecar_serves_both_coo_and_csr_loaders() {
+        let (_tmp, idx) = exported_index(test_buckets(), 1 << 20);
+        let q = make_query(41, &all_minimizers(&idx), 30_000, 30_000, false);
+        let parquet = ShardedInvertedIndex::open(&idx).unwrap();
+        let mut with_raw = ShardedInvertedIndex::open(&idx).unwrap();
+        with_raw.attach_raw(RawLoad::Mmap).unwrap();
+        for info in &parquet.manifest().shards {
+            let id = info.shard_id;
+            assert_eq!(
+                with_raw.load_shard_coo_for_query(id, &q, None).unwrap(),
+                parquet.load_shard_coo_for_query(id, &q, None).unwrap()
+            );
+            let (a, b) = (
+                with_raw.load_shard_for_query(id, &q, None).unwrap(),
+                parquet.load_shard_for_query(id, &q, None).unwrap(),
+            );
+            assert_eq!(
+                (&a.minimizers, &a.offsets, &a.bucket_ids),
+                (&b.minimizers, &b.offsets, &b.bucket_ids)
+            );
+            assert_eq!(
+                (a.k, a.w, a.salt, a.source_hash),
+                (b.k, b.w, b.salt, b.source_hash)
+            );
+        }
+    }
+
+    #[test]
+    fn attached_sidecar_is_actually_read() {
+        // Equality with Parquet can't distinguish "used the sidecar" from
+        // "silently fell back to Parquet". Rewrite the sidecar's bucket ids
+        // (sizes stay valid) and check both loaders report the rewritten ids.
+        let (_tmp, idx) = exported_index(test_buckets(), 1 << 40);
+        let bids = raw_shard_path(&idx.join(RAW_DIR), 0, BUCKET_IDS_FILE);
+        let n = std::fs::metadata(&bids).unwrap().len() as usize / 4;
+        std::fs::write(
+            &bids,
+            vec![99u32; n]
+                .iter()
+                .flat_map(|b| b.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )
+        .unwrap();
+
+        let mut sharded = ShardedInvertedIndex::open(&idx).unwrap();
+        sharded.attach_raw(RawLoad::Mmap).unwrap();
+        let q = make_query(51, &all_minimizers(&idx), 1_000, 0, false);
+        let coo = sharded.load_shard_coo_for_query(0, &q, None).unwrap();
+        assert!(!coo.is_empty() && coo.iter().all(|&(_, b)| b == 99));
+        let csr = sharded.load_shard_for_query(0, &q, None).unwrap();
+        assert!(!csr.bucket_ids.is_empty() && csr.bucket_ids.iter().all(|&b| b == 99));
     }
 
     fn copy_dir(src: &Path, dst: &Path) {

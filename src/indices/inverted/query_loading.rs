@@ -123,9 +123,26 @@ impl InvertedIndex {
         options: Option<&super::super::parquet::ParquetReadOptions>,
     ) -> Result<Self> {
         let all_pairs = load_filtered_coo_pairs(path, k, query_minimizers, options)?;
+        Ok(Self::from_sorted_coo_pairs(
+            &all_pairs,
+            k,
+            w,
+            salt,
+            source_hash,
+        ))
+    }
 
+    /// Build a (partial) CSR index from `(minimizer, bucket_id)` pairs sorted by
+    /// minimizer, as returned by the shard loaders.
+    pub(crate) fn from_sorted_coo_pairs(
+        all_pairs: &[(u64, u32)],
+        k: usize,
+        w: usize,
+        salt: u64,
+        source_hash: u64,
+    ) -> Self {
         if all_pairs.is_empty() {
-            return Ok(InvertedIndex {
+            return InvertedIndex {
                 k,
                 w,
                 salt,
@@ -133,7 +150,7 @@ impl InvertedIndex {
                 minimizers: Vec::new(),
                 offsets: vec![0],
                 bucket_ids: Vec::new(),
-            });
+            };
         }
 
         // Build CSR structure from sorted COO pairs
@@ -145,7 +162,7 @@ impl InvertedIndex {
         let mut current_min = all_pairs[0].0;
         minimizers.push(current_min);
 
-        for &(m, b) in &all_pairs {
+        for &(m, b) in all_pairs {
             if m != current_min {
                 offsets.push(bucket_ids_out.len() as u32);
                 minimizers.push(m);
@@ -156,7 +173,7 @@ impl InvertedIndex {
 
         offsets.push(bucket_ids_out.len() as u32);
 
-        Ok(InvertedIndex {
+        InvertedIndex {
             k,
             w,
             salt,
@@ -164,7 +181,7 @@ impl InvertedIndex {
             minimizers,
             offsets,
             bucket_ids: bucket_ids_out,
-        })
+        }
     }
 
     /// Load a Parquet shard as sorted COO pairs, filtering to query minimizers.
