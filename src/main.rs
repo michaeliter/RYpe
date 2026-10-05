@@ -404,12 +404,18 @@ fn main() -> Result<()> {
                 trim_to,
                 minimum_length,
                 wide,
+                raw_index,
+                raw_load,
             } => {
                 // Enable timing diagnostics if requested
                 if timing {
                     ENABLE_TIMING.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
 
+                let raw_index = raw_index.then_some(match raw_load.as_deref() {
+                    Some("read") => rype::RawLoad::Read,
+                    _ => rype::RawLoad::Mmap,
+                });
                 run_classify(ClassifyRunArgs {
                     common: CommonClassifyArgs {
                         index,
@@ -428,6 +434,7 @@ fn main() -> Result<()> {
                     negative_index,
                     best_hit,
                     wide,
+                    raw_index,
                 })?;
             }
 

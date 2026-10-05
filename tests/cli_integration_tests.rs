@@ -390,6 +390,240 @@ fn test_cli_index_export_raw() -> Result<()> {
     Ok(())
 }
 
+/// Concatenated sequence lines of a FASTA file.
+fn fasta_sequence(path: &Path) -> String {
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.starts_with('>'))
+        .collect()
+}
+
+/// Reads drawn from phiX174 and pUC19 windows with 0..12 mismatches, plus
+/// unrelated reads, so scores spread across thresholds and both buckets.
+fn write_mixed_reads(dir: &Path, manifest_dir: &str) -> PathBuf {
+    let examples = Path::new(manifest_dir).join("examples");
+    let genomes = [
+        fasta_sequence(&examples.join("phiX174.fasta")),
+        fasta_sequence(&examples.join("pUC19.fasta")),
+    ];
+    let mut fastq = String::new();
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for i in 0..120 {
+        let read: Vec<u8> = if i % 10 == 9 {
+            (0..150).map(|_| b"ACGT"[(next() % 4) as usize]).collect()
+        } else {
+            let g = genomes[i % 2].as_bytes();
+            let start = (next() as usize) % (g.len() - 150);
+            let mut r = g[start..start + 150].to_vec();
+            for _ in 0..(i % 13) {
+                let pos = (next() as usize) % r.len();
+                r[pos] = b"ACGT"[(next() % 4) as usize];
+            }
+            r
+        };
+        fastq.push_str(&format!(
+            "@r{}\n{}\n+\n{}\n",
+            i,
+            String::from_utf8(read).unwrap(),
+            "I".repeat(150)
+        ));
+    }
+    let path = dir.join("mixed.fastq");
+    fs::write(&path, fastq).unwrap();
+    path
+}
+
+/// Run the binary, assert success, return sorted stdout result lines.
+fn run_sorted(binary: &Path, args: &[&str]) -> Vec<String> {
+    let output = Command::new(binary).args(args).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// Build a two-bucket (phiX, pUC19) index and a pUC19-only negative index,
+/// both with raw sidecars exported. Returns (positive, negative) paths.
+fn raw_test_indices(binary: &Path, dir: &Path, manifest_dir: &str) -> (PathBuf, PathBuf) {
+    let examples = Path::new(manifest_dir).join("examples");
+    let phix = examples.join("phiX174.fasta");
+    let puc19 = examples.join("pUC19.fasta");
+    let pos = dir.join("pos.ryxdi");
+    let neg = dir.join("neg.ryxdi");
+    run_sorted(
+        binary,
+        &[
+            "index",
+            "create",
+            "-o",
+            pos.to_str().unwrap(),
+            "-r",
+            phix.to_str().unwrap(),
+            "-r",
+            puc19.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+            "--separate-buckets",
+        ],
+    );
+    run_sorted(
+        binary,
+        &[
+            "index",
+            "create",
+            "-o",
+            neg.to_str().unwrap(),
+            "-r",
+            puc19.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ],
+    );
+    for idx in [&pos, &neg] {
+        run_sorted(
+            binary,
+            &["index", "export-raw", "-i", idx.to_str().unwrap()],
+        );
+    }
+    (pos, neg)
+}
+
+/// `classify run --raw-index` must produce byte-identical results to the
+/// Parquet path (any divergence would change which reads are filtered),
+/// for both load modes, several thresholds, and with a negative index.
+#[test]
+fn test_cli_classify_raw_index_matches_parquet() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let examples = Path::new(manifest_dir).join("examples");
+    if !examples.join("phiX174.fasta").exists() || !examples.join("pUC19.fasta").exists() {
+        eprintln!("Skipping test: example FASTA files not found");
+        return Ok(());
+    }
+    let dir = tempdir()?;
+    let binary = get_binary_path();
+    let (pos, neg) = raw_test_indices(&binary, dir.path(), manifest_dir);
+    let reads = write_mixed_reads(dir.path(), manifest_dir);
+    let (pos, neg, reads) = (
+        pos.to_str().unwrap(),
+        neg.to_str().unwrap(),
+        reads.to_str().unwrap(),
+    );
+
+    for threshold in ["0.0", "0.3"] {
+        let base = ["classify", "run", "-i", pos, "-1", reads, "-t", threshold];
+        let parquet = run_sorted(&binary, &base);
+        let buckets_hit: std::collections::HashSet<&str> = parquet
+            .iter()
+            .filter(|l| !l.starts_with("read_id"))
+            .filter_map(|l| l.split('\t').nth(1))
+            .collect();
+        assert!(
+            buckets_hit.len() == 2,
+            "precondition: both buckets hit, got {:?}",
+            buckets_hit
+        );
+
+        let raw = run_sorted(&binary, &[&base[..], &["--raw-index"]].concat());
+        assert_eq!(raw, parquet, "--raw-index, t={threshold}");
+        let read = run_sorted(
+            &binary,
+            &[&base[..], &["--raw-index", "--raw-load", "read"]].concat(),
+        );
+        assert_eq!(read, parquet, "--raw-load read, t={threshold}");
+
+        let with_neg = [&base[..], &["-N", neg]].concat();
+        let neg_parquet = run_sorted(&binary, &with_neg);
+        assert_ne!(neg_parquet, parquet, "precondition: -N must change results");
+        let neg_raw = run_sorted(&binary, &[&with_neg[..], &["--raw-index"]].concat());
+        assert_eq!(neg_raw, neg_parquet, "-N with --raw-index, t={threshold}");
+    }
+    Ok(())
+}
+
+/// `--raw-index` fails loudly instead of silently decoding Parquet when it
+/// can't be honored.
+#[test]
+fn test_cli_classify_raw_index_rejections() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let phix = Path::new(manifest_dir).join("examples/phiX174.fasta");
+    if !phix.exists() {
+        eprintln!("Skipping test: example FASTA file not found");
+        return Ok(());
+    }
+    let dir = tempdir()?;
+    let binary = get_binary_path();
+    let idx = dir.path().join("idx.ryxdi");
+    run_sorted(
+        &binary,
+        &[
+            "index",
+            "create",
+            "-o",
+            idx.to_str().unwrap(),
+            "-r",
+            phix.to_str().unwrap(),
+            "-k",
+            "32",
+            "-w",
+            "10",
+        ],
+    );
+    let reads = write_mixed_reads(dir.path(), manifest_dir);
+    let base = [
+        "classify",
+        "run",
+        "-i",
+        idx.to_str().unwrap(),
+        "-1",
+        reads.to_str().unwrap(),
+    ];
+    let stderr_of = |extra: &[&str]| {
+        let out = Command::new(&binary)
+            .args(base)
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{:?} should fail", extra);
+        String::from_utf8_lossy(&out.stderr).to_string()
+    };
+
+    let err = stderr_of(&["--raw-index"]);
+    assert!(err.contains("export-raw"), "no sidecar: {err}");
+
+    run_sorted(
+        &binary,
+        &["index", "export-raw", "-i", idx.to_str().unwrap()],
+    );
+    let err = stderr_of(&["--raw-index", "--parallel-rg"]);
+    assert!(err.contains("--parallel-rg"), "parallel-rg: {err}");
+
+    let err = stderr_of(&["--raw-load", "read"]);
+    assert!(
+        err.contains("--raw-index"),
+        "raw-load without raw-index: {err}"
+    );
+    Ok(())
+}
+
 /// Test index stats command
 #[test]
 fn test_cli_index_stats() -> Result<()> {

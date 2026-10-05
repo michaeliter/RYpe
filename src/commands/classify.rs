@@ -46,6 +46,8 @@ pub struct ClassifyRunArgs {
     pub negative_index: Option<PathBuf>,
     pub best_hit: bool,
     pub wide: bool,
+    /// Serve the positive index's shard loads from its raw sidecar.
+    pub raw_index: Option<rype::RawLoad>,
 }
 
 /// Default threshold value for classification.
@@ -64,6 +66,12 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
             "--wide is incompatible with --threshold.\n\
              Wide format requires all bucket scores, so no threshold filtering can be applied.\n\
              Use --wide without --threshold, or omit --wide to use threshold filtering."
+        ));
+    }
+    if args.raw_index.is_some() && args.common.parallel_rg {
+        return Err(anyhow!(
+            "--raw-index is incompatible with --parallel-rg: row-group parallelism decodes \
+             Parquet row groups directly (raw lookups are already parallel)."
         ));
     }
 
@@ -131,8 +139,14 @@ pub fn run_classify(args: ClassifyRunArgs) -> Result<()> {
         },
     )?;
     let metadata = loaded_index.metadata;
-    let sharded = loaded_index.sharded;
+    let mut sharded = loaded_index.sharded;
     let read_options = loaded_index.read_options;
+    if let Some(load) = args.raw_index {
+        let t_attach = std::time::Instant::now();
+        sharded.attach_raw(load)?;
+        log_timing("raw: attach", t_attach.elapsed().as_millis());
+        log::info!("Serving shard loads from the raw sidecar ({:?})", load);
+    }
 
     // Set up I/O based on input format
     let output_format = OutputFormat::detect(args.common.output.as_ref());

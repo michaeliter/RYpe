@@ -493,6 +493,16 @@ WHEN TO USE 'run' vs 'aggregate':
         /// Incompatible with --threshold (all scores must be reported).
         #[arg(long)]
         wide: bool,
+
+        /// Search the index's raw sidecar in place (memory-mapped) instead of
+        /// decoding Parquet shards. Create it once with `rype index export-raw`.
+        /// Incompatible with --parallel-rg.
+        #[arg(long)]
+        raw_index: bool,
+
+        /// How --raw-index loads the sidecar: "mmap" (default) or "read" into memory.
+        #[arg(long, hide = true, requires = "raw_index", value_parser = ["mmap", "read"])]
+        raw_load: Option<String>,
     },
 
     /// Pool all reads for sample-level classification (higher sensitivity)

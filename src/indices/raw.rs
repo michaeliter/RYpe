@@ -1144,6 +1144,57 @@ mod tests {
     }
 
     #[test]
+    fn classification_with_sidecar_matches_parquet_on_overlapping_multi_bucket_shards() {
+        // End-to-end through the shard loop: cross-shard dedup, accumulation
+        // and scoring must see identical rows whichever store served them.
+        let (_tmp, idx) = exported_index(test_buckets(), 1 << 20);
+        let parquet = ShardedInvertedIndex::open(&idx).unwrap();
+        assert!(parquet.manifest().has_overlapping_shards, "precondition");
+        assert!(parquet.manifest().shards.len() > 1, "precondition");
+        let all = all_minimizers(&idx);
+
+        // Reads with varying hit fractions on each strand.
+        let extracted: Vec<(Vec<u64>, Vec<u64>)> = (0..300u64)
+            .map(|i| {
+                let hits = (i % 40) as usize;
+                let mut fwd = make_query(100 + i, &all, hits, 40 - hits, false);
+                fwd.dedup();
+                let mut rc = make_query(1000 + i, &all, (i % 7) as usize, 10, false);
+                rc.dedup();
+                (fwd, rc)
+            })
+            .collect();
+        let ids: Vec<i64> = (0..extracted.len() as i64).collect();
+
+        let mut with_raw = ShardedInvertedIndex::open(&idx).unwrap();
+        with_raw.attach_raw(RawLoad::Mmap).unwrap();
+        let mut prev_len = usize::MAX;
+        for threshold in [0.0, 0.1, 0.25] {
+            let sorted = |sharded: &ShardedInvertedIndex| {
+                let mut hits = crate::classify::classify_from_extracted_minimizers(
+                    sharded, &extracted, &ids, threshold, None,
+                )
+                .unwrap();
+                hits.sort_by(|a, b| (a.query_id, a.bucket_id).cmp(&(b.query_id, b.bucket_id)));
+                hits
+            };
+            let expected = sorted(&parquet);
+            // Each threshold must keep some hits and drop some (vs. the lower one).
+            assert!(
+                !expected.is_empty() && expected.len() < prev_len,
+                "t={threshold}"
+            );
+            prev_len = expected.len();
+            let got = sorted(&with_raw);
+            assert_eq!(got.len(), expected.len(), "t={threshold}");
+            for (g, e) in got.iter().zip(&expected) {
+                assert_eq!((g.query_id, g.bucket_id), (e.query_id, e.bucket_id));
+                assert_eq!(g.score.to_bits(), e.score.to_bits(), "t={threshold}");
+            }
+        }
+    }
+
+    #[test]
     fn parallel_rg_classification_uses_attached_sidecar() {
         // --parallel-rg reads Parquet row groups directly; with a sidecar
         // attached it must not silently bypass it. Rewrite every sidecar row
