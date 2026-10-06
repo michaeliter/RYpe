@@ -27,7 +27,10 @@ serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 env_logger = "0.11"
 zstd = "0.13"  # Compression for inverted index
-flate2 = "1.1.8"  # Gzip compression for output
+# Gzip for output, and (through Cargo feature unification) for needletail's gzip
+# input. needletail still enables flate2's default miniz_oxide backend, but flate2
+# selects zlib-rs whenever both are enabled; zlib-rs inflates much faster.
+flate2 = { version = "1.1.8", default-features = false, features = ["zlib-rs"] }
 parquet = { version = "59", default-features = false, features = ["zstd", "snap", "arrow"] }
 bytes = "1.5"
 arrow = { version = "59", default-features = false }
