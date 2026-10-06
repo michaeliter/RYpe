@@ -1,7 +1,12 @@
 //! FASTX (FASTA/FASTQ) I/O with background prefetching.
 
 use anyhow::{anyhow, Result};
-use needletail::{parse_fastx_file, FastxReader};
+use flate2::read::MultiGzDecoder;
+use needletail::errors::ParseError;
+use needletail::parser::{FastaReader, FastqReader};
+use needletail::{parse_fastx_reader, FastxReader};
+use std::fs::File;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
@@ -76,7 +81,8 @@ const DEFAULT_PREFETCH_TIMEOUT: Duration = Duration::from_secs(300);
 /// This handler spawns a background thread that reads and decompresses the next
 /// batch while the main thread processes the current batch. This is especially
 /// effective for gzipped input where decompression can be overlapped with
-/// minimizer extraction and classification.
+/// minimizer extraction and classification. Each gzipped input file is
+/// additionally inflated on its own thread (see [`open_fastx`]).
 ///
 /// # Usage
 /// ```ignore
@@ -280,7 +286,7 @@ impl PrefetchingIoHandler {
         }
 
         // Open readers in the background thread
-        let mut r1 = match parse_fastx_file(&r1_path) {
+        let mut r1 = match open_fastx(&r1_path) {
             Ok(r) => r,
             Err(e) => {
                 send_error!(format!("Failed to open R1 at {}: {}", r1_path.display(), e));
@@ -288,7 +294,7 @@ impl PrefetchingIoHandler {
         };
 
         let mut r2: Option<Box<dyn FastxReader>> = match r2_path {
-            Some(ref p) => match parse_fastx_file(p) {
+            Some(ref p) => match open_fastx(p) {
                 Ok(r) => Some(r),
                 Err(e) => {
                     send_error!(format!("Failed to open R2 at {}: {}", p.display(), e));
@@ -512,12 +518,157 @@ impl PrefetchingIoHandler {
 }
 
 // ============================================================================
+// Threaded gzip decompression
+// ============================================================================
+
+/// Gzip magic bytes, as needletail detects them.
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+
+/// Bytes per decompressed chunk handed from a decompression thread to the parser.
+const DECOMPRESS_CHUNK_SIZE: usize = 1 << 20;
+
+/// Decompressed chunks queued per input file. With the chunk being filled and
+/// the chunk being parsed, read-ahead is at most `DECOMPRESS_CHANNEL_DEPTH + 2`
+/// chunks (about 6 MiB) per file.
+const DECOMPRESS_CHANNEL_DEPTH: usize = 4;
+
+/// A chunk sent by a decompression thread. An empty chunk marks end of input.
+type Chunk = std::io::Result<Vec<u8>>;
+
+/// Open a FASTX file for parsing, inflating gzip input on a dedicated thread.
+///
+/// Inflation is the slowest part of reading gzipped FASTQ. A thread per file
+/// overlaps it with parsing on the reader thread and lets R1 and R2 inflate
+/// concurrently instead of one after the other. Other input goes to needletail
+/// unchanged: plain input has nothing to offload, and zstd (much faster to
+/// decompress than gzip) has not been measured as a bottleneck.
+fn open_fastx(path: &Path) -> Result<Box<dyn FastxReader>, ParseError> {
+    open_fastx_with_chunk_size(path, DECOMPRESS_CHUNK_SIZE)
+}
+
+fn open_fastx_with_chunk_size(
+    path: &Path,
+    chunk_size: usize,
+) -> Result<Box<dyn FastxReader>, ParseError> {
+    let mut file = File::open(path)?;
+    let mut magic = Vec::with_capacity(GZIP_MAGIC.len());
+    (&mut file)
+        .take(GZIP_MAGIC.len() as u64)
+        .read_to_end(&mut magic)?;
+    let is_gzip = magic == GZIP_MAGIC;
+    // Put the peeked bytes back in front rather than seeking, so pipes still work.
+    let input = Cursor::new(magic).chain(file);
+    if !is_gzip {
+        return parse_fastx_reader(input);
+    }
+
+    // MultiGzDecoder, like needletail, so multi-member files (bgzip, `cat a.gz
+    // b.gz`) are read to the end. The thread is not joined: it exits after end
+    // of input, on a decode error, or once the parser drops the receiver.
+    let decoder = MultiGzDecoder::new(input);
+    let (tx, rx) = mpsc::sync_channel(DECOMPRESS_CHANNEL_DEPTH);
+    thread::Builder::new()
+        .name("rype-gunzip".to_string())
+        .spawn(move || send_chunks(decoder, chunk_size, tx))?;
+
+    // Detect FASTA/FASTQ from the first decompressed byte, as needletail's own
+    // gzip branch does. Passing the stream back through parse_fastx_reader
+    // would sniff for compression a second time and report any read error at
+    // the start as "empty file".
+    let mut reader = ChunkReader::new(rx);
+    let mut first = [0u8; 1];
+    reader.read_exact(&mut first).map_err(|e| match e.kind() {
+        std::io::ErrorKind::UnexpectedEof => ParseError::new_empty_file(),
+        _ => e.into(),
+    })?;
+    let reader = Cursor::new(first).chain(reader);
+    match first[0] {
+        b'>' => Ok(Box::new(FastaReader::new(reader))),
+        b'@' => Ok(Box::new(FastqReader::new(reader))),
+        byte => Err(ParseError::new_unknown_format(byte)),
+    }
+}
+
+/// Read `source` to the end in `chunk_size` pieces and send them, followed by an
+/// empty end-of-input chunk. Stops early if the receiver has been dropped.
+fn send_chunks(mut source: impl Read, chunk_size: usize, tx: SyncSender<Chunk>) {
+    loop {
+        let mut chunk = Vec::with_capacity(chunk_size);
+        match (&mut source)
+            .take(chunk_size as u64)
+            .read_to_end(&mut chunk)
+        {
+            Ok(_) => {
+                let end = chunk.is_empty();
+                if tx.send(Ok(chunk)).is_err() || end {
+                    return;
+                }
+            }
+            Err(e) => {
+                // Pass on what inflated before the error, as reading the decoder
+                // directly would, so the same records reach the parser first.
+                if !chunk.is_empty() && tx.send(Ok(chunk)).is_err() {
+                    return;
+                }
+                let _ = tx.send(Err(e));
+                return;
+            }
+        }
+    }
+}
+
+/// `Read` over the chunks sent by [`send_chunks`].
+struct ChunkReader {
+    rx: Receiver<Chunk>,
+    chunk: Cursor<Vec<u8>>,
+    done: bool,
+}
+
+impl ChunkReader {
+    fn new(rx: Receiver<Chunk>) -> Self {
+        Self {
+            rx,
+            chunk: Cursor::new(Vec::new()),
+            done: false,
+        }
+    }
+}
+
+impl Read for ChunkReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let n = self.chunk.read(buf)?;
+            // n == 0 with a non-empty buf means the current chunk is used up.
+            if n > 0 || self.done || buf.is_empty() {
+                return Ok(n);
+            }
+            match self.rx.recv() {
+                Ok(Ok(chunk)) => {
+                    self.done = chunk.is_empty();
+                    self.chunk = Cursor::new(chunk);
+                }
+                Ok(Err(e)) => return Err(e),
+                // The sender dropped without the end-of-input chunk: the thread
+                // died mid-file. Reporting EOF here would truncate input silently.
+                Err(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "gzip decompression thread exited before the end of input",
+                    ))
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Unit Tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use needletail::parse_fastx_file;
 
     // -------------------------------------------------------------------------
     // Tests for OwnedFastxRecord
@@ -949,5 +1100,205 @@ mod tests {
         // Both surviving reads are trimmed to 50
         assert_eq!(records[0].seq1.len(), 50);
         assert_eq!(records[1].seq1.len(), 50);
+    }
+
+    // -------------------------------------------------------------------------
+    // Tests for threaded gzip decompression
+    // -------------------------------------------------------------------------
+
+    /// FASTQ text whose records differ in id, length, sequence and quality, so a
+    /// dropped, duplicated or misjoined record changes what is parsed.
+    fn sample_fastq(n: usize, mate: u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        for i in 0..n {
+            let len = 20 + (i * 7) % 61;
+            let seq: Vec<u8> = (0..len).map(|j| b"ACGT"[(i * 31 + j * 17) % 4]).collect();
+            let qual: Vec<u8> = (0..len).map(|j| b'!' + ((i + j) % 40) as u8).collect();
+            out.extend_from_slice(format!("@read{}/{} c{}\n", i, mate, i).as_bytes());
+            out.extend_from_slice(&seq);
+            out.extend_from_slice(b"\n+\n");
+            out.extend_from_slice(&qual);
+            out.push(b'\n');
+        }
+        out
+    }
+
+    /// Gzip each part as a separate member and concatenate them, as `bgzip` and
+    /// `cat a.gz b.gz` produce.
+    fn gzip_members(parts: &[&[u8]]) -> Vec<u8> {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+        let mut out = Vec::new();
+        for part in parts {
+            let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
+            enc.write_all(part).unwrap();
+            out.extend(enc.finish().unwrap());
+        }
+        out
+    }
+
+    fn temp_file(bytes: &[u8]) -> tempfile::NamedTempFile {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp, bytes).unwrap();
+        tmp
+    }
+
+    type ParsedRecord = (Vec<u8>, Vec<u8>, Option<Vec<u8>>);
+
+    /// Records parsed before the first error (from opening or reading), and
+    /// that error's message.
+    fn parse_outcome(
+        reader: Result<Box<dyn FastxReader>, ParseError>,
+    ) -> (Vec<ParsedRecord>, Option<String>) {
+        let mut out = Vec::new();
+        let mut reader = match reader {
+            Ok(reader) => reader,
+            Err(e) => return (out, Some(e.to_string())),
+        };
+        while let Some(rec) = reader.next() {
+            match rec {
+                Ok(rec) => out.push((
+                    rec.id().to_vec(),
+                    rec.seq().to_vec(),
+                    rec.qual().map(|q| q.to_vec()),
+                )),
+                Err(e) => return (out, Some(e.to_string())),
+            }
+        }
+        (out, None)
+    }
+
+    #[test]
+    fn test_threaded_gzip_parses_same_records_as_needletail() {
+        // The decompression thread hands the parser fixed-size chunks, so record
+        // boundaries fall mid-line; chunk size 1 puts a boundary between every
+        // byte. Two gzip members check that inflation continues past the first
+        // member, as needletail's own MultiGzDecoder does: stopping there would
+        // silently drop the reads in every later member.
+        let n = 500;
+        let plain = sample_fastq(n, 1);
+        let (head, tail) = plain.split_at(plain.len() / 3);
+        let tmp = temp_file(&gzip_members(&[head, tail]));
+
+        let expected = parse_outcome(parse_fastx_file(tmp.path()));
+        assert_eq!(
+            (expected.0.len(), &expected.1),
+            (n, &None),
+            "precondition: needletail reads every member"
+        );
+
+        for chunk_size in [1, 7, 4096, DECOMPRESS_CHUNK_SIZE] {
+            assert_eq!(
+                parse_outcome(open_fastx_with_chunk_size(tmp.path(), chunk_size)),
+                expected,
+                "chunk_size {}",
+                chunk_size
+            );
+        }
+    }
+
+    #[test]
+    fn test_threaded_gzip_fails_like_needletail_on_bad_input() {
+        // Bad input must fail the same way it did before threading: the same
+        // records reach the caller before the error, and the error names the
+        // real problem. Small files keep each case inside the first chunk,
+        // where a decode error could otherwise surface as "empty file".
+        let plain = sample_fastq(300, 1);
+        let gz = gzip_members(&[&plain]);
+        let mut bad_crc = gz.clone();
+        let crc_byte = bad_crc.len() - 8;
+        bad_crc[crc_byte] ^= 0xff;
+        let cases: [(&str, Vec<u8>); 4] = [
+            // Every record inflates; only the decoder's checksum error reveals
+            // the corruption, so this fails only if that error is passed on.
+            ("bad checksum", bad_crc),
+            ("truncated", gz[..gz.len() / 2].to_vec()),
+            // Decompressing once leaves gzip bytes, not FASTQ: an unknown format.
+            ("double gzip", gzip_members(&[&gz])),
+            ("empty", gzip_members(&[b""])),
+        ];
+
+        for (name, bytes) in cases {
+            let tmp = temp_file(&bytes);
+            let expected = parse_outcome(parse_fastx_file(tmp.path()));
+            assert!(
+                expected.1.is_some(),
+                "precondition: needletail rejects {}",
+                name
+            );
+            for chunk_size in [7, DECOMPRESS_CHUNK_SIZE] {
+                assert_eq!(
+                    parse_outcome(open_fastx_with_chunk_size(tmp.path(), chunk_size)),
+                    expected,
+                    "{} (chunk_size {})",
+                    name,
+                    chunk_size
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_chunk_reader_errors_when_thread_exits_without_end_marker() {
+        // If the decompression thread dies (e.g. panics) its sender drops without
+        // the empty end-of-input chunk. That must read as an error, not as EOF,
+        // or the input would be truncated silently.
+        let (tx, rx) = mpsc::sync_channel(4);
+        tx.send(Ok(b"@r\nACGT\n".to_vec())).unwrap();
+        drop(tx);
+        let mut buf = Vec::new();
+        assert!(ChunkReader::new(rx).read_to_end(&mut buf).is_err());
+
+        let (tx, rx) = mpsc::sync_channel(4);
+        tx.send(Ok(b"@r\nACGT\n".to_vec())).unwrap();
+        tx.send(Ok(Vec::new())).unwrap();
+        drop(tx);
+        let mut reader = ChunkReader::new(rx);
+        // A zero-length read must not consume (and so lose) the pending chunk.
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"@r\nACGT\n");
+    }
+
+    #[test]
+    fn test_paired_gzip_input_matches_plain_input() {
+        // End to end through the prefetching reader: paired gzip input (each
+        // file inflated on its own thread) must produce exactly the batches that
+        // the same reads produce uncompressed. A small batch size makes the
+        // pairing cross many batches.
+        let n = 1000;
+        let (p1, p2) = (sample_fastq(n, 1), sample_fastq(n, 2));
+        let (plain1, plain2) = (temp_file(&p1), temp_file(&p2));
+        let (gz1, gz2) = (
+            temp_file(&gzip_members(&[&p1])),
+            temp_file(&gzip_members(&[&p2])),
+        );
+
+        let read_batches = |r1: &Path, r2: &Path| {
+            let r2 = r2.to_path_buf();
+            let mut handler =
+                PrefetchingIoHandler::with_options(r1, Some(&r2), None, 64, None, None, true)
+                    .unwrap();
+            let mut out = Vec::new();
+            while let Some((records, headers)) = handler.next_batch().unwrap() {
+                for (rec, header) in records.into_iter().zip(headers) {
+                    out.push((
+                        header,
+                        rec.query_id,
+                        rec.seq1,
+                        rec.qual1,
+                        rec.seq2,
+                        rec.qual2,
+                    ));
+                }
+            }
+            handler.finish().unwrap();
+            out
+        };
+
+        let expected = read_batches(plain1.path(), plain2.path());
+        assert_eq!(expected.len(), n);
+        assert_eq!(read_batches(gz1.path(), gz2.path()), expected);
     }
 }
