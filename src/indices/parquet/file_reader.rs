@@ -1,130 +1,209 @@
-//! A parquet [`ChunkReader`] over a file that does not depend on `File::try_clone`.
+//! Parquet [`ChunkReader`] for index files.
 //!
-//! parquet's built-in `impl ChunkReader for File` duplicates the descriptor on
-//! every `get_read` / `get_bytes` call. Rust's std makes `OwnedFd::try_clone`
-//! unconditionally return `Unsupported` on wasm32 (including
-//! `wasm32-unknown-emscripten`), so opening any index there failed with
-//! "operation not supported on this platform" before a single byte was read.
-//!
-//! Positional reads (`pread` / `seek_read`) are available on every platform rype
-//! builds for, so this reader uses them for `get_bytes` and re-opens the path
-//! for the (rare, footer / page-stream) `get_read` calls.
-//!
-//! Native builds keep parquet's own `File` reader: [`PositionalFile::get_bytes`]
-//! zero-fills each buffer before reading, which measured as ~0.1 s per pass over
-//! a 1.7 GB shard, whereas `File`'s `read_to_end` path reads into uninitialised
-//! capacity. [`ParquetFile`] selects the right type per target.
+//! parquet's built-in `impl ChunkReader for File` duplicates the descriptor
+//! (`File::try_clone`) on every `get_read` / `get_bytes` call, and Rust's std
+//! makes `OwnedFd::try_clone` unconditionally `Unsupported` on wasm32. Opening
+//! any index on wasm32-unknown-emscripten therefore failed with "operation not
+//! supported on this platform" before a byte was read. [`PositionalFile`] uses
+//! positional reads (`pread`) instead, which emscripten supports (it sets
+//! `cfg(unix)`; see `advise_prefetch` in `indices::sharded` for the same fact).
 
-use bytes::Bytes;
-use parquet::errors::Result as ParquetResult;
-use parquet::file::reader::{ChunkReader, Length};
-use std::fs::File;
-use std::io::{self, BufReader, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
-
-/// Parquet chunk reader used for index files: `File` natively, positional reads on wasm32.
-#[cfg(not(target_arch = "wasm32"))]
-pub type ParquetFile = File;
-#[cfg(target_arch = "wasm32")]
+/// The chunk reader every parquet reader in this crate is built from
+/// (`tests::parquet_readers_use_parquet_file` enforces this).
+///
+/// Native builds keep parquet's own `File` impl: `PositionalFile::get_bytes`
+/// zero-fills its buffer before reading, which measured as ~0.1 s per pass over
+/// a 1.7 GB shard, whereas `File`'s `read_to_end` reads into uninitialised capacity.
+#[cfg(not(target_os = "emscripten"))]
+pub type ParquetFile = std::fs::File;
+#[cfg(target_os = "emscripten")]
 pub type ParquetFile = PositionalFile;
 
-/// File-backed parquet chunk reader using positional reads (no `try_clone`).
-// Only wired in on wasm32; kept compiled natively so its unit test runs.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub struct PositionalFile {
-    path: PathBuf,
-    file: File,
-    len: u64,
-}
+#[cfg(any(target_os = "emscripten", test))]
+pub use positional::PositionalFile;
 
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-impl PositionalFile {
-    /// Open `path` for reading and record its length.
-    pub fn open(path: &Path) -> io::Result<Self> {
-        let file = File::open(path)?;
-        let len = file.metadata()?.len();
-        Ok(Self {
-            path: path.to_path_buf(),
-            file,
-            len,
-        })
+// Only wired in on emscripten; compiled under `test` so the native unit test runs.
+#[cfg(any(target_os = "emscripten", test))]
+mod positional {
+    use bytes::Bytes;
+    use parquet::errors::Result as ParquetResult;
+    use parquet::file::reader::{ChunkReader, Length};
+    use std::fs::File;
+    use std::io::{self, BufReader, Read};
+    use std::os::unix::fs::FileExt;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    /// File-backed parquet chunk reader using positional reads (no `try_clone`).
+    pub struct PositionalFile {
+        file: Arc<File>,
+        len: u64,
     }
 
-    #[cfg(unix)]
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-        std::os::unix::fs::FileExt::read_exact_at(&self.file, buf, offset)
-    }
-
-    #[cfg(windows)]
-    fn read_exact_at(&self, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
-        use std::os::windows::fs::FileExt;
-        while !buf.is_empty() {
-            match self.file.seek_read(buf, offset) {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "failed to fill whole buffer",
-                    ))
-                }
-                Ok(n) => {
-                    buf = &mut buf[n..];
-                    offset += n as u64;
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
+    impl PositionalFile {
+        /// Open `path` for reading and record its length.
+        pub fn open(path: &Path) -> io::Result<Self> {
+            let file = File::open(path)?;
+            let len = file.metadata()?.len();
+            Ok(Self {
+                file: Arc::new(file),
+                len,
+            })
         }
-        Ok(())
-    }
-}
-
-impl Length for PositionalFile {
-    fn len(&self) -> u64 {
-        self.len
-    }
-}
-
-impl ChunkReader for PositionalFile {
-    type T = BufReader<File>;
-
-    fn get_read(&self, start: u64) -> ParquetResult<Self::T> {
-        let mut file = File::open(&self.path)?;
-        file.seek(SeekFrom::Start(start))?;
-        Ok(BufReader::new(file))
     }
 
-    fn get_bytes(&self, start: u64, length: usize) -> ParquetResult<Bytes> {
-        let mut buf = vec![0u8; length];
-        self.read_exact_at(&mut buf, start)?;
-        Ok(buf.into())
+    impl Length for PositionalFile {
+        fn len(&self) -> u64 {
+            self.len
+        }
+    }
+
+    /// Sequential `Read` over a shared handle, advancing by `pread`.
+    pub struct PreadReader {
+        file: Arc<File>,
+        pos: u64,
+    }
+
+    impl Read for PreadReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.file.read_at(buf, self.pos)?;
+            self.pos += n as u64;
+            Ok(n)
+        }
+    }
+
+    impl ChunkReader for PositionalFile {
+        // parquet calls `get_read` for the footer and once per page header (a few
+        // dozen bytes each); a small buffer avoids re-reading page data that
+        // `get_bytes` fetches right after.
+        type T = BufReader<PreadReader>;
+
+        fn get_read(&self, start: u64) -> ParquetResult<Self::T> {
+            Ok(BufReader::with_capacity(
+                1024,
+                PreadReader {
+                    file: Arc::clone(&self.file),
+                    pos: start,
+                },
+            ))
+        }
+
+        fn get_bytes(&self, start: u64, length: usize) -> ParquetResult<Bytes> {
+            let mut buf = vec![0u8; length];
+            self.file.read_exact_at(&mut buf, start)?;
+            Ok(buf.into())
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use arrow::array::{UInt32Array, UInt64Array};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::reader::{ChunkReader, Length};
+    use std::fs::File;
+    use std::io::Read;
+    use std::path::Path;
+    use std::sync::Arc;
 
+    /// `PositionalFile` must give the parquet reader exactly what was written:
+    /// same footer, same pages, same rows. Multiple row groups and pages exercise
+    /// both `get_read` (page headers) and `get_bytes` (page data). Runs on wasm32
+    /// too (`cargo test --target wasm32-unknown-emscripten`), where `File` itself
+    /// cannot serve as a reference.
     #[test]
-    fn positional_and_streaming_reads_match_file_contents() {
+    fn positional_file_reads_parquet_identically_to_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data.bin");
-        let data: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
-        File::create(&path).unwrap().write_all(&data).unwrap();
+        let path = dir.path().join("shard.parquet");
+        let n = 50_000u64;
+        let batch = RecordBatch::try_from_iter([
+            (
+                "minimizer",
+                Arc::new(UInt64Array::from_iter_values(0..n)) as arrow::array::ArrayRef,
+            ),
+            (
+                "bucket_id",
+                Arc::new(UInt32Array::from_iter_values((0..n).map(|v| v as u32 % 7))) as _,
+            ),
+        ])
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(10_000))
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), Some(props))
+                .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
 
-        let reader = PositionalFile::open(&path).unwrap();
-        assert_eq!(reader.len(), 1000);
-        assert_eq!(&reader.get_bytes(10, 20).unwrap()[..], &data[10..30]);
+        let positional = PositionalFile::open(&path).unwrap();
+        assert_eq!(positional.len(), std::fs::metadata(&path).unwrap().len());
+        let batches: Vec<RecordBatch> = ParquetRecordBatchReaderBuilder::try_new(positional)
+            .unwrap()
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap())
+            .collect();
+        assert!(batches.len() > 1, "expected several row groups to be read");
+        let read_back = arrow::compute::concat_batches(&batch.schema(), &batches).unwrap();
+        assert_eq!(read_back, batch);
 
+        // The reader contract past EOF: get_bytes errors, get_read yields what is left.
+        let positional = PositionalFile::open(&path).unwrap();
+        assert!(positional.get_bytes(positional.len() - 4, 8).is_err());
         let mut tail = Vec::new();
-        reader
-            .get_read(990)
+        positional
+            .get_read(positional.len() - 4)
             .unwrap()
             .read_to_end(&mut tail)
             .unwrap();
-        assert_eq!(&tail[..], &data[990..]);
+        assert_eq!(tail, b"PAR1");
+    }
 
-        // Reading past EOF is an error, matching parquet's File impl.
-        assert!(reader.get_bytes(995, 10).is_err());
+    /// Any `std::fs::File` handed to a parquet reader silently breaks wasm32
+    /// (see module doc). Every parquet-reading site under `src/indices` and
+    /// `src/memory.rs` must open through `ParquetFile`; a `File::open` there is
+    /// only allowed with a `not a parquet reader` comment within the two lines above it.
+    /// Scans the source tree, so it is host-only (no sources on an emscripten test run).
+    #[test]
+    #[cfg(not(target_os = "emscripten"))]
+    fn parquet_readers_use_parquet_file() {
+        fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let p = entry.unwrap().path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|e| e == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = vec![root.join("memory.rs")];
+        walk(&root.join("indices"), &mut files);
+        let mut offenders = Vec::new();
+        for file in files {
+            if file.ends_with("file_reader.rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&file).unwrap();
+            let lines: Vec<&str> = src.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                let marked = lines[i.saturating_sub(2)..=i]
+                    .iter()
+                    .any(|l| l.contains("not a parquet reader"));
+                if line.contains("File::open(") && !line.contains("ParquetFile::open(") && !marked {
+                    offenders.push(format!("{}:{}", file.display(), i + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "File::open fed to parquet? use ParquetFile::open: {offenders:?}"
+        );
     }
 }

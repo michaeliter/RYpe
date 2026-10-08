@@ -329,7 +329,7 @@ impl ShardedInvertedIndex {
                 break;
             }
 
-            // Open and mmap the file
+            // Open and mmap the file (not a parquet reader)
             let file = match std::fs::File::open(&shard_path) {
                 Ok(f) => f,
                 Err(_) => continue,

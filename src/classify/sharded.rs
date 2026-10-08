@@ -9,11 +9,8 @@ use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-#[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc;
-#[cfg(not(target_arch = "wasm32"))]
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::constants::{
     COO_MERGE_JOIN_MAX_BUCKETS, DENSE_ACCUMULATOR_MAX_BUCKETS, ESTIMATED_MINIMIZERS_PER_SEQUENCE,
@@ -320,44 +317,44 @@ fn classify_shard_loop<A: HitAccumulator>(
         Ok(())
     };
 
-    // Pipelined shard processing: background loader thread + main merge-join thread.
-    // sync_channel(1) allows at most one shard buffered ahead, bounding memory to
-    // at most 2 loaded shards simultaneously.
-    #[cfg(not(target_arch = "wasm32"))]
-    let load_result: Result<()> = std::thread::scope(|scope| {
-        let (tx, rx) = mpsc::sync_channel::<Result<(LoadedShard, u128)>>(1);
-        let load_shard = &load_shard;
-
-        // Background loader thread.
-        // MUST use scoped thread (not std::thread::spawn) because `load_shard`
-        // borrows `sharded` and `query_minimizers` from the enclosing scope.
-        // thread::scope guarantees these borrows don't outlive the thread.
-        let loader = scope.spawn(move || {
-            for shard_info in &manifest.shards {
-                // If receiver dropped (main thread errored/stopped), stop loading
-                if tx.send(load_shard(shard_info)).is_err() {
-                    break;
-                }
-            }
-        });
-
-        for received in rx {
-            consume(received)?;
-        }
-
-        // Join the loader thread (propagates panics)
-        loader.join().expect("shard loader thread panicked");
-
-        Ok(())
-    });
-
     // wasm32 has no OS threads (std::thread::spawn returns Unsupported), so load
     // and merge-join each shard on the calling thread instead.
-    #[cfg(target_arch = "wasm32")]
-    let load_result: Result<()> = manifest
-        .shards
-        .iter()
-        .try_for_each(|shard_info| consume(load_shard(shard_info)));
+    let load_result: Result<()> = if cfg!(target_arch = "wasm32") {
+        manifest
+            .shards
+            .iter()
+            .try_for_each(|shard_info| consume(load_shard(shard_info)))
+    } else {
+        // Pipelined shard processing: background loader thread + main merge-join
+        // thread. sync_channel(1) allows at most one shard buffered ahead, bounding
+        // memory to at most 2 loaded shards simultaneously.
+        std::thread::scope(|scope| {
+            let (tx, rx) = mpsc::sync_channel::<Result<(LoadedShard, u128)>>(1);
+            let load_shard = &load_shard;
+
+            // Background loader thread.
+            // MUST use scoped thread (not std::thread::spawn) because `load_shard`
+            // borrows `sharded` and `query_minimizers` from the enclosing scope.
+            // thread::scope guarantees these borrows don't outlive the thread.
+            let loader = scope.spawn(move || {
+                for shard_info in &manifest.shards {
+                    // If receiver dropped (main thread errored/stopped), stop loading
+                    if tx.send(load_shard(shard_info)).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            for received in rx {
+                consume(received)?;
+            }
+
+            // Join the loader thread (propagates panics)
+            loader.join().expect("shard loader thread panicked");
+
+            Ok(())
+        })
+    };
 
     load_result?;
 
@@ -512,13 +509,62 @@ pub fn classify_batch_sharded_merge_join(
 // Parallel row group processing (classify_from_query_index_parallel_rg)
 // ============================================================================
 
+/// Spawn the progress reporter for `parallel_rg_inner`: every 30s while parallel
+/// work runs, log progress. Returns `None` on wasm32, which has no OS threads
+/// (the reporter is logging-only, so nothing else changes there).
+fn spawn_reporter<'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    rgs_done: &'scope AtomicUsize,
+    pairs: &'scope AtomicU64,
+    stop: &'scope AtomicBool,
+    total_rgs: usize,
+) -> Option<std::thread::ScopedJoinHandle<'scope, ()>> {
+    if cfg!(target_arch = "wasm32") {
+        return None;
+    }
+    Some(scope.spawn(move || {
+        let report_start = Instant::now();
+        let report_interval = Duration::from_secs(30);
+        let mut next_wake = report_start + report_interval;
+        while !stop.load(Ordering::Relaxed) {
+            let now = Instant::now();
+            if now >= next_wake {
+                let done = rgs_done.load(Ordering::Relaxed);
+                let pairs = pairs.load(Ordering::Relaxed);
+                let elapsed = report_start.elapsed().as_secs_f64();
+                let pct = if total_rgs > 0 {
+                    (done as f64 / total_rgs as f64) * 100.0
+                } else {
+                    0.0
+                };
+                let eta = if done > 0 && total_rgs > done {
+                    let per_rg = elapsed / done as f64;
+                    fmt_duration_secs((total_rgs - done) as f64 * per_rg)
+                } else {
+                    "?".to_string()
+                };
+                log::info!(
+                    "Classification progress: {}/{} row groups ({:.1}%), {} ref minimizers processed, elapsed {}, ETA {}",
+                    done,
+                    total_rgs,
+                    pct,
+                    pairs,
+                    fmt_duration_secs(elapsed),
+                    eta,
+                );
+                next_wake = now + report_interval;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+
+    }))
+}
+
 /// Inner parallel RG processing generic over accumulator type.
 ///
 /// Handles both fold/reduce (for small batches) and collect+merge (for large
 /// batches) strategies, using the accumulator trait for hit accumulation.
 #[allow(clippy::too_many_arguments)]
-// `scope` and `total_rgs` only feed the reporter thread, which wasm32 skips.
-#[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
 fn parallel_rg_inner<A>(
     work_items: Vec<(PathBuf, usize)>,
     query_idx: &QueryInvertedIndex,
@@ -548,50 +594,13 @@ where
     let stop_reporter = AtomicBool::new(false);
 
     let final_accumulator = std::thread::scope(|scope| -> Result<A> {
-        // Background reporter: every 30s while parallel work runs, log progress.
         // The StopGuard guarantees the reporter exits even if the parallel work
         // returns an error early — otherwise thread::scope would deadlock.
         let rgs_done_ref = &rgs_done;
         let pairs_ref = &pairs_processed;
         let stop_ref = &stop_reporter;
         let _stop_guard = StopGuard(stop_ref);
-        // No OS threads on wasm32: skip the (logging-only) reporter there.
-        #[cfg(not(target_arch = "wasm32"))]
-        let reporter = scope.spawn(move || {
-            let report_start = Instant::now();
-            let report_interval = Duration::from_secs(30);
-            let mut next_wake = report_start + report_interval;
-            while !stop_ref.load(Ordering::Relaxed) {
-                let now = Instant::now();
-                if now >= next_wake {
-                    let done = rgs_done_ref.load(Ordering::Relaxed);
-                    let pairs = pairs_ref.load(Ordering::Relaxed);
-                    let elapsed = report_start.elapsed().as_secs_f64();
-                    let pct = if total_rgs > 0 {
-                        (done as f64 / total_rgs as f64) * 100.0
-                    } else {
-                        0.0
-                    };
-                    let eta = if done > 0 && total_rgs > done {
-                        let per_rg = elapsed / done as f64;
-                        fmt_duration_secs((total_rgs - done) as f64 * per_rg)
-                    } else {
-                        "?".to_string()
-                    };
-                    log::info!(
-                        "Classification progress: {}/{} row groups ({:.1}%), {} ref minimizers processed, elapsed {}, ETA {}",
-                        done,
-                        total_rgs,
-                        pct,
-                        pairs,
-                        fmt_duration_secs(elapsed),
-                        eta,
-                    );
-                    next_wake = now + report_interval;
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-        });
+        let reporter = spawn_reporter(scope, rgs_done_ref, pairs_ref, stop_ref, total_rgs);
 
         let acc = if num_reads <= FOLD_REDUCE_MAX_READS {
             // Fold/reduce: efficient for small batches (long reads).
@@ -659,8 +668,9 @@ where
         };
 
         stop_ref.store(true, Ordering::Relaxed);
-        #[cfg(not(target_arch = "wasm32"))]
-        reporter.join().expect("progress reporter thread panicked");
+        if let Some(reporter) = reporter {
+            reporter.join().expect("progress reporter thread panicked");
+        }
         Ok(acc)
     })?;
     log_timing(

@@ -162,7 +162,8 @@ impl InvertedIndex {
             )));
         }
 
-        // Read entire file into memory once (avoids N file opens)
+        // Read entire file into memory once (avoids N file opens).
+        // not a parquet reader: read_to_end into Bytes
         let mut file =
             File::open(path).map_err(|e| RypeError::io(path, "open Parquet shard", e))?;
         let file_size = file.metadata()?.len() as usize;
