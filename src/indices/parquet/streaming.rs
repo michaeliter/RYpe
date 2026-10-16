@@ -810,14 +810,12 @@ impl ShardAccumulator {
 
     /// Returns the estimated current size in bytes.
     ///
-    /// Uses `len()`, not `capacity()`. Previously this read `capacity()`, which
-    /// let `Vec`'s amortized-doubling growth (triggered incrementally by
-    /// `add_entries_from_minimizers`, growing from empty after each flush)
-    /// transiently double allocated capacity past `max_shard_bytes` before a
-    /// flush caught it. Measuring `len()` instead makes the flush threshold
-    /// track real data volume regardless of how the backing `Vec` grows; see
-    /// `reset_entries` (private) for how capacity is retained (not eagerly
-    /// pre-allocated) across cycles.
+    /// Uses `len()`, not `capacity()`: this is the flush threshold, and capacity is
+    /// retained across flushes (see `reset_entries`, private), so a capacity-based
+    /// threshold would report a full buffer right after a flush. Allocation is
+    /// bounded separately: `reserve_bounded` (private) caps capacity at
+    /// `max_shard_bytes` unless the data itself is larger, so `len()` does not hide
+    /// `Vec` doubling slack past the budget.
     ///
     /// Note: fixing this transient doubling alone did not close the
     /// real-world gap between `--max-memory` and measured peak RSS
@@ -835,11 +833,34 @@ impl ShardAccumulator {
     /// front. Many buckets hold far less data than `max_shard_bytes` allows
     /// (never triggering a real flush), so eagerly reserving the full budget
     /// would needlessly bloat allocated (if not necessarily resident) memory
-    /// for them. `len()`-based flush thresholds (see
-    /// [`current_size_bytes`](Self::current_size_bytes)) already prevent the
-    /// capacity this settles into from overshooting `max_shard_bytes`.
+    /// for them. Capacity above `max_shard_bytes` (allocated only when one add
+    /// stored more than the limit, see `reserve_bounded`) is released, since
+    /// that data has just been flushed.
     fn reset_entries(&mut self) {
         self.entries.clear();
+        self.entries
+            .shrink_to(self.max_shard_bytes / Self::BYTES_PER_ENTRY);
+    }
+
+    /// Make room for `additional` more entries without letting `Vec`'s amortized
+    /// doubling push capacity past `max_shard_bytes`.
+    ///
+    /// Below the limit, capacity still doubles (amortized O(1) pushes). At the
+    /// limit it is capped, so the only allocation past `max_shard_bytes` is data a
+    /// single add call actually stores, never doubling slack. Without the cap, a
+    /// buffer just under the limit could double to nearly 2x `max_shard_bytes`
+    /// and keep that capacity for the rest of the build (`reset_entries` retains
+    /// it). Callers that size `max_shard_bytes` as a share of a memory budget,
+    /// e.g. `build_index_from_arrow` at half the budget, rely on this bound.
+    fn reserve_bounded(&mut self, additional: usize) {
+        let needed = self.entries.len() + additional;
+        let capacity = self.entries.capacity();
+        if needed <= capacity {
+            return;
+        }
+        let limit = (self.max_shard_bytes / Self::BYTES_PER_ENTRY).max(needed);
+        let target = capacity.saturating_mul(2).max(needed).min(limit);
+        self.entries.reserve_exact(target - self.entries.len());
     }
 
     /// Returns the number of accumulated entries.
@@ -884,6 +905,7 @@ impl ShardAccumulator {
 
     /// Add entries to the accumulator.
     pub fn add_entries(&mut self, entries: &[(u64, u32)]) {
+        self.reserve_bounded(entries.len());
         self.entries.extend_from_slice(entries);
     }
 
@@ -892,7 +914,7 @@ impl ShardAccumulator {
     /// This is more efficient than creating a temporary Vec of (minimizer, bucket_id)
     /// pairs and calling `add_entries`.
     pub fn add_entries_from_minimizers(&mut self, minimizers: &[u64], bucket_id: u32) {
-        self.entries.reserve(minimizers.len());
+        self.reserve_bounded(minimizers.len());
         for &m in minimizers {
             self.entries.push((m, bucket_id));
         }
@@ -1053,7 +1075,7 @@ impl ShardAccumulator {
             }
         }
 
-        // Reset buffer to a fresh, fully pre-allocated one for the next cycle
+        // Empty the buffer for the next cycle, keeping its (bounded) capacity
         self.reset_entries();
 
         Ok(Some(shard_info))
@@ -1785,7 +1807,7 @@ mod tests {
         let entries: Vec<(u64, u32)> = vec![(100, 1), (200, 2), (300, 1), (400, 3)];
         accumulator.add_entries(&entries);
 
-        // Size is based on capacity, not length (accounts for Vec over-allocation)
+        // Size is based on length (the flush threshold); capacity is bounded separately
         assert_eq!(accumulator.entry_count(), 4);
         let min_size = 4 * ShardAccumulator::BYTES_PER_ENTRY;
         assert!(
@@ -1830,6 +1852,54 @@ mod tests {
             .collect();
         accumulator.add_entries(&many_entries);
         assert!(accumulator.should_flush());
+    }
+
+    #[test]
+    fn test_shard_accumulator_capacity_bounded_by_max_shard_bytes() {
+        // The flush threshold measures len(), and flushes keep the buffer's capacity.
+        // If growth were left to Vec's amortized doubling, a buffer just under the
+        // limit would double to nearly 2x max_shard_bytes and hold that for the rest
+        // of the build. build_index_from_arrow sizes max_shard_bytes at half the
+        // memory budget, so that slack alone would consume the whole budget. The only
+        // allocation allowed past the limit is data a single add actually stores.
+        let tmp = TempDir::new().unwrap();
+        let output_dir = tmp.path().join("test.ryxdi");
+        std::fs::create_dir_all(output_dir.join("inverted")).unwrap();
+
+        let max_bytes = MIN_SHARD_BYTES;
+        let limit = max_bytes / ShardAccumulator::BYTES_PER_ENTRY;
+        let mut accumulator = ShardAccumulator::with_output_dir(&output_dir, max_bytes, None);
+        let assert_bounded = |acc: &ShardAccumulator, context: &str| {
+            let allowed = limit.max(acc.entries.len());
+            assert!(
+                acc.entries.capacity() <= allowed,
+                "{context}: capacity {} entries exceeds max(limit {limit}, len {})",
+                acc.entries.capacity(),
+                acc.entries.len()
+            );
+        };
+
+        // Per-feature adds with the arrow builder's flush loop. 0.6 then 0.3 of the
+        // limit stays under the threshold, but doubling the first add's capacity
+        // would reach 1.2x the limit.
+        let mut next = 0u64;
+        for (round, fraction) in [0.6, 0.3, 0.6, 0.3, 0.25, 0.9].into_iter().enumerate() {
+            let n = (limit as f64 * fraction) as usize;
+            let mins: Vec<u64> = (next..next + n as u64).collect();
+            next += n as u64;
+            accumulator.add_entries_from_minimizers(&mins, 1);
+            assert_bounded(&accumulator, &format!("after add {round}"));
+            while accumulator.should_flush() {
+                accumulator.flush_shard().unwrap();
+                assert_bounded(&accumulator, &format!("after flush {round}"));
+            }
+        }
+
+        // One add larger than the whole limit may allocate exactly what it stores.
+        accumulator.flush_shard().unwrap();
+        let big: Vec<(u64, u32)> = (0..(limit as u64 * 3 / 2)).map(|i| (i, 2)).collect();
+        accumulator.add_entries(&big);
+        assert_bounded(&accumulator, "after oversized add");
     }
 
     // ========== Phase 2: ShardAccumulator Flush Tests ==========
