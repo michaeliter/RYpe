@@ -487,6 +487,77 @@ WHEN TO USE 'run' vs 'aggregate':
         wide: bool,
     },
 
+    /// Write the reads that do (or, by default, do NOT) match the index
+    #[command(after_help = "FILTER MODE:
+  Streams reads through the same classification passes as 'run', but writes
+  the reads themselves instead of hit lines. By default a read (or pair) is
+  written when it scores below --threshold in every bucket, i.e. host
+  depletion against a host index; --invert writes only the matching reads.
+  One pass over the input, no intermediate files.
+
+  Paired input is written interleaved (<id>/1, <id>/2) unless --output2 is
+  given. Pairs are kept or dropped as a unit. Output is FASTQ (FASTA when the
+  input has no qualities); a .gz path is gzip-compressed single-threaded, so
+  for large outputs write to stdout and pipe through pigz/bgzip.
+
+EXAMPLES:
+  # Host depletion, survivors to a file
+  rype classify filter -i human.ryxdi -1 R1.fq.gz -2 R2.fq.gz -t 0.0001 -o clean.fq
+
+  # Stream survivors straight into a second-stage aligner
+  rype classify filter -i human.ryxdi -1 R1.fq.gz -2 R2.fq.gz -t 0.0001 \\
+      | minimap2 -ax sr host.mmi - | samtools fastq -f 12 -")]
+    Filter {
+        /// Path to index directory (.ryxdi)
+        #[arg(short, long)]
+        index: PathBuf,
+
+        /// Forward reads (FASTA/FASTQ, optionally .gz)
+        #[arg(short = '1', long)]
+        r1: PathBuf,
+
+        /// Reverse reads for paired-end data (optional)
+        #[arg(short = '2', long)]
+        r2: Option<PathBuf>,
+
+        /// A read matches when its score reaches this threshold in any bucket
+        #[arg(short, long, default_value_t = 0.1)]
+        threshold: f64,
+
+        /// Maximum memory to use (e.g., "4G", "512M", "auto").
+        /// Buffered read sequences count against this budget.
+        #[arg(long, default_value = "auto", value_parser = parse_max_memory_arg)]
+        max_memory: usize,
+
+        /// Override automatic input batch size calculation
+        #[arg(short, long)]
+        batch_size: Option<usize>,
+
+        /// Output path for written reads (`-` or omitted: stdout; `.gz`: gzip)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Write R2 mates here instead of interleaving them into --output
+        #[arg(long)]
+        output2: Option<PathBuf>,
+
+        /// Write the matching reads instead of the non-matching ones
+        #[arg(long)]
+        invert: bool,
+
+        /// Use parallel row group processing
+        #[arg(long)]
+        parallel_rg: bool,
+
+        /// Use bloom filters for row group filtering
+        #[arg(long)]
+        use_bloom_filter: bool,
+
+        /// Print timing diagnostics to stderr for performance analysis
+        #[arg(long)]
+        timing: bool,
+    },
+
     /// Pool all reads for sample-level classification (higher sensitivity)
     #[command(alias = "agg")]
     #[command(after_help = "AGGREGATE vs RUN:

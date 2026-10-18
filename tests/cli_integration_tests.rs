@@ -6468,3 +6468,105 @@ fn test_negative_index_run_reports_nonzero_passes() -> Result<()> {
 
     Ok(())
 }
+
+/// `classify filter` is a host-depletion filter: with a host (phiX) index it
+/// must write every non-host pair, intact and in input order, and drop every
+/// host pair as a unit — even when only R1 carries the host signal. `--invert`
+/// must write exactly the complement, so the two modes together account for
+/// every input pair (nothing silently lost or duplicated).
+#[test]
+fn test_cli_filter_keeps_non_host_pairs_and_invert_is_complement() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+    let phix_path = Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let phix: String = fs::read_to_string(&phix_path)?
+        .lines()
+        .filter(|l| !l.starts_with('>'))
+        .collect();
+
+    let binary = get_binary_path();
+    let index_path = dir.path().join("phix.ryxdi");
+    let output = Command::new(&binary)
+        .args(["index", "create", "-o", index_path.to_str().unwrap()])
+        .args(["-r", phix_path.to_str().unwrap(), "-k", "32", "-w", "10"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Deterministic non-phiX sequence (LCG), long enough for many minimizers.
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut random_seq = |n: usize| -> String {
+        (0..n)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                b"ACGT"[(state >> 62) as usize] as char
+            })
+            .collect()
+    };
+    let host_r1 = |start: usize| phix[start..start + 150].to_string();
+    // (id, R1, R2, is_host). pair_b's R2 is non-host: the pair is still host.
+    let pairs = vec![
+        ("pair_a", random_seq(150), random_seq(150), false),
+        ("pair_b", host_r1(100), random_seq(150), true),
+        ("pair_c", random_seq(150), random_seq(150), false),
+        ("pair_d", host_r1(2000), phix[3000..3150].to_string(), true),
+    ];
+    let qual = |s: &str| "I".repeat(s.len());
+    let (mut r1_fq, mut r2_fq) = (String::new(), String::new());
+    for (id, s1, s2, _) in &pairs {
+        r1_fq.push_str(&format!("@{id}/1\n{s1}\n+\n{}\n", qual(s1)));
+        r2_fq.push_str(&format!("@{id}/2\n{s2}\n+\n{}\n", qual(s2)));
+    }
+    let (r1, r2) = (dir.path().join("r1.fq"), dir.path().join("r2.fq"));
+    fs::write(&r1, r1_fq)?;
+    fs::write(&r2, r2_fq)?;
+
+    let run_filter = |extra: &[&str]| -> Result<String> {
+        let output = Command::new(&binary)
+            .args(["classify", "filter", "-i", index_path.to_str().unwrap()])
+            .args([
+                "-1",
+                r1.to_str().unwrap(),
+                "-2",
+                r2.to_str().unwrap(),
+                "-t",
+                "0.5",
+            ])
+            .args(extra)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(String::from_utf8(output.stdout)?)
+    };
+    let expected = |want_host: bool| -> String {
+        pairs
+            .iter()
+            .filter(|p| p.3 == want_host)
+            .map(|(id, s1, s2, _)| {
+                format!(
+                    "@{id}/1\n{s1}\n+\n{}\n@{id}/2\n{s2}\n+\n{}\n",
+                    qual(s1),
+                    qual(s2)
+                )
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        run_filter(&[])?,
+        expected(false),
+        "default must write only non-host pairs"
+    );
+    assert_eq!(
+        run_filter(&["--invert"])?,
+        expected(true),
+        "--invert must write only host pairs"
+    );
+    Ok(())
+}

@@ -18,7 +18,7 @@ mod query_loading;
 mod shard_parquet;
 
 // Re-export public types
-pub use accumulate::QueryAccumulator;
+pub use accumulate::{MetaHeapBytes, QueryAccumulator};
 pub use query::QueryInvertedIndex;
 pub use query_loading::{get_row_group_ranges, load_row_group_pairs, RowGroupRangeInfo};
 
