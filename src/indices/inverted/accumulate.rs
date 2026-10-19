@@ -146,10 +146,16 @@ impl<M: MetaHeapBytes> QueryAccumulator<M> {
     /// after a drain is genuinely 0, not merely emptied `len()` — so that
     /// trap no longer applies and this can go back to the more accurate
     /// (and more conservative) measurement.
+    ///
+    /// `meta` is counted the same way: its inline `size_of::<M>()` per slot
+    /// of capacity, plus each payload's heap bytes. The inline part is 24
+    /// bytes for a `String` header but well over 100 for a payload that
+    /// carries a whole read (`classify filter`).
     pub fn approx_bytes(&self) -> usize {
         self.entries.capacity() * std::mem::size_of::<(u64, u32)>()
             + self.fwd_counts.capacity() * std::mem::size_of::<u32>()
             + self.rc_counts.capacity() * std::mem::size_of::<u32>()
+            + self.meta.capacity() * std::mem::size_of::<M>()
             + self.meta_heap_bytes
     }
 
@@ -401,6 +407,30 @@ mod tests {
         );
     }
 
+    /// Regression: a payload's inline size must count, not just its heap
+    /// bytes. `classify filter` buffers whole reads as metadata, and the
+    /// per-read struct alone is over 100 bytes; leaving it out let a pass of
+    /// short reads run well past its byte budget.
+    #[test]
+    fn test_meta_inline_size_counted_in_approx_bytes() {
+        struct Inline {
+            _payload: [u64; 16],
+        }
+        impl MetaHeapBytes for Inline {
+            fn heap_bytes(&self) -> usize {
+                0
+            }
+        }
+        let mut acc = QueryAccumulator::with_budget(usize::MAX);
+        acc.push(Inline { _payload: [0; 16] }, vec![], vec![]);
+        assert!(
+            acc.approx_bytes() >= std::mem::size_of::<Inline>(),
+            "approx_bytes() ({}) must include the payload's inline size ({})",
+            acc.approx_bytes(),
+            std::mem::size_of::<Inline>()
+        );
+    }
+
     #[test]
     fn test_extend_extracted_matches_sequential_push() {
         let extracted: Vec<(Vec<u64>, Vec<u64>)> =
@@ -489,10 +519,10 @@ mod tests {
         // What a `len()`-based `approx_bytes()` would have reported —
         // computed independently here (not by calling `approx_bytes()`
         // itself) so this test discriminates the actual implementation
-        // rather than trivially restating whatever it does. `meta_heap_bytes`
-        // is shared by both implementations, so it's excluded from the
-        // comparison entirely rather than risk it swamping a real but small
-        // capacity/length delta.
+        // rather than trivially restating whatever it does. The `meta` terms
+        // (inline and heap) are shared by both implementations, so they're
+        // excluded from the comparison entirely rather than risk them swamping
+        // a real but small capacity/length delta.
         let len_based_entries_counts_bytes = acc.entries.len() * std::mem::size_of::<(u64, u32)>()
             + acc.fwd_counts.len() * std::mem::size_of::<u32>()
             + acc.rc_counts.len() * std::mem::size_of::<u32>();
@@ -507,13 +537,13 @@ mod tests {
              (cap_bytes={cap_based_entries_counts_bytes}, len_bytes={len_based_entries_counts_bytes})"
         );
 
-        let approx_bytes_entries_counts_only = acc.approx_bytes() - acc.meta_heap_bytes;
+        let meta_bytes = acc.meta.capacity() * std::mem::size_of::<String>() + acc.meta_heap_bytes;
+        let approx_bytes_entries_counts_only = acc.approx_bytes() - meta_bytes;
         assert_eq!(
             approx_bytes_entries_counts_only, cap_based_entries_counts_bytes,
-            "approx_bytes() (minus meta_heap_bytes: {}) should equal the entries/counts \
+            "approx_bytes() (minus meta bytes: {meta_bytes}) should equal the entries/counts \
              buffers' real allocated capacity ({cap_based_entries_counts_bytes}), not \
-             their length ({len_based_entries_counts_bytes})",
-            acc.meta_heap_bytes
+             their length ({len_based_entries_counts_bytes})"
         );
     }
 

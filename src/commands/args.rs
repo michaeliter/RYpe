@@ -529,7 +529,7 @@ EXAMPLES:
         #[arg(long, default_value = "auto", value_parser = parse_max_memory_arg)]
         max_memory: usize,
 
-        /// Override automatic input batch size calculation
+        /// Maximum reads per classification pass (--max-memory still applies)
         #[arg(short, long)]
         batch_size: Option<usize>,
 

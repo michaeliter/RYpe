@@ -58,6 +58,13 @@ pub struct BatchSizeResult {
     /// regardless of byte budget. Set only when the caller passed an explicit
     /// `batch_size_override`, to preserve read-count semantics for that case.
     pub classify_max_reads: Option<usize>,
+    /// Bytes of `max_memory` set aside for input batches in flight, i.e. what
+    /// `classify_byte_budget` was computed net of. 0 for a user-specified
+    /// batch size.
+    pub input_batch_residency: usize,
+    /// Sampled average query length (R1 + R2 for pairs). 0 for a
+    /// user-specified batch size.
+    pub avg_query_length: usize,
 }
 
 /// Determine the correct `InputFormat` for memory estimation.
@@ -176,6 +183,8 @@ pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSiz
             // guessing at a byte budget with no read-length sample.
             classify_byte_budget: usize::MAX,
             classify_max_reads: Some(bs),
+            input_batch_residency: 0,
+            avg_query_length: 0,
         });
     }
 
@@ -346,6 +355,8 @@ pub fn compute_effective_batch_size(config: &BatchSizeConfig) -> Result<BatchSiz
         shard_reservation,
         classify_byte_budget,
         classify_max_reads: None,
+        input_batch_residency,
+        avg_query_length: mem_config.read_profile.avg_query_length,
     })
 }
 

@@ -6473,7 +6473,9 @@ fn test_negative_index_run_reports_nonzero_passes() -> Result<()> {
 /// must write every non-host pair, intact and in input order, and drop every
 /// host pair as a unit — even when only R1 carries the host signal. `--invert`
 /// must write exactly the complement, so the two modes together account for
-/// every input pair (nothing silently lost or duplicated).
+/// every input pair (nothing silently lost or duplicated). Splitting the input
+/// into one pass per pair must not change what is written or its order, since
+/// reads are buffered and written back per pass.
 #[test]
 fn test_cli_filter_keeps_non_host_pairs_and_invert_is_complement() -> Result<()> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -6524,7 +6526,7 @@ fn test_cli_filter_keeps_non_host_pairs_and_invert_is_complement() -> Result<()>
     fs::write(&r1, r1_fq)?;
     fs::write(&r2, r2_fq)?;
 
-    let run_filter = |extra: &[&str]| -> Result<String> {
+    let run_filter = |extra: &[&str]| -> Result<(String, String)> {
         let output = Command::new(&binary)
             .args(["classify", "filter", "-i", index_path.to_str().unwrap()])
             .args([
@@ -6542,7 +6544,10 @@ fn test_cli_filter_keeps_non_host_pairs_and_invert_is_complement() -> Result<()>
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        Ok(String::from_utf8(output.stdout)?)
+        Ok((
+            String::from_utf8(output.stdout)?,
+            String::from_utf8(output.stderr)?,
+        ))
     };
     let expected = |want_host: bool| -> String {
         pairs
@@ -6559,14 +6564,69 @@ fn test_cli_filter_keeps_non_host_pairs_and_invert_is_complement() -> Result<()>
     };
 
     assert_eq!(
-        run_filter(&[])?,
+        run_filter(&[])?.0,
         expected(false),
         "default must write only non-host pairs"
     );
     assert_eq!(
-        run_filter(&["--invert"])?,
+        run_filter(&["--invert"])?.0,
         expected(true),
         "--invert must write only host pairs"
     );
+
+    for (extra, want_host) in [
+        (vec!["-b", "1"], false),
+        (vec!["-b", "1", "--invert"], true),
+    ] {
+        let (stdout, stderr) = run_filter(&extra)?;
+        assert!(
+            stderr.contains("passes=4"),
+            "-b 1 must classify each pair in its own pass: {stderr}"
+        );
+        assert_eq!(
+            stdout,
+            expected(want_host),
+            "one pass per pair must write the same reads in the same order ({extra:?})"
+        );
+    }
+    Ok(())
+}
+
+/// A pair is written as one record format. R1 as FASTQ with R2 as FASTA would
+/// produce an interleaved stream mixing `@` and `>` records, which aligners
+/// reject, so the filter must refuse it instead of writing it.
+#[test]
+fn test_cli_filter_rejects_mixed_fastq_fasta_pairs() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = tempdir()?;
+    let phix_path = Path::new(manifest_dir).join("examples/phiX174.fasta");
+    let binary = get_binary_path();
+    let index_path = dir.path().join("phix.ryxdi");
+    let output = Command::new(&binary)
+        .args(["index", "create", "-o", index_path.to_str().unwrap()])
+        .args(["-r", phix_path.to_str().unwrap(), "-k", "32", "-w", "10"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let seq = "ACGT".repeat(40);
+    let (r1, r2) = (dir.path().join("r1.fq"), dir.path().join("r2.fa"));
+    fs::write(&r1, format!("@p/1\n{seq}\n+\n{}\n", "I".repeat(seq.len())))?;
+    fs::write(&r2, format!(">p/2\n{seq}\n"))?;
+
+    let output = Command::new(&binary)
+        .args(["classify", "filter", "-i", index_path.to_str().unwrap()])
+        .args(["-1", r1.to_str().unwrap(), "-2", r2.to_str().unwrap()])
+        .output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "mixed pair must fail: {stderr}");
+    assert!(
+        stderr.contains("both be FASTQ or both be FASTA"),
+        "unexpected error: {stderr}"
+    );
+    assert!(output.stdout.is_empty(), "nothing may be written");
     Ok(())
 }
