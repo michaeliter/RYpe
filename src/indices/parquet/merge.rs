@@ -9,7 +9,6 @@ use crate::indices::sharded::{ShardManifest, ShardedInvertedIndex};
 use crate::memory::format_bytes;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::path::Path;
 
 use super::streaming::{compute_source_hash, ShardAccumulator, MIN_SHARD_BYTES};
@@ -289,7 +288,7 @@ fn process_shard_parallel_row_groups(
     use parquet::file::serialized_reader::SerializedFileReader;
 
     // Get row group count
-    let file = File::open(shard_path)
+    let file = super::ParquetFile::open(shard_path)
         .map_err(|e| RypeError::io(shard_path.to_path_buf(), "open shard for metadata", e))?;
     let reader = SerializedFileReader::new(file)?;
     let num_row_groups = reader.metadata().num_row_groups();
@@ -328,7 +327,7 @@ fn process_shard_parallel_row_groups(
         .par_iter()
         .map(|&rg_idx| {
             // Each thread opens its own file handle (OS page cache handles deduplication)
-            let file = File::open(&shard_path_buf)
+            let file = super::ParquetFile::open(&shard_path_buf)
                 .map_err(|e| RypeError::io(shard_path_buf.clone(), "open shard", e))?;
             let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
             let reader = builder.with_row_groups(vec![rg_idx]).build()?;
@@ -876,7 +875,7 @@ pub fn read_shard_pairs(path: &Path) -> Result<Vec<(u64, u32)>> {
     use arrow::array::{UInt32Array, UInt64Array};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-    let file = std::fs::File::open(path)
+    let file = super::ParquetFile::open(path)
         .map_err(|e| RypeError::io(path.to_path_buf(), "open shard", e))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let reader = builder.build()?;
