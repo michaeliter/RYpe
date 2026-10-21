@@ -10,9 +10,9 @@ mod logging;
 
 use commands::{
     build_parquet_index_from_config, create_parquet_index_from_refs, inspect_matches,
-    load_index_metadata, resolve_bucket_id, run_aggregate, run_classify, run_log_ratio,
-    ClassifyAggregateArgs, ClassifyCommands, ClassifyLogRatioArgs, ClassifyRunArgs, Cli, Commands,
-    CommonClassifyArgs, IndexCommands, InspectCommands,
+    load_index_metadata, resolve_bucket_id, run_aggregate, run_classify, run_filter, run_log_ratio,
+    ClassifyAggregateArgs, ClassifyCommands, ClassifyFilterArgs, ClassifyLogRatioArgs,
+    ClassifyRunArgs, Cli, Commands, CommonClassifyArgs, IndexCommands, InspectCommands,
 };
 
 // CLI argument definitions moved to commands/args.rs
@@ -409,6 +409,39 @@ fn main() -> Result<()> {
                     negative_index,
                     best_hit,
                     wide,
+                })?;
+            }
+
+            ClassifyCommands::Filter {
+                index,
+                r1,
+                r2,
+                threshold,
+                max_memory,
+                batch_size,
+                output,
+                output2,
+                invert,
+                parallel_rg,
+                use_bloom_filter,
+                timing,
+            } => {
+                if timing {
+                    ENABLE_TIMING.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                run_filter(ClassifyFilterArgs {
+                    index,
+                    r1,
+                    r2,
+                    threshold,
+                    max_memory,
+                    batch_size,
+                    output,
+                    output2,
+                    invert,
+                    parallel_rg,
+                    use_bloom_filter,
                 })?;
             }
 
