@@ -979,7 +979,9 @@ impl ShardAccumulator {
         // justify going parallel at all, so sort sequentially and skip the pool
         // entirely — it is never built for buckets that never cross this line (the
         // common case for a many-small-buckets build), and the ordering — and
-        // therefore the subsequent dedup — is identical either way.
+        // therefore the subsequent dedup — is identical either way. The
+        // `num_cpus > 1` guard also keeps one-thread runs (wasm32,
+        // RAYON_NUM_THREADS=1) off the pool, which wasm32 cannot spawn.
         let num_cpus = rayon::current_num_threads();
         let use_parallel_sort =
             self.entries.len() > MIN_ENTRIES_PER_PARALLEL_PARTITION * num_cpus && num_cpus > 1;
@@ -1223,7 +1225,7 @@ impl StreamingShardReader {
     fn open(path: &Path) -> Result<Self> {
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-        let file = std::fs::File::open(path)
+        let file = super::ParquetFile::open(path)
             .map_err(|e| RypeError::io(path.to_path_buf(), "open shard", e))?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
         let iter = builder.build()?;
@@ -1754,7 +1756,7 @@ mod tests {
         // Verify bloom filter metadata exists in the parquet file
         // We check this by reading the file metadata
         let shard_path = index_dir.join("inverted").join("shard.0.parquet");
-        let file = std::fs::File::open(&shard_path).unwrap();
+        let file = crate::indices::parquet::ParquetFile::open(&shard_path).unwrap();
         let reader = parquet::file::reader::SerializedFileReader::new(file).unwrap();
         let metadata = reader.metadata();
 
@@ -2320,7 +2322,7 @@ mod tests {
         use arrow::array::{UInt32Array, UInt64Array};
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-        let file = std::fs::File::open(path)
+        let file = crate::indices::parquet::ParquetFile::open(path)
             .map_err(|e| RypeError::io(path.to_path_buf(), "open shard", e))?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
         let reader = builder.build()?;

@@ -18,7 +18,7 @@ use crate::constants::{
 };
 use crate::core::extraction::get_paired_minimizers_into;
 use crate::core::workspace::MinimizerWorkspace;
-use crate::indices::sharded::{ShardManifest, ShardedInvertedIndex};
+use crate::indices::sharded::{ShardInfo, ShardManifest, ShardedInvertedIndex};
 use crate::indices::{InvertedIndex, QueryInvertedIndex};
 use crate::types::{HitResult, QueryRecord};
 
@@ -237,107 +237,124 @@ fn classify_shard_loop<A: HitAccumulator>(
     // pairs across shards to avoid double-counting hits in the accumulator.
     let needs_dedup = manifest.has_overlapping_shards && manifest.shards.len() > 1;
 
-    // Pipelined shard processing: background loader thread + main merge-join thread.
-    // sync_channel(1) allows at most one shard buffered ahead, bounding memory to
-    // at most 2 loaded shards simultaneously.
-    let load_result: Result<()> = std::thread::scope(|scope| {
-        let (tx, rx) = mpsc::sync_channel::<Result<(LoadedShard, u128)>>(1);
-        let query_mins_ref = &query_minimizers;
+    // Load one shard filtered to the query minimizers; returns (shard, load_ms).
+    let load_shard = |shard_info: &ShardInfo| -> Result<(LoadedShard, u128)> {
+        let t_load = Instant::now();
+        let loaded: Result<LoadedShard> = if use_coo {
+            sharded
+                .load_shard_coo_for_query(shard_info.shard_id, &query_minimizers, read_options)
+                .map(LoadedShard::Coo)
+                .map_err(Into::into)
+        } else {
+            sharded
+                .load_shard_for_query(shard_info.shard_id, &query_minimizers, read_options)
+                .map(LoadedShard::Csr)
+                .map_err(Into::into)
+        };
+        loaded.map(|s| (s, t_load.elapsed().as_millis()))
+    };
 
-        // Background loader thread.
-        // MUST use scoped thread (not std::thread::spawn) because we borrow
-        // `sharded`, `manifest.shards`, and `query_mins_ref` from the enclosing
-        // scope. thread::scope guarantees these borrows don't outlive the thread.
-        let loader = scope.spawn(move || {
-            for shard_info in &manifest.shards {
-                let t_load = Instant::now();
-                let loaded: Result<LoadedShard> = if use_coo {
-                    sharded
-                        .load_shard_coo_for_query(shard_info.shard_id, query_mins_ref, read_options)
-                        .map(LoadedShard::Coo)
-                        .map_err(Into::into)
+    // Merge-join one loaded shard into the accumulator.
+    // When needs_dedup is true, maintain a sorted Vec of seen (minimizer, bucket_id)
+    // pairs to filter duplicates across shards. Uses two buffers with swap to avoid
+    // per-shard allocation after the first shard.
+    let mut seen: Vec<(u64, u32)> = Vec::new();
+    let mut merge_buf: Vec<(u64, u32)> = Vec::new();
+    let total_shards = manifest.shards.len();
+    let mut shard_idx = 0usize;
+    let mut total_pairs_processed: u64 = 0;
+    let mut consume = |received: Result<(LoadedShard, u128)>| -> Result<()> {
+        let (shard, load_ms) = received?;
+        total_shard_load_ms += load_ms;
+        shard_idx += 1;
+
+        let pairs_in_shard: u64 = match &shard {
+            LoadedShard::Coo(p) => p.len() as u64,
+            LoadedShard::Csr(idx) => idx.num_bucket_entries() as u64,
+        };
+
+        let t_merge = Instant::now();
+        match shard {
+            LoadedShard::Coo(ref pairs) => {
+                if needs_dedup {
+                    let filtered = filter_unseen(pairs, &seen);
+                    merge_sorted_into(&seen, &filtered, &mut merge_buf);
+                    std::mem::swap(&mut seen, &mut merge_buf);
+                    merge_join_coo_parallel(query_idx, &filtered, &mut accumulator);
                 } else {
-                    sharded
-                        .load_shard_for_query(shard_info.shard_id, query_mins_ref, read_options)
-                        .map(LoadedShard::Csr)
-                        .map_err(Into::into)
-                };
-                let load_ms = t_load.elapsed().as_millis();
-
-                // If receiver dropped (main thread errored/stopped), stop loading
-                if tx.send(loaded.map(|s| (s, load_ms))).is_err() {
-                    break;
+                    merge_join_coo_parallel(query_idx, pairs, &mut accumulator);
                 }
             }
-        });
+            LoadedShard::Csr(ref idx) => {
+                // CSR path: has_overlapping_shards indices are always single-bucket
+                // (from-config streaming build), so they always use COO (num_buckets
+                // <= COO_MERGE_JOIN_MAX_BUCKETS). No dedup needed here.
+                merge_join_csr(query_idx, idx, &mut accumulator, &query_minimizers);
+            }
+        }
+        let merge_ms = t_merge.elapsed().as_millis();
+        total_merge_join_ms += merge_ms;
+        total_pairs_processed += pairs_in_shard;
 
-        // Main thread: receive loaded shards and merge-join.
-        // When needs_dedup is true, maintain a sorted Vec of seen (minimizer, bucket_id)
-        // pairs to filter duplicates across shards. Uses two buffers with swap to avoid
-        // per-shard allocation after the first shard.
-        let mut seen: Vec<(u64, u32)> = Vec::new();
-        let mut merge_buf: Vec<(u64, u32)> = Vec::new();
-        let total_shards = manifest.shards.len();
-        let mut shard_idx = 0usize;
-        let mut total_pairs_processed: u64 = 0;
-        for received in rx {
-            let (shard, load_ms) = received?;
-            total_shard_load_ms += load_ms;
-            shard_idx += 1;
+        let elapsed = t_start.elapsed().as_secs_f64();
+        let eta = if shard_idx < total_shards && shard_idx > 0 {
+            let per_shard = elapsed / shard_idx as f64;
+            fmt_duration_secs((total_shards - shard_idx) as f64 * per_shard)
+        } else {
+            "0s".to_string()
+        };
+        log::info!(
+            "Classification progress: shard {}/{} done (load {}ms, merge {}ms, {} pairs), {} total pairs, elapsed {}, ETA {}",
+            shard_idx,
+            total_shards,
+            load_ms,
+            merge_ms,
+            pairs_in_shard,
+            total_pairs_processed,
+            fmt_duration_secs(elapsed),
+            eta,
+        );
+        Ok(())
+    };
 
-            let pairs_in_shard: u64 = match &shard {
-                LoadedShard::Coo(p) => p.len() as u64,
-                LoadedShard::Csr(idx) => idx.num_bucket_entries() as u64,
-            };
+    // wasm32 has no OS threads (std::thread::spawn returns Unsupported), so load
+    // and merge-join each shard on the calling thread instead.
+    let load_result: Result<()> = if cfg!(target_arch = "wasm32") {
+        manifest
+            .shards
+            .iter()
+            .try_for_each(|shard_info| consume(load_shard(shard_info)))
+    } else {
+        // Pipelined shard processing: background loader thread + main merge-join
+        // thread. sync_channel(1) allows at most one shard buffered ahead, bounding
+        // memory to at most 2 loaded shards simultaneously.
+        std::thread::scope(|scope| {
+            let (tx, rx) = mpsc::sync_channel::<Result<(LoadedShard, u128)>>(1);
+            let load_shard = &load_shard;
 
-            let t_merge = Instant::now();
-            match shard {
-                LoadedShard::Coo(ref pairs) => {
-                    if needs_dedup {
-                        let filtered = filter_unseen(pairs, &seen);
-                        merge_sorted_into(&seen, &filtered, &mut merge_buf);
-                        std::mem::swap(&mut seen, &mut merge_buf);
-                        merge_join_coo_parallel(query_idx, &filtered, &mut accumulator);
-                    } else {
-                        merge_join_coo_parallel(query_idx, pairs, &mut accumulator);
+            // Background loader thread.
+            // MUST use scoped thread (not std::thread::spawn) because `load_shard`
+            // borrows `sharded` and `query_minimizers` from the enclosing scope.
+            // thread::scope guarantees these borrows don't outlive the thread.
+            let loader = scope.spawn(move || {
+                for shard_info in &manifest.shards {
+                    // If receiver dropped (main thread errored/stopped), stop loading
+                    if tx.send(load_shard(shard_info)).is_err() {
+                        break;
                     }
                 }
-                LoadedShard::Csr(ref idx) => {
-                    // CSR path: has_overlapping_shards indices are always single-bucket
-                    // (from-config streaming build), so they always use COO (num_buckets
-                    // <= COO_MERGE_JOIN_MAX_BUCKETS). No dedup needed here.
-                    merge_join_csr(query_idx, idx, &mut accumulator, &query_minimizers);
-                }
+            });
+
+            for received in rx {
+                consume(received)?;
             }
-            let merge_ms = t_merge.elapsed().as_millis();
-            total_merge_join_ms += merge_ms;
-            total_pairs_processed += pairs_in_shard;
 
-            let elapsed = t_start.elapsed().as_secs_f64();
-            let eta = if shard_idx < total_shards && shard_idx > 0 {
-                let per_shard = elapsed / shard_idx as f64;
-                fmt_duration_secs((total_shards - shard_idx) as f64 * per_shard)
-            } else {
-                "0s".to_string()
-            };
-            log::info!(
-                "Classification progress: shard {}/{} done (load {}ms, merge {}ms, {} pairs), {} total pairs, elapsed {}, ETA {}",
-                shard_idx,
-                total_shards,
-                load_ms,
-                merge_ms,
-                pairs_in_shard,
-                total_pairs_processed,
-                fmt_duration_secs(elapsed),
-                eta,
-            );
-        }
+            // Join the loader thread (propagates panics)
+            loader.join().expect("shard loader thread panicked");
 
-        // Join the loader thread (propagates panics)
-        loader.join().expect("shard loader thread panicked");
-
-        Ok(())
-    });
+            Ok(())
+        })
+    };
 
     load_result?;
 
@@ -492,6 +509,57 @@ pub fn classify_batch_sharded_merge_join(
 // Parallel row group processing (classify_from_query_index_parallel_rg)
 // ============================================================================
 
+/// Spawn the progress reporter for `parallel_rg_inner`: every 30s while parallel
+/// work runs, log progress. Returns `None` on wasm32, which has no OS threads
+/// (the reporter is logging-only, so nothing else changes there).
+fn spawn_reporter<'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    rgs_done: &'scope AtomicUsize,
+    pairs: &'scope AtomicU64,
+    stop: &'scope AtomicBool,
+    total_rgs: usize,
+) -> Option<std::thread::ScopedJoinHandle<'scope, ()>> {
+    if cfg!(target_arch = "wasm32") {
+        return None;
+    }
+    Some(scope.spawn(move || {
+        let report_start = Instant::now();
+        let report_interval = Duration::from_secs(30);
+        let mut next_wake = report_start + report_interval;
+        while !stop.load(Ordering::Relaxed) {
+            let now = Instant::now();
+            if now >= next_wake {
+                let done = rgs_done.load(Ordering::Relaxed);
+                let pairs = pairs.load(Ordering::Relaxed);
+                let elapsed = report_start.elapsed().as_secs_f64();
+                let pct = if total_rgs > 0 {
+                    (done as f64 / total_rgs as f64) * 100.0
+                } else {
+                    0.0
+                };
+                let eta = if done > 0 && total_rgs > done {
+                    let per_rg = elapsed / done as f64;
+                    fmt_duration_secs((total_rgs - done) as f64 * per_rg)
+                } else {
+                    "?".to_string()
+                };
+                log::info!(
+                    "Classification progress: {}/{} row groups ({:.1}%), {} ref minimizers processed, elapsed {}, ETA {}",
+                    done,
+                    total_rgs,
+                    pct,
+                    pairs,
+                    fmt_duration_secs(elapsed),
+                    eta,
+                );
+                next_wake = now + report_interval;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+
+    }))
+}
+
 /// Inner parallel RG processing generic over accumulator type.
 ///
 /// Handles both fold/reduce (for small batches) and collect+merge (for large
@@ -526,48 +594,13 @@ where
     let stop_reporter = AtomicBool::new(false);
 
     let final_accumulator = std::thread::scope(|scope| -> Result<A> {
-        // Background reporter: every 30s while parallel work runs, log progress.
         // The StopGuard guarantees the reporter exits even if the parallel work
         // returns an error early — otherwise thread::scope would deadlock.
         let rgs_done_ref = &rgs_done;
         let pairs_ref = &pairs_processed;
         let stop_ref = &stop_reporter;
         let _stop_guard = StopGuard(stop_ref);
-        let report_start = Instant::now();
-        let reporter = scope.spawn(move || {
-            let report_interval = Duration::from_secs(30);
-            let mut next_wake = report_start + report_interval;
-            while !stop_ref.load(Ordering::Relaxed) {
-                let now = Instant::now();
-                if now >= next_wake {
-                    let done = rgs_done_ref.load(Ordering::Relaxed);
-                    let pairs = pairs_ref.load(Ordering::Relaxed);
-                    let elapsed = report_start.elapsed().as_secs_f64();
-                    let pct = if total_rgs > 0 {
-                        (done as f64 / total_rgs as f64) * 100.0
-                    } else {
-                        0.0
-                    };
-                    let eta = if done > 0 && total_rgs > done {
-                        let per_rg = elapsed / done as f64;
-                        fmt_duration_secs((total_rgs - done) as f64 * per_rg)
-                    } else {
-                        "?".to_string()
-                    };
-                    log::info!(
-                        "Classification progress: {}/{} row groups ({:.1}%), {} ref minimizers processed, elapsed {}, ETA {}",
-                        done,
-                        total_rgs,
-                        pct,
-                        pairs,
-                        fmt_duration_secs(elapsed),
-                        eta,
-                    );
-                    next_wake = now + report_interval;
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-        });
+        let reporter = spawn_reporter(scope, rgs_done_ref, pairs_ref, stop_ref, total_rgs);
 
         let acc = if num_reads <= FOLD_REDUCE_MAX_READS {
             // Fold/reduce: efficient for small batches (long reads).
@@ -635,7 +668,9 @@ where
         };
 
         stop_ref.store(true, Ordering::Relaxed);
-        reporter.join().expect("progress reporter thread panicked");
+        if let Some(reporter) = reporter {
+            reporter.join().expect("progress reporter thread panicked");
+        }
         Ok(acc)
     })?;
     log_timing(
